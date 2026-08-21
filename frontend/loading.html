@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph Memory - 初始化</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #e6edf3; font-family: -apple-system, 'Segoe UI', sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100vh; user-select: none; overflow: hidden;
+  }
+  .logo { font-size: 28px; font-weight: 700; margin-bottom: 8px; color: #58a6ff; }
+  .subtitle { font-size: 13px; color: #7d8590; margin-bottom: 32px; }
+  .progress-bar {
+    width: 320px; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, #58a6ff, #bc8cff);
+    border-radius: 4px; width: 0%; transition: width 0.5s ease;
+  }
+  .progress-fill.indeterminate {
+    width: 30%; animation: slide 1.5s ease-in-out infinite;
+  }
+  @keyframes slide {
+    0% { margin-left: -30%; } 100% { margin-left: 100%; }
+  }
+  .progress-pct { font-size: 14px; font-weight: 700; color: #58a6ff; margin-bottom: 16px; }
+  .status-text { font-size: 13px; color: #7d8590; text-align: center; line-height: 1.6; }
+  .status-text .detail { color: #58a6ff; font-size: 12px; margin-top: 4px; }
+  .status-text .file { color: #484f58; font-size: 11px; margin-top: 2px; }
+  .error { color: #f85149; }
+  .model-info { font-size: 11px; color: #484f58; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <div class="logo">Graph Memory</div>
+  <div class="subtitle">图式记忆系统 — 首次启动初始化</div>
+
+  <div class="progress-bar">
+    <div id="progress-fill" class="progress-fill indeterminate"></div>
+  </div>
+  <div class="progress-pct" id="progress-pct"></div>
+
+  <div class="status-text" id="status">
+    正在检查模型缓存...
+    <div class="detail" id="detail"></div>
+    <div class="file" id="file"></div>
+  </div>
+
+  <div class="model-info">模型: BGE-Small-ZH-v1.5 (~100MB) | 下载来源: hf-mirror.com</div>
+
+<script>
+function fmtBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/model_status');
+    const data = await res.json();
+    const el = document.getElementById('status');
+    const det = document.getElementById('detail');
+    const fileEl = document.getElementById('file');
+    const bar = document.getElementById('progress-fill');
+    const pct = document.getElementById('progress-pct');
+
+    if (data.error) {
+      el.innerHTML = '<span class="error">下载失败</span>';
+      det.innerHTML = '<span class="error">' + data.error + '</span>';
+      bar.classList.remove('indeterminate');
+      bar.style.width = '0%';
+      pct.textContent = '';
+      return;
+    }
+
+    if (data.done && data.embedder_ready) {
+      el.innerHTML = '模型已就绪,正在打开应用...';
+      det.textContent = '';
+      fileEl.textContent = '';
+      bar.classList.remove('indeterminate');
+      bar.style.width = '100%';
+      pct.textContent = '100%';
+      return;
+    }
+
+    if (data.downloading) {
+      const p = data.progress_pct || 0;
+      bar.classList.remove('indeterminate');
+      bar.style.width = p + '%';
+      pct.textContent = p + '%';
+      el.innerHTML = '正在下载 BGE-Small-ZH 模型...';
+      det.textContent = fmtBytes(data.downloaded_bytes) + ' / ' + fmtBytes(data.total_bytes);
+      fileEl.textContent = data.current_file ? '当前: ' + data.current_file : '';
+    } else if (data.done) {
+      el.innerHTML = '下载完成! 正在加载模型...';
+      det.textContent = '即将打开主窗口';
+      fileEl.textContent = '';
+      bar.classList.remove('indeterminate');
+      bar.style.width = '90%';
+      pct.textContent = '90%';
+    } else if (!data.cached) {
+      el.innerHTML = '首次使用需要下载嵌入模型 BGE-Small-ZH<br>正在自动开始下载...';
+      det.textContent = '从 hf-mirror.com 下载 (~100MB)';
+      bar.classList.add('indeterminate');
+      pct.textContent = '';
+      fetch('/api/start_download', { method: 'POST' });
+    } else {
+      // cached=true 但还没 ready,说明在加载
+      el.innerHTML = '模型已缓存,正在加载...';
+      det.textContent = '加载中';
+      bar.classList.add('indeterminate');
+      pct.textContent = '';
+    }
+  } catch(e) {
+    document.getElementById('detail').textContent = 'poll error: ' + e;
+  }
+}
+
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>
