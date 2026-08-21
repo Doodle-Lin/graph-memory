@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "graph-memory"
+version = "0.1.0"
+description = "图式记忆系统 — 基于知识图谱的 Agent 关联记忆检索与写入"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "sentence-transformers>=2.2",
+    "numpy>=1.24",
+    "pydantic>=2.0",
+    "requests>=2.28",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dotenv = ["python-dotenv>=1.0"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+graph-memory = "graph_memory.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["graph_memory*"]
+
+[tool.setuptools.package-data]
+graph_memory = ["frontend/*.html"]
