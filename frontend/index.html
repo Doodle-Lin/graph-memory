@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph Memory — 图式记忆系统</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2128;
+    --panel-3: #21262d;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --text-faint: #6e7681;
+    --accent: #58a6ff;
+    --accent-2: #388bfd;
+    --green: #238636;
+    --green-h: #2ea043;
+    --danger: #f85149;
+    --shadow: 0 8px 24px rgba(1,4,9,0.55);
+    --shadow-sm: 0 4px 12px rgba(1,4,9,0.4);
+    --radius: 10px;
+    --radius-sm: 6px;
+    --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh; overflow: hidden;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+  #app { display: flex; height: 100vh; }
+
+  /* 侧边栏 */
+  #sidebar {
+    width: 380px; min-width: 380px; background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #sidebar-header {
+    padding: 18px 22px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  #sidebar-header .logo {
+    width: 34px; height: 34px; border-radius: 9px; display: flex;
+    align-items: center; justify-content: center; font-size: 18px;
+    background: linear-gradient(135deg, #1f6feb 0%, #8957e5 100%);
+    box-shadow: 0 2px 10px rgba(31,111,235,0.35);
+  }
+  #sidebar-header h1 {
+    font-size: 17px; font-weight: 600; color: var(--text); white-space: nowrap;
+    letter-spacing: -0.01em;
+  }
+  #stats {
+    font-size: 12px; color: var(--text-dim); padding: 10px 22px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex; gap: 14px; letter-spacing: 0.01em;
+  }
+  #stats span b { color: var(--text); font-weight: 600; }
+
+  /* 搜索栏 */
+  #search-bar {
+    padding: 14px 22px; border-bottom: 1px solid var(--border); display: flex; gap: 8px;
+  }
+  #search-input {
+    flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 9px 12px; color: var(--text); font-size: 13px; outline: none;
+    transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+  }
+  #search-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(88,166,255,0.18);
+  }
+  #search-btn, #import-btn {
+    border: none; border-radius: var(--radius-sm); padding: 9px 16px;
+    color: white; font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap;
+    transition: background 0.18s var(--ease), transform 0.08s var(--ease);
+  }
+  #search-btn { background: var(--green); }
+  #search-btn:hover { background: var(--green-h); }
+  #search-btn:active { transform: translateY(1px); }
+  #import-btn { background: var(--accent-2); }
+  #import-btn:hover { background: var(--accent); }
+  #import-btn:disabled { opacity: 0.5; cursor: wait; transform: none; }
+  #refine-btn { background: #6f6e77; color: #ddd; border: none; border-radius: var(--radius-sm); padding: 9px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+  #refine-btn:hover { background: #8a8893; }
+  #refine-btn:disabled { opacity: 0.5; cursor: wait; }
+
+  /* 搜索结果 */
+  #search-results {
+    flex: 1; overflow-y: auto; padding: 6px 0;
+  }
+
+  /* 筛选器 */
+  #filter-bar {
+    padding: 8px 22px; border-bottom: 1px solid var(--border-soft);
+    display: flex; flex-direction: column; gap: 6px;
+    flex-shrink: 0;  /* 不被压缩 */
+  }
+  #filter-bar .filter-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #filter-bar .filter-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-faint); font-weight: 600; margin-right: 2px; flex-shrink: 0;
+  }
+  /* 来源行:默认折叠,只显示一行 + 展开按钮 */
+  #filter-sources {
+    overflow: hidden;
+    max-height: 28px;  /* 只显示第一行 */
+    transition: max-height 0.2s var(--ease);
+    position: relative;
+  }
+  #filter-sources.expanded { max-height: 500px; }
+  #filter-sources .toggle-btn {
+    font-size: 10px; color: var(--text-faint); cursor: pointer;
+    padding: 3px 6px; flex-shrink: 0; user-select: none;
+    background: var(--panel-3); border-radius: 4px; transition: color 0.15s;
+  }
+  #filter-sources .toggle-btn:hover { color: var(--accent); }
+  .filter-chip {
+    font-size: 11px; padding: 3px 10px; border-radius: 20px;
+    border: 1px solid var(--border); background: var(--panel-3);
+    color: var(--text-dim); cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 5px;
+    transition: all 0.15s var(--ease);
+  }
+  .filter-chip:hover { border-color: var(--text-faint); color: var(--text); }
+  .filter-chip.active { color: var(--text); border-color: transparent; }
+  .filter-chip .fdot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.06);
+  }
+  .filter-chip.active .fdot { box-shadow: 0 0 0 2px rgba(255,255,255,0.15); }
+  .filter-chip .fcount { font-size: 9px; opacity: 0.6; }
+  .filter-clear {
+    font-size: 11px; color: var(--text-faint); cursor: pointer;
+    padding: 3px 8px; border-radius: 4px; transition: color 0.15s var(--ease);
+  }
+  .filter-clear:hover { color: var(--accent); }
+  .filter-divider { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
+  #search-results::-webkit-scrollbar { width: 8px; }
+  #search-results::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  #search-results::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+  .result-item {
+    padding: 12px 22px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
+    transition: background 0.15s var(--ease), border-left-color 0.15s var(--ease);
+    border-left: 3px solid transparent;
+  }
+  .result-item:hover { background: var(--panel-2); }
+  .result-item .title {
+    font-size: 13px; font-weight: 600; color: var(--accent); margin-bottom: 5px;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  .result-item .title .t-left { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .result-item .title .t-left .tdot {
+    width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.04);
+  }
+  .result-item .title .t-left .tname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .result-item .score {
+    font-size: 11px; color: var(--text-faint); font-weight: 500; flex-shrink: 0;
+  }
+  .result-item .content {
+    font-size: 12px; color: var(--text-dim); line-height: 1.55;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; cursor: pointer;
+  }
+  .result-item .content.expanded {
+    -webkit-line-clamp: unset; overflow: visible;
+  }
+  .result-item .content:hover { color: var(--text); }
+  .result-item .tags { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+  .tag {
+    font-size: 10px; padding: 2px 8px; border-radius: 20px;
+    background: var(--panel-3); color: var(--text-dim); font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .tag.match-graph { background: rgba(88,166,255,0.12); color: var(--accent); }
+  .tag.match-semantic { background: rgba(188,140,255,0.12); color: #bc8cff; }
+
+  /* 图区域 */
+  #cy {
+    flex: 1; position: relative; background:
+      radial-gradient(ellipse at 30% 20%, rgba(56,139,253,0.05) 0%, transparent 60%),
+      radial-gradient(ellipse at 70% 80%, rgba(188,140,255,0.04) 0%, transparent 55%),
+      var(--bg);
+  }
+  #cy-controls {
+    position: absolute; top: 16px; right: 16px; z-index: 10;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #cy-controls button {
+    width: 38px; height: 38px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: rgba(22,27,34,0.85); backdrop-filter: blur(6px); color: var(--text);
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    box-shadow: var(--shadow-sm); transition: all 0.18s var(--ease);
+  }
+  #cy-controls button svg { width: 18px; height: 18px; stroke: currentColor; fill: none;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #cy-controls button:hover {
+    background: var(--panel-2); border-color: var(--text-faint); transform: translateY(-1px);
+  }
+  #cy-controls button:active { transform: translateY(0); }
+  #cy-controls button.primary { color: var(--accent); }
+
+  /* 节点详情面板 */
+  #node-panel {
+    position: absolute; bottom: 16px; left: 16px; z-index: 10;
+    width: 420px; max-height: 56vh; background: var(--panel);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px;
+    display: none; overflow-y: auto; box-shadow: var(--shadow);
+    animation: panelIn 0.22s var(--ease);
+  }
+  #node-panel::-webkit-scrollbar { width: 6px; }
+  #node-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  #node-panel.active { display: block; }
+  @keyframes panelIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  #node-panel h3 {
+    font-size: 15px; color: var(--accent); margin-bottom: 14px; display: flex;
+    justify-content: space-between; align-items: flex-start; gap: 10px; line-height: 1.4;
+  }
+  #node-panel h3 .nt-text { flex: 1; word-break: break-word; }
+  #node-panel .content {
+    font-size: 13px; line-height: 1.65; color: var(--text); margin-bottom: 14px;
+    white-space: pre-wrap; word-break: break-word;
+    padding: 10px 12px; background: var(--bg); border-radius: var(--radius-sm);
+    border: 1px solid var(--border-soft);
+  }
+  #node-panel .meta {
+    font-size: 11px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 6px;
+    margin-bottom: 12px;
+  }
+  #node-panel .meta .tag.type-tag { font-weight: 600; }
+  #node-panel .section-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-faint); margin: 14px 0 6px; font-weight: 600;
+  }
+  #node-panel .relations { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  #node-panel .rel-item {
+    font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 6px;
+    padding: 5px 8px; background: var(--bg); border-radius: var(--radius-sm);
+    border: 1px solid var(--border-soft); cursor: pointer;
+    transition: background 0.15s var(--ease);
+  }
+  #node-panel .rel-item:hover { background: var(--panel-2); }
+  #node-panel .rel-item .rel-arrow { color: var(--text-faint); font-size: 11px; }
+  #node-panel .rel-item .rel-label { color: var(--accent); font-size: 10px;
+    background: rgba(88,166,255,0.1); padding: 1px 6px; border-radius: 8px; }
+  #node-panel .rel-item .rel-name { color: var(--text); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  #node-panel .rel-empty { font-size: 12px; color: var(--text-faint); font-style: italic; }
+  #node-panel .actions { display: flex; gap: 8px; margin-top: 14px; }
+  #node-panel .actions button {
+    font-size: 12px; padding: 7px 13px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--panel-3); color: var(--text); cursor: pointer; display: flex;
+    align-items: center; gap: 5px; transition: all 0.15s var(--ease);
+  }
+  #node-panel .actions button:hover { background: var(--border); }
+  #node-panel .actions button.danger { color: var(--danger); border-color: rgba(249,82,73,0.3); }
+  #node-panel .actions button.danger:hover { background: rgba(249,82,73,0.12); border-color: var(--danger); }
+  #node-panel .close-btn {
+    background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 18px;
+    line-height: 1; padding: 0; flex-shrink: 0; transition: color 0.15s var(--ease);
+  }
+  #node-panel .close-btn:hover { color: var(--text); }
+
+  /* 添加节点表单 */
+  #add-form {
+    position: absolute; top: 16px; left: 16px; z-index: 10;
+    width: 360px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px; display: none;
+    box-shadow: var(--shadow); animation: panelIn 0.22s var(--ease);
+  }
+  #add-form.active { display: block; }
+  #add-form h3 { font-size: 15px; color: var(--accent); margin-bottom: 14px; }
+  #add-form .field-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-faint); margin-bottom: 5px; font-weight: 600;
+  }
+  #add-form textarea, #add-form input, #add-form select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 9px 12px; color: var(--text); font-size: 13px; outline: none;
+    transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+    font-family: inherit;
+  }
+  #add-form textarea { min-height: 84px; resize: vertical; margin-bottom: 12px; }
+  #add-form input { margin-bottom: 12px; }
+  #add-form select { margin-bottom: 12px; cursor: pointer; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 12px center; padding-right: 32px; }
+  #add-form textarea:focus, #add-form input:focus, #add-form select:focus {
+    border-color: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,0.18);
+  }
+  #add-form .form-actions {
+    display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px;
+  }
+  #add-form button {
+    font-size: 13px; padding: 8px 16px; border-radius: var(--radius-sm); border: none; cursor: pointer;
+    font-weight: 500; transition: all 0.15s var(--ease);
+  }
+  #add-form .btn-save { background: var(--green); color: white; }
+  #add-form .btn-save:hover { background: var(--green-h); }
+  #add-form .btn-cancel { background: var(--panel-3); color: var(--text); border: 1px solid var(--border); }
+  #add-form .btn-cancel:hover { background: var(--border); }
+
+  /* Toast */
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 22px; color: var(--text); font-size: 13px; z-index: 1000;
+    box-shadow: var(--shadow); display: none; opacity: 0;
+    transition: opacity 0.3s var(--ease), transform 0.3s var(--ease);
+  }
+  #toast.show { display: block; opacity: 1; transform: translateX(-50%) translateY(-2px); }
+
+  /* 图例 */
+  #legend {
+    position: absolute; bottom: 16px; right: 16px; z-index: 10;
+    background: rgba(22,27,34,0.55); backdrop-filter: blur(8px);
+    border: 1px solid rgba(48,54,61,0.6); border-radius: var(--radius-sm);
+    padding: 10px 14px; font-size: 11px; color: var(--text-dim);
+    transition: background 0.25s var(--ease), border-color 0.25s var(--ease);
+    cursor: default; user-select: none;
+  }
+  #legend:hover {
+    background: var(--panel); border-color: var(--border);
+  }
+  #legend .ltitle {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-faint); margin-bottom: 6px; font-weight: 600;
+  }
+  #legend .item { display: flex; align-items: center; gap: 7px; margin: 4px 0; }
+  #legend .dot { width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(255,255,255,0.05); }
+  #legend .item .lname { color: var(--text); }
+  #legend .item .lkey { color: var(--text-faint); margin-left: auto; padding-left: 10px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- 侧边栏 -->
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <div class="logo">🧠</div>
+      <h1>Graph Memory</h1>
+    </div>
+    <div id="stats">
+      <span>节点 <b id="stat-nodes">0</b></span>
+      <span>边 <b id="stat-edges">0</b></span>
+      <span>密度 <b id="stat-density">0</b></span>
+    </div>
+    <div id="search-bar">
+      <input id="search-input" type="text" placeholder="检索知识..." />
+      <button id="search-btn">检索</button>
+      <button id="import-btn">导入</button>
+      <button id="refine-btn" title="用 LLM 提炼节点标题(需配置 GM_LLM_*)">提炼</button>
+    </div>
+    <div id="filter-bar">
+      <div class="filter-row" id="filter-types">
+        <span class="filter-label">类型</span>
+      </div>
+      <div class="filter-row" id="filter-sources">
+        <span class="filter-label">来源</span>
+      </div>
+    </div>
+    <div id="search-results"></div>
+    <div id="agent-panel" style="margin-top:auto;padding:12px;border-top:1px solid #30363d;">
+      <div style="font-size:12px;color:#8b949e;margin-bottom:8px;">Agent 接入</div>
+      <div id="agent-list"></div>
+    </div>
+  </div>
+
+  <!-- 图区域 -->
+  <div id="cy">
+    <div id="cy-controls">
+      <button onclick="fitGraph()" title="适应窗口" aria-label="适应窗口">
+        <svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
+      <button onclick="zoomIn()" title="放大" aria-label="放大">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M11 8v6M8 11h6M20 20l-3.5-3.5"/></svg>
+      </button>
+      <button onclick="zoomOut()" title="缩小" aria-label="缩小">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M20 20l-3.5-3.5"/></svg>
+      </button>
+      <button onclick="toggleAddForm()" title="添加节点" class="primary" aria-label="添加节点">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button onclick="relayoutGraph()" title="重排布局" aria-label="重排布局">
+        <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7L21 8M21 3v5h-5"/></svg>
+      </button>
+    </div>
+
+    <!-- 添加节点表单 -->
+    <div id="add-form">
+      <h3>添加知识节点</h3>
+      <div class="field-label">类型</div>
+      <select id="add-type">
+        <option value="knowledge">knowledge · 知识</option>
+        <option value="preference">preference · 偏好</option>
+        <option value="project">project · 项目</option>
+        <option value="fact">fact · 事实</option>
+        <option value="skill">skill · 技能</option>
+        <option value="reference">reference · 参考</option>
+      </select>
+      <div class="field-label">标题</div>
+      <input id="add-title" type="text" placeholder="标题(可选)" />
+      <div class="field-label">内容</div>
+      <textarea id="add-content" placeholder="知识内容..."></textarea>
+      <div class="form-actions">
+        <button class="btn-cancel" onclick="toggleAddForm()">取消</button>
+        <button class="btn-save" onclick="submitNode()">保存</button>
+      </div>
+    </div>
+
+    <!-- 节点详情 -->
+    <div id="node-panel">
+      <h3><span class="nt-text" id="node-title"></span><button class="close-btn" onclick="closePanel()">✕</button></h3>
+      <div class="content" id="node-content"></div>
+      <div class="meta" id="node-meta"></div>
+      <div class="section-label">关联关系</div>
+      <div class="relations" id="node-relations"></div>
+      <div class="actions">
+        <button onclick="expandNeighbors()">🔗 展开邻居</button>
+        <button class="danger" onclick="deleteSelectedNode()">🗑 删除</button>
+      </div>
+    </div>
+
+    <!-- 图例 -->
+    <div id="legend">
+      <div class="ltitle">类型</div>
+      <div class="item"><div class="dot" style="background:#58a6ff"></div><span class="lname">知识</span><span class="lkey">knowledge</span></div>
+      <div class="item"><div class="dot" style="background:#3fb950"></div><span class="lname">偏好</span><span class="lkey">preference</span></div>
+      <div class="item"><div class="dot" style="background:#f0883e"></div><span class="lname">项目</span><span class="lkey">project</span></div>
+      <div class="item"><div class="dot" style="background:#f85149"></div><span class="lname">事实</span><span class="lkey">fact</span></div>
+      <div class="item"><div class="dot" style="background:#bc8cff"></div><span class="lname">技能</span><span class="lkey">skill</span></div>
+      <div class="item"><div class="dot" style="background:#ffa657"></div><span class="lname">参考</span><span class="lkey">reference</span></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- Cytoscape.js -->
+<script src="cytoscape.min.js"></script>
+<script>
+// 启动/错误上报到后端日志(诊断用)
+function __clog(kind, msg, extra) {
+  try {
+    fetch('/api/clientlog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ kind: kind, msg: String(msg) }, extra || {}))
+    });
+  } catch (_) {}
+}
+window.addEventListener('error', (e) => __clog('error', e.message, { src: String(e.filename), line: e.lineno }));
+window.addEventListener('unhandledrejection', (e) => __clog('reject', (e.reason && e.reason.message) || e.reason));
+__clog('boot', 'script start, cytoscape=' + (typeof cytoscape));
+</script>
+<script>
+// ── HTTP API 兼容层 ─────────────────────────────────────────
+// 架构说明:本应用统一走 HTTP API。
+//  - 桌面端(Tauri):后端同进程直连引擎,前端通过 window.location.origin 的 HTTP 调用。
+//  - 纯 Python 模式:前端通过 9121 端口的 FastAPI 调用。
+// 不使用 Tauri IPC(在 External URL 模式下 IPC 插件不注入,会报 Plugin not found)。
+const API = window.location.origin || 'http://127.0.0.1:9121';
+
+async function apiStats() {
+  return await (await fetch(`${API}/api/stats`)).json();
+}
+async function apiHealth() {
+  return await (await fetch(`${API}/api/health`)).json();
+}
+async function apiRecent(limit = 20) {
+  return await (await fetch(`${API}/api/recent?limit=${limit}`)).json();
+}
+async function apiRetrieve(query, topK = 5, spread = true) {
+  const r = await fetch(`${API}/api/retrieve`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ query, top_k: topK, spread })
+  });
+  return await r.json();
+}
+async function apiWrite(content, title, nodeType, source = 'manual', metadata = '{}') {
+  const r = await fetch(`${API}/api/write`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ content, title, node_type: nodeType, source, metadata })
+  });
+  return await r.json();
+}
+async function apiUpdate(query, newContent, newTitle = '', nodeType = 'knowledge') {
+  const r = await fetch(`${API}/api/update`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ query, new_content: newContent, new_title: newTitle, node_type: nodeType })
+  });
+  return await r.json();
+}
+async function apiGraph() {
+  return await (await fetch(`${API}/api/graph`)).json();
+}
+async function apiSearch(q, topK = 15) {
+  return await (await fetch(`${API}/api/search?q=${encodeURIComponent(q)}&top_k=${topK}`)).json();
+}
+async function apiDeleteNode(id) {
+  await fetch(`${API}/api/nodes/${id}`, { method: 'DELETE' });
+}
+async function apiImport(source = 'all') {
+  const r = await fetch(`${API}/api/import?source=${source}`, { method: 'POST' });
+  return await r.json();
+}
+
+const API_LAYER = { apiStats, apiHealth, apiRecent, apiRetrieve,
+  apiWrite, apiUpdate, apiGraph, apiSearch, apiDeleteNode, apiImport };
+
+let cy = null;
+let selectedNode = null;
+
+// 节点颜色映射 (6 种类型)
+const TYPE_COLORS = {
+  knowledge: '#58a6ff', preference: '#3fb950', project: '#f0883e',
+  fact: '#f85149', skill: '#bc8cff', reference: '#ffa657',
+};
+const TYPE_LABELS = {
+  knowledge: '知识', preference: '偏好', project: '项目',
+  fact: '事实', skill: '技能', reference: '参考',
+};
+
+function getColor(type) { return TYPE_COLORS[type] || '#8b949e'; }
+function getTypeLabel(type) { return TYPE_LABELS[type] || type || '未知'; }
+
+// 初始化 Cytoscape
+function initCy() {
+  cy = cytoscape({
+    container: document.getElementById('cy'),
+    style: [
+      { selector: 'node', style: {
+        'background-color': (e) => getColor(e.data('node_type')),
+        'label': 'data(title)',
+        'font-size': '10px', 'color': '#c9d1d9', 'text-valign': 'bottom',
+        'text-margin-y': 8, 'text-max-width': '120px', 'text-wrap': 'wrap',
+        'width': 32, 'height': 32, 'border-width': 0, 'opacity': 0.92,
+        'transition-property': 'opacity, border-width, width, height',
+        'transition-duration': '0.18s',
+      }},
+      { selector: 'node:selected', style: {
+        'border-width': 3, 'border-color': '#58a6ff',
+        'border-opacity': 0.9, 'width': 42, 'height': 42,
+      }},
+      { selector: 'edge', style: {
+        'width': 1.5, 'line-color': '#30363d',
+        'target-arrow-color': '#30363d', 'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier', 'opacity': 0.5,
+        'transition-property': 'opacity, line-color, width',
+        'transition-duration': '0.18s',
+      }},
+      { selector: '.highlighted', style: {
+        'opacity': 1, 'border-color': '#f0883e', 'border-width': 3,
+      }},
+      { selector: '.faded', style: { 'opacity': 0.15 }},
+      { selector: 'edge.highlighted', style: {
+        'opacity': 0.85, 'line-color': '#f0883e', 'width': 3,
+        'target-arrow-color': '#f0883e',
+      }},
+    ],
+    layout: { name: 'cose', animate: true, animationDuration: 500,
+      idealEdgeLength: 100, nodeRepulsion: 8000, padding: 50 },
+    wheelSensitivity: 0.3,
+  });
+
+  cy.on('tap', 'node', (evt) => {
+    selectedNode = evt.target;
+    showNodePanel(selectedNode);
+    highlightNeighbors(selectedNode);
+  });
+
+  cy.on('tap', (e) => {
+    if (e.target === cy) { closePanel(); }
+  });
+}
+
+async function loadGraph() {
+  // 显示加载状态
+  const cyContainer = document.getElementById('cy');
+  const loadingDiv = document.createElement('div');
+  loadingDiv.id = 'loading-overlay';
+  loadingDiv.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--text-dim);font-size:14px;z-index:5;';
+  loadingDiv.textContent = '加载知识图谱...';
+  cyContainer.appendChild(loadingDiv);
+
+  const data = await apiGraph();
+  updateStats(data.stats);
+  const elements = [];
+  if (data.nodes && data.nodes.length > 0) {
+    for (const n of data.nodes) {
+      elements.push({
+        data: {
+          id: n.id, title: n.data?.title || n.data?.content?.slice(0, 30) || n.id,
+          content: n.data?.content || '', node_type: n.data?.node_type || 'knowledge',
+          source: n.data?.source || '', metadata: n.data?.metadata || '',
+        }
+      });
+    }
+  }
+  for (const e of data.edges) {
+    const ed = e.data || e;
+    elements.push({
+      data: { id: ed.id || `${ed.source}->${ed.target}`, source: ed.source, target: ed.target,
+        relation: ed.relation, weight: ed.weight }
+    });
+  }
+  cy.elements().remove();
+  cy.add(elements);
+  // 大图用 cose 力导向(有聚类结构),动画关掉加速;小图也用 cose
+  const isLarge = elements.length > 300;
+  cy.layout({
+    name: 'cose',
+    animate: !isLarge,           // 大图关动画避免卡顿
+    animationDuration: 500,
+    idealEdgeLength: isLarge ? 60 : 100,
+    nodeRepulsion: isLarge ? 6000 : 8000,
+    nodeOverlap: 4,
+    padding: 50,
+    // 大图多跑几轮收敛更好
+    numIter: isLarge ? 1500 : 1000,
+    // 初始随机布局避免全堆一起
+    randomize: true,
+  }).run();
+
+  // 移除加载状态
+  const ov = document.getElementById('loading-overlay');
+  if (ov) ov.remove();
+
+  // 统计类型和来源分布,构建筛选器
+  allTypeCounts = {};
+  allSourceCounts = {};
+  for (const n of data.nodes) {
+    const nt = n.data.node_type || 'unknown';
+    const ns = n.data.source || 'unknown';
+    allTypeCounts[nt] = (allTypeCounts[nt] || 0) + 1;
+    allSourceCounts[ns] = (allSourceCounts[ns] || 0) + 1;
+  }
+  buildFilterBar();
+}
+
+function updateStats(stats) {
+  document.getElementById('stat-nodes').textContent = stats.node_count;
+  document.getElementById('stat-edges').textContent = stats.edge_count;
+  document.getElementById('stat-density').textContent = stats.density;
+}
+
+// ── 筛选器 ─────────────────────────────────────────────────
+let activeTypes = new Set();    // 空集 = 全部
+let activeSources = new Set();  // 空集 = 全部
+let allTypeCounts = {};
+let allSourceCounts = {};
+
+function buildFilterBar() {
+  // 类型筛选
+  const typeContainer = document.getElementById('filter-types');
+  typeContainer.innerHTML = '<span class="filter-label">类型</span>';
+  for (const [key, label] of Object.entries(TYPE_LABELS)) {
+    const count = allTypeCounts[key] || 0;
+    if (count === 0) continue;
+    const chip = document.createElement('span');
+    chip.className = 'filter-chip active';
+    chip.dataset.type = key;
+    chip.innerHTML = `<span class="fdot" style="background:${TYPE_COLORS[key]}"></span>${label}<span class="fcount">${count}</span>`;
+    chip.onclick = () => toggleType(key);
+    typeContainer.appendChild(chip);
+  }
+
+  // 来源筛选(可折叠)
+  const srcContainer = document.getElementById('filter-sources');
+  srcContainer.innerHTML = '<span class="filter-label">来源</span>';
+  // 按出现频率排序
+  const sortedSources = Object.entries(allSourceCounts).sort((a,b) => b[1]-a[1]);
+  for (const [src, count] of sortedSources) {
+    if (count === 0) continue;
+    // 缩短来源名
+    const shortName = src.replace('llm_extract:', 'llm:').replace('hermes_', 'h:').replace('claude_', 'c:');
+    const chip = document.createElement('span');
+    chip.className = 'filter-chip active';
+    chip.dataset.source = src;
+    chip.innerHTML = `${shortName}<span class="fcount">${count}</span>`;
+    chip.onclick = () => toggleSource(src);
+    srcContainer.appendChild(chip);
+  }
+
+  // 折叠/展开按钮
+  if (sortedSources.length > 5) {
+    const toggle = document.createElement('span');
+    toggle.className = 'toggle-btn';
+    toggle.id = 'source-toggle';
+    toggle.textContent = `展开 (${sortedSources.length})`;
+    toggle.onclick = () => {
+      const row = document.getElementById('filter-sources');
+      row.classList.toggle('expanded');
+      toggle.textContent = row.classList.contains('expanded')
+        ? '收起'
+        : `展开 (${sortedSources.length})`;
+    };
+    srcContainer.appendChild(toggle);
+  }
+
+  // 清除按钮
+  const clearBtn = document.createElement('span');
+  clearBtn.className = 'filter-clear';
+  clearBtn.textContent = '清除筛选';
+  clearBtn.onclick = clearFilters;
+  srcContainer.appendChild(clearBtn);
+}
+
+function toggleType(type) {
+  if (activeTypes.has(type)) activeTypes.delete(type);
+  else activeTypes.add(type);
+  updateFilterUI();
+  applyFilter();
+}
+
+function toggleSource(src) {
+  if (activeSources.has(src)) activeSources.delete(src);
+  else activeSources.add(src);
+  updateFilterUI();
+  applyFilter();
+}
+
+function clearFilters() {
+  activeTypes.clear();
+  activeSources.clear();
+  updateFilterUI();
+  applyFilter();
+}
+
+function updateFilterUI() {
+  document.querySelectorAll('#filter-types .filter-chip').forEach(chip => {
+    const type = chip.dataset.type;
+    const active = activeTypes.size === 0 || activeTypes.has(type);
+    chip.classList.toggle('active', active);
+    if (active) {
+      chip.style.background = TYPE_COLORS[type] + '22';
+      chip.style.borderColor = TYPE_COLORS[type] + '44';
+    } else {
+      chip.style.background = '';
+      chip.style.borderColor = '';
+    }
+  });
+  document.querySelectorAll('#filter-sources .filter-chip').forEach(chip => {
+    const src = chip.dataset.source;
+    chip.classList.toggle('active', activeSources.size === 0 || activeSources.has(src));
+  });
+}
+
+function applyFilter() {
+  const typeActive = activeTypes.size > 0;
+  const srcActive = activeSources.size > 0;
+
+  if (!typeActive && !srcActive) {
+    // 全部显示
+    cy.elements().removeClass('faded');
+    return;
+  }
+
+  cy.nodes().forEach(n => {
+    const nt = n.data('node_type') || '';
+    const ns = n.data('source') || '';
+    const typeOk = !typeActive || activeTypes.has(nt);
+    const srcOk = !srcActive || activeSources.has(ns);
+    if (typeOk && srcOk) n.removeClass('faded');
+    else n.addClass('faded');
+  });
+  // 边:两端都可见才显示
+  cy.edges().forEach(e => {
+    if (e.source().hasClass('faded') || e.target().hasClass('faded')) {
+      e.addClass('faded');
+    } else {
+      e.removeClass('faded');
+    }
+  });
+}
+
+// 搜索
+async function search() {
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) { loadRecent(); return; }
+  const results = await apiSearch(q, 15);
+  // 去重: 相同 content 只保留分数最高的
+  const seen = new Set();
+  const deduped = results.filter(r => {
+    const key = r.content?.slice(0, 50) || r.title;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  // 按激活的筛选器过滤
+  const filtered = deduped.filter(r => {
+    const typeOk = activeTypes.size === 0 || activeTypes.has(r.node_type);
+    const srcOk = activeSources.size === 0 || activeSources.has(r.source);
+    return typeOk && srcOk;
+  });
+  loadSearchResults(filtered);
+  highlightNodes(filtered.map(r => r.id));
+}
+
+async function loadRecent() {
+  const results = await apiRecent(20);
+  const filtered = results.filter(r => {
+    const typeOk = activeTypes.size === 0 || activeTypes.has(r.node_type);
+    const srcOk = activeSources.size === 0 || activeSources.has(r.source);
+    return typeOk && srcOk;
+  });
+  loadSearchResults(filtered.map(r => ({...r, score: 0, match_type: 'recent'})));
+}
+
+function loadSearchResults(results) {
+  const container = document.getElementById('search-results');
+  container.innerHTML = '';
+  for (const r of results) {
+    const div = document.createElement('div');
+    div.className = 'result-item';
+    div.onclick = () => focusNode(r.id);
+    const scoreStr = r.match_type === 'graph_spread'
+      ? `扩散 ${r.pagerank_score?.toFixed(3)}`
+      : r.match_type === 'recent'
+      ? '最近'
+      : `语义 ${r.semantic_score?.toFixed(3)}`;
+    const dotColor = getColor(r.node_type);
+    div.innerHTML = `
+      <div class="title">
+        <span class="t-left">
+          <span class="tdot" style="background:${dotColor}"></span>
+          <span class="tname">${r.title}</span>
+        </span>
+        <span class="score">${scoreStr}</span>
+      </div>
+      <div class="content" onclick="this.classList.toggle('expanded')">${r.content || ''}</div>
+      <div class="tags">
+        <span class="tag">${r.source}</span>
+        <span class="tag">${r.node_type}</span>
+        <span class="tag ${r.match_type === 'graph_spread' ? 'match-graph' : 'match-semantic'}">${r.match_type}</span>
+      </div>
+    `;
+    container.appendChild(div);
+  }
+}
+
+function highlightNodes(ids) {
+  cy.elements().removeClass('highlighted').removeClass('faded');
+  const idSet = new Set(ids);
+  cy.nodes().forEach(n => {
+    if (idSet.has(n.id())) n.addClass('highlighted');
+    else n.addClass('faded');
+  });
+  cy.edges().forEach(e => {
+    if (idSet.has(e.source().id()) && idSet.has(e.target().id())) {
+      e.addClass('highlighted');
+    } else {
+      e.addClass('faded');
+    }
+  });
+}
+
+function highlightNeighbors(node) {
+  cy.elements().removeClass('highlighted').removeClass('faded');
+  node.addClass('highlighted');
+  const neighbors = node.neighborhood();
+  neighbors.addClass('highlighted');
+  cy.elements().not(node).not(neighbors).addClass('faded');
+}
+
+function focusNode(id) {
+  const node = cy.getElementById(id);
+  if (node && node.length > 0) {
+    cy.animate({ center: { eles: node }, zoom: 1.5, duration: 300 });
+    node.select();
+    showNodePanel(node);
+    highlightNeighbors(node);
+  }
+}
+
+// 节点面板
+function showNodePanel(node) {
+  const data = node.data();
+  const panel = document.getElementById('node-panel');
+  panel.classList.add('active');
+  document.getElementById('node-title').textContent = data.title || '(无标题)';
+  document.getElementById('node-content').textContent = data.content || '';
+  const meta = document.getElementById('node-meta');
+  const metadata = data.metadata || {};
+  const typeColor = getColor(data.node_type);
+  meta.innerHTML = `
+    <span class="tag type-tag" style="background:${typeColor}22;color:${typeColor}">${getTypeLabel(data.node_type)} · ${data.node_type || 'knowledge'}</span>
+    <span class="tag">${data.source || 'manual'}</span>
+    ${metadata.file ? `<span class="tag">📄 ${metadata.file}</span>` : ''}
+    ${metadata.similarity != null ? `<span class="tag">sim ${metadata.similarity.toFixed(3)}</span>` : ''}
+  `;
+
+  // 关联关系
+  const relBox = document.getElementById('node-relations');
+  const connectedEdges = node.connectedEdges();
+  if (connectedEdges.length === 0) {
+    relBox.innerHTML = '<div class="rel-empty">暂无关联</div>';
+  } else {
+    const rows = connectedEdges.map(edge => {
+      const ed = edge.data();
+      const isSource = ed.source === data.id;
+      const otherId = isSource ? ed.target : ed.source;
+      const other = cy.getElementById(otherId);
+      const otherTitle = (other && other.length > 0)
+        ? (other.data('title') || other.data('content')?.slice(0, 28) || otherId)
+        : otherId;
+      const otherType = other && other.length > 0 ? other.data('node_type') : '';
+      const relName = ed.relation || '关联';
+      const arrow = isSource ? '→' : '←';
+      return `<div class="rel-item" data-id="${otherId}">
+        <span class="rel-label">${relName}</span>
+        <span class="rel-arrow">${arrow}</span>
+        <span class="tdot" style="width:8px;height:8px;border-radius:50%;background:${getColor(otherType)};flex-shrink:0;"></span>
+        <span class="rel-name">${otherTitle}</span>
+      </div>`;
+    }).join('');
+    relBox.innerHTML = rows;
+    relBox.querySelectorAll('.rel-item').forEach(el => {
+      el.onclick = () => focusNode(el.dataset.id);
+    });
+  }
+}
+
+function closePanel() {
+  document.getElementById('node-panel').classList.remove('active');
+  cy.elements().removeClass('highlighted').removeClass('faded');
+  selectedNode = null;
+}
+
+async function deleteSelectedNode() {
+  if (!selectedNode) return;
+  const id = selectedNode.id();
+  if (!confirm('确认删除此节点及其所有边?')) return;
+  await apiDeleteNode(id);
+  showToast('节点已删除');
+  closePanel();
+  loadGraph();
+}
+
+async function expandNeighbors() {
+  if (!selectedNode) return;
+  const id = selectedNode.id();
+  // 统一走 HTTP:优先用 neighbors 端点,失败则退化为 retrieve 找相关节点
+  try {
+    const res = await fetch(`${API}/api/neighbors/${id}?depth=2`);
+    if (res.ok) {
+      const data = await res.json();
+      const neighborIds = (data.neighbors || []).map(n => n.id);
+      highlightNodes([id, ...neighborIds]);
+      return;
+    }
+  } catch (_) {}
+  // 退化:用节点内容检索相关节点
+  const node = cy.getElementById(id).data();
+  const results = await apiRetrieve(node.content?.slice(0, 100) || node.title, 10, true);
+  const neighborIds = results.map(r => r.id);
+  highlightNodes([id, ...neighborIds]);
+}
+
+// 添加节点
+function toggleAddForm() {
+  const form = document.getElementById('add-form');
+  form.classList.toggle('active');
+  if (form.classList.contains('active')) {
+    document.getElementById('add-content').focus();
+  }
+}
+
+async function submitNode() {
+  const content = document.getElementById('add-content').value.trim();
+  const title = document.getElementById('add-title').value.trim();
+  const nodeType = document.getElementById('add-type').value;
+  if (!content) { showToast('内容不能为空'); return; }
+  const data = await apiWrite(content, title, nodeType, 'manual', '{}');
+  showToast(`已添加 ${data.auto_links?.length || 0} 条自动关联`);
+  // 重置表单
+  document.getElementById('add-content').value = '';
+  document.getElementById('add-title').value = '';
+  document.getElementById('add-type').value = 'knowledge';
+  toggleAddForm();
+  loadGraph();
+}
+
+// 导入
+async function importMemories() {
+  const btn = document.getElementById('import-btn');
+  btn.disabled = true; btn.textContent = '导入中...';
+  // 显示进度提示
+  showToast('正在读取 Hermes 记忆文件...');
+  try {
+    const data = await apiImport('all');
+    const count = data.total_nodes || data.nodes || 0;
+    showToast(`已导入 ${count} 个节点,正在加载图...`);
+    // 导入后重新加载图
+    await loadGraph();
+    showToast(`导入完成: ${count} 个节点`);
+  } catch (e) {
+    showToast('导入失败: ' + e.message);
+    // 即使导入失败也加载图(可能已有旧数据)
+    loadGraph();
+  }
+  btn.disabled = false; btn.textContent = '导入';
+}
+
+// 图控制
+function fitGraph() { cy.animate({ fit: { eles: cy.elements(), padding: 50 }, duration: 300 }); }
+function zoomIn() { cy.zoom({ level: cy.zoom() * 1.3, renderedPosition: { x: cy.width()/2, y: cy.height()/2 } }); }
+function zoomOut() { cy.zoom({ level: cy.zoom() / 1.3, renderedPosition: { x: cy.width()/2, y: cy.height()/2 } }); }
+
+function relayoutGraph() {
+  const nodeCount = cy.nodes().length;
+  const isLarge = nodeCount > 300;
+  cy.layout({
+    name: 'cose',
+    animate: true,
+    animationDuration: 800,
+    idealEdgeLength: isLarge ? 60 : 100,
+    nodeRepulsion: isLarge ? 6000 : 8000,
+    nodeOverlap: 4,
+    padding: 50,
+    numIter: isLarge ? 1500 : 1000,
+    randomize: true,
+  }).run();
+  showToast('重新布局完成');
+}
+
+// Toast
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+// 键盘: Enter 搜索
+document.getElementById('search-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') search();
+});
+document.getElementById('search-btn').addEventListener('click', search);
+document.getElementById('import-btn').addEventListener('click', importMemories);
+document.getElementById('refine-btn').addEventListener('click', refineNodes);
+
+async function refineNodes() {
+  const btn = document.getElementById('refine-btn');
+  btn.disabled = true;
+  btn.textContent = '提炼中...';
+  showToast('正在用 LLM 提炼节点标题(可能需要几分钟)...');
+  try {
+    const res = await fetch(`${API}/api/refine`, { method: 'POST' });
+    const data = await res.json();
+    if (data.message) showToast(data.message);
+    if (data.refined > 0) { loadGraph(); loadRecent(); }
+  } catch(e) { showToast('提炼失败: ' + e.message); }
+  btn.disabled = false;
+  btn.textContent = '提炼';
+}
+
+// 启动
+initCy();
+loadGraph().catch(e => console.error('loadGraph failed:', e));
+// 初始加载最近添加
+setTimeout(() => loadRecent(), 2000);
+// 加载 agent 接入面板
+setTimeout(() => loadAgentPanel(), 500);
+
+async function loadAgentPanel() {
+  try {
+    const res = await fetch(`${API}/api/agents`);
+    const data = await res.json();
+    const list = document.getElementById('agent-list');
+    list.innerHTML = '';
+    for (const a of data.agents) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 0;font-size:13px;';
+      const left = document.createElement('span');
+      const dot = a.installed ? (a.connected ? '🟢' : '⚪') : '⚫';
+      left.textContent = `${dot} ${a.name}`;
+      left.style.opacity = a.installed ? '1' : '0.5';
+      row.appendChild(left);
+      if (a.installed && a.id !== 'hermes') {
+        const btn = document.createElement('button');
+        btn.textContent = a.connected ? '断开' : '接入';
+        btn.style.cssText = 'padding:2px 10px;font-size:12px;cursor:pointer;border-radius:4px;border:1px solid #30363d;background:';
+        btn.style.background = a.connected ? '#21262d' : '#238636';
+        btn.style.color = a.connected ? '#c9d1d9' : '#fff';
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.textContent = '...';
+          try {
+            if (a.connected) {
+              await fetch(`${API}/api/agents/disconnect`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:a.id})});
+            } else {
+              await fetch(`${API}/api/agents/connect`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent:a.id})});
+            }
+            loadAgentPanel();
+          } catch(e) { btn.textContent = '错误'; }
+        };
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    }
+  } catch(e) { console.error('agent panel failed:', e); }
+}
+</script>
+</body>
+</html>
