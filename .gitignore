@@ -1,0 +1,37 @@
+# 数据(不提交个人记忆;演示数据由 seed_demo.py 现场种入)
+data/
+*.json
+*.npz
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# 回归快照(本地对比用,不提交)
+regression_snapshots/
+
+# 临时文件
+_*.py
+*_test.py
+*_debug.py
+benchmark_report*.json
+
+# IDE
+.vscode/
+.idea/
+
+# Rust/Tauri build output
+src-tauri/target/
+src-tauri/gen/
+src-tauri/Cargo.lock
+
+# Tauri 运行日志
+src-tauri/*.log
+src-tauri/app_stderr.txt
+src-tauri/app_stdout.txt
