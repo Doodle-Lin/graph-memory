@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "description": "Graph Memory default capability",
+  "windows": ["main", "loading"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
