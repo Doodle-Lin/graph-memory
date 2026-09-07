@@ -282,6 +282,43 @@
   #add-form .btn-cancel { background:var(--panel-3); color:var(--text); border:1px solid var(--border); }
   #add-form .btn-cancel:hover { background:var(--panel-hover); }
 
+  /* ── LLM 设置弹窗 ── */
+  #llm-modal {
+    position:fixed; inset:0; z-index:2000; display:none;
+    background:rgba(0,0,0,0.55); backdrop-filter:blur(4px);
+    align-items:center; justify-content:center; animation:fadeIn .2s var(--ease);
+  }
+  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+  #llm-modal.active { display:flex; }
+  #llm-modal .modal-box {
+    width:440px; max-width:90vw; background:var(--panel-2); border:1px solid var(--border);
+    border-radius:var(--radius); padding:20px 22px; box-shadow:var(--shadow-lg);
+    animation:panelIn .25s var(--ease-out);
+  }
+  #llm-modal h3 { font-size:15px; font-weight:650; color:var(--text); margin-bottom:6px; display:flex; align-items:center; gap:8px; }
+  #llm-modal .modal-desc { font-size:12px; color:var(--text-dim); margin-bottom:16px; line-height:1.5; }
+  #llm-modal .status-pill {
+    display:inline-flex; align-items:center; gap:6px; font-size:11px; padding:3px 9px;
+    border-radius:20px; margin-left:auto;
+  }
+  #llm-modal .status-pill.ok { background:rgba(52,211,153,0.14); color:var(--green); }
+  #llm-modal .status-pill.no { background:rgba(248,113,113,0.12); color:var(--danger); }
+  #llm-modal .status-pill .pdot { width:7px; height:7px; border-radius:50%; background:currentColor; }
+  #llm-modal .field-label { font-size:9px; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-faint); margin-bottom:4px; font-weight:650; }
+  #llm-modal input {
+    width:100%; background:var(--bg-soft); border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:9px 11px; color:var(--text); font-size:13px; outline:none; margin-bottom:11px;
+    transition:border-color .2s var(--ease), box-shadow .2s var(--ease); font-family:inherit;
+  }
+  #llm-modal input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  #llm-modal input[type=password] { font-family:'SF Mono',Consolas,monospace; font-size:12px; }
+  #llm-modal .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
+  #llm-modal .btn-save { background:var(--accent-grad); color:#fff; }
+  #llm-modal .btn-save:hover { filter:brightness(1.08); }
+  #llm-modal .btn-cancel { background:var(--panel-3); color:var(--text); border:1px solid var(--border); }
+  #llm-modal .btn-cancel:hover { background:var(--panel-hover); }
+  #llm-modal .env-hint { font-size:11px; color:var(--text-faint); margin-top:10px; line-height:1.5; padding:8px 10px; background:var(--bg-soft); border-radius:var(--radius-xs); border:1px solid var(--border-soft); }
+
   #toast {
     position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
     background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
@@ -339,6 +376,9 @@
       <div id="tab-actions">
         <button onclick="toggleAddForm()" title="添加节点" class="primary" aria-label="添加节点">
           <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <button onclick="openLlmModal()" title="LLM 配置" aria-label="LLM 配置">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
       </div>
     </div>
@@ -417,6 +457,24 @@
         <button class="btn btn-cancel" onclick="toggleAddForm()">取消</button>
         <button class="btn btn-save" onclick="submitNode()">保存</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div id="llm-modal">
+  <div class="modal-box">
+    <h3>LLM 配置 <span class="status-pill no" id="llm-pill"><span class="pdot"></span><span id="llm-pill-text">未配置</span></span></h3>
+    <div class="modal-desc">用于知识提炼(/api/refine)。支持 OpenAI 兼容 API:DeepSeek / GLM / Qwen / OpenAI 等。检索与写入不需要 LLM。</div>
+    <div class="field-label">Base URL</div>
+    <input id="llm-base-url" type="text" placeholder="https://api.deepseek.com/v1" autocomplete="off" />
+    <div class="field-label">API Key</div>
+    <input id="llm-api-key" type="password" placeholder="sk-..." autocomplete="off" />
+    <div class="field-label">模型名</div>
+    <input id="llm-model" type="text" placeholder="deepseek-chat" autocomplete="off" />
+    <div class="env-hint">保存后写入项目 .env 并即时生效,无需重启。提炼功能立即可用。</div>
+    <div class="modal-actions">
+      <button class="btn btn-cancel" onclick="closeLlmModal()">取消</button>
+      <button class="btn btn-save" onclick="saveLlmConfig()">保存</button>
     </div>
   </div>
 </div>
@@ -789,6 +847,57 @@ async function loadAgentPanel() {
     }
   } catch(e) { console.error('agent panel failed:', e); }
 }
+
+// ── LLM 配置弹窗 ─────────────────────────────────────────
+async function openLlmModal() {
+  // 加载当前状态
+  try {
+    const s = await (await fetch(`${API}/api/llm/status`)).json();
+    document.getElementById('llm-base-url').value = s.base_url || '';
+    document.getElementById('llm-model').value = s.model || '';
+    const pill = document.getElementById('llm-pill');
+    if (s.configured) {
+      pill.className = 'status-pill ok';
+      document.getElementById('llm-pill-text').textContent = '已配置';
+      document.getElementById('llm-api-key').value = '••••••••';  // 占位,不回显真实 key
+      document.getElementById('llm-api-key').dataset.filled = '1';
+    } else {
+      pill.className = 'status-pill no';
+      document.getElementById('llm-pill-text').textContent = '未配置';
+      document.getElementById('llm-api-key').value = '';
+      document.getElementById('llm-api-key').dataset.filled = '';
+    }
+  } catch(e) { console.error('llm status failed', e); }
+  document.getElementById('llm-modal').classList.add('active');
+  document.getElementById('llm-base-url').focus();
+}
+function closeLlmModal() { document.getElementById('llm-modal').classList.remove('active'); }
+async function saveLlmConfig() {
+  const baseUrl = document.getElementById('llm-base-url').value.trim();
+  const model = document.getElementById('llm-model').value.trim();
+  const keyInput = document.getElementById('llm-api-key');
+  // 若 key 是占位符(未改动),传空串保留 .env 现有值
+  const apiKey = (keyInput.value && keyInput.value !== '••••••••') ? keyInput.value.trim() : '';
+  if (!baseUrl || !model) { showToast('Base URL 和模型名不能为空'); return; }
+  try {
+    const r = await fetch(`${API}/api/llm/config`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ api_key: apiKey, base_url: baseUrl, model })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast('LLM 配置已保存并即时生效');
+      closeLlmModal();
+    } else { showToast('保存失败: ' + (d.error || '未知错误')); }
+  } catch(e) { showToast('保存失败: ' + e.message); }
+}
+// 点遮罩关闭弹窗
+document.getElementById('llm-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'llm-modal') closeLlmModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.getElementById('llm-modal').classList.contains('active')) closeLlmModal();
+});
 
 // ── 启动:不预加载图谱,只加载统计+最近节点+接入面板 ──────
 document.getElementById('search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });

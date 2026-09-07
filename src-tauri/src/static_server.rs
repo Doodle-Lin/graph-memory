@@ -469,6 +469,25 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         send_json(&mut stream, serde_json::json!({"agents": agents}));
         return;
     }
+    // ── LLM 配置:读 .env + 即时设进程环境变量(不依赖引擎) ──
+    if clean == "/api/llm/config" && method == "POST" {
+        let body = parse_json_body(&req);
+        let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+        let base_url = body.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+        let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        match write_llm_env(api_key, base_url, model) {
+            Ok(path) => {
+                // 即时生效:设置进程环境变量,refine 立刻可用(无需重启)
+                std::env::set_var("GM_LLM_API_KEY", api_key);
+                std::env::set_var("GM_LLM_BASE_URL", base_url);
+                std::env::set_var("GM_LLM_MODEL", model);
+                log::info!("LLM config updated: base_url={}, model={}", base_url, model);
+                send_json(&mut stream, serde_json::json!({"ok": true, "env_path": path}));
+            }
+            Err(e) => send_err(&mut stream, 500, &e),
+        }
+        return;
+    }
     if clean == "/api/agents/connect" && method == "POST" {
         let body = parse_json_body(&req);
         let agent_id = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
@@ -580,6 +599,45 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
             let _ = stream.write_all(msg.as_bytes());
         }
     }
+}
+
+/// 写 LLM 配置到 .env(更新已有 key 或追加,保留其他行),返回 .env 路径。
+/// 路径解析与 lib.rs::load_env_file 对齐:cwd 优先,其次 exe 同目录。
+fn write_llm_env(api_key: &str, base_url: &str, model: &str) -> Result<String, String> {
+    let cwd_env = std::env::current_dir().map(|d| d.join(".env")).ok();
+    let exe_env = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(".env")));
+    let env_path = {
+        let mut found: Option<std::path::PathBuf> = None;
+        for p in cwd_env.as_ref().into_iter().chain(exe_env.as_ref()) {
+            if p.exists() { found = Some(p.clone()); break; }
+        }
+        found.or_else(|| cwd_env.clone()).or_else(|| exe_env.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from(".env"))
+    };
+
+    // 读现有 .env(保留非 LLM 行)
+    let mut lines: Vec<String> = std::fs::read_to_string(&env_path).ok()
+        .map(|c| c.lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default();
+
+    // 更新或追加三个 GM_LLM_ key
+    let updates = [
+        ("GM_LLM_API_KEY", api_key),
+        ("GM_LLM_BASE_URL", base_url),
+        ("GM_LLM_MODEL", model),
+    ];
+    for (key, val) in &updates {
+        let prefix = format!("{}=", key);
+        if let Some(line) = lines.iter_mut().find(|l| l.trim_start().starts_with(&prefix)) {
+            *line = format!("{}={}", key, val);
+        } else {
+            lines.push(format!("{}={}", key, val));
+        }
+    }
+
+    let body = lines.join("\n");
+    std::fs::write(&env_path, body).map_err(|e| format!("write .env failed: {}", e))?;
+    Ok(env_path.to_string_lossy().into())
 }
 
 /// 启动静态服务器,返回实际监听端口
