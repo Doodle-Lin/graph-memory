@@ -72,7 +72,8 @@ impl GraphEngine {
             "CREATE TABLE IF NOT EXISTS nodes (
                 id TEXT PRIMARY KEY, content TEXT NOT NULL, title TEXT DEFAULT '',
                 node_type TEXT DEFAULT 'knowledge', source TEXT DEFAULT 'manual',
-                metadata TEXT DEFAULT '{}', created_at TEXT, updated_at TEXT
+                metadata TEXT DEFAULT '{}', created_at TEXT, updated_at TEXT,
+                content_hash TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS edges (
                 source TEXT NOT NULL, target TEXT NOT NULL,
@@ -80,10 +81,45 @@ impl GraphEngine {
                 metadata TEXT DEFAULT '{}', created_at TEXT,
                 PRIMARY KEY (source, target)
             );
+            CREATE TABLE IF NOT EXISTS node_history (
+                node_id TEXT NOT NULL, old_title TEXT, old_content TEXT,
+                changed_at TEXT NOT NULL,
+                FOREIGN KEY(node_id) REFERENCES nodes(id)
+            );
             CREATE INDEX IF NOT EXISTS idx_node_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_node_source ON nodes(source);
             CREATE INDEX IF NOT EXISTS idx_node_created ON nodes(created_at);",
         )?;
+
+        // 迁移:旧表无 content_hash 列时添加(ALTER TABLE 不能用 IF NOT EXISTS)
+        let has_content_hash: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name='content_hash'",
+            [], |r| r.get::<_, i64>(0)
+        ).unwrap_or(0) > 0;
+        if !has_content_hash {
+            log::info!("Migrating: adding content_hash column to nodes");
+            let _ = db.execute("ALTER TABLE nodes ADD COLUMN content_hash TEXT DEFAULT ''", []);
+        }
+
+        // content_hash 索引(列存在后再建)
+        let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_node_hash ON nodes(content_hash)", []);
+
+        // 迁移:旧数据无 content_hash 列时补上(用 content 的 sha256 前 16 位)
+        let need_migrate: i64 = db.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE content_hash = '' OR content_hash IS NULL",
+            [], |r| r.get(0)
+        ).unwrap_or(0);
+        if need_migrate > 0 {
+            log::info!("Migrating {} nodes: backfilling content_hash", need_migrate);
+            let mut stmt = db.prepare("SELECT id, content FROM nodes WHERE content_hash = '' OR content_hash IS NULL")?;
+            let rows: Vec<(String, String)> = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .filter_map(|r| r.ok()).collect();
+            for (id, content) in rows {
+                let hash = Self::content_hash(&content);
+                let _ = db.execute("UPDATE nodes SET content_hash = ? WHERE id = ?", params![hash, id]);
+            }
+            log::info!("Migration done: {} nodes backfilled", need_migrate);
+        }
 
         // FTS5 全文检索(trigram tokenizer,中文友好,不需要 jieba)
         // BM25 关键词搜索:精确匹配型号/端口/路径,弥补 embedding 对标识符的弱点
@@ -159,10 +195,16 @@ impl GraphEngine {
         Ok(())
     }
 
-    fn node_id(content: &str) -> String {
+    /// content 的 hash(用于精确去重,与 node id 解耦)
+    fn content_hash(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         hex::encode(hasher.finalize())[..16].to_string()
+    }
+
+    /// 生成唯一 node id(UUID v4,不再依赖 content hash)
+    fn new_node_id() -> String {
+        uuid::Uuid::new_v4().to_string()
     }
 
     fn now() -> String {
@@ -305,11 +347,15 @@ impl GraphEngine {
 
     /// 直接写入 SQLite(不生成 embedding,用于批量导入)
     pub fn add_node_raw(&mut self, content: &str, title: &str, node_type: &str, source: &str) -> Result<(), String> {
-        let nid = Self::node_id(content);
+        let nid = Self::new_node_id();
+        let chash = Self::content_hash(content);
         let now = Self::now();
 
-        // 跳过已存在(hash 去重)
-        if self.node_map.contains_key(&nid) {
+        // 跳过已存在(content_hash 精确去重,不再依赖 id=hash)
+        if self.db.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM nodes WHERE content_hash = ?", params![chash],
+            |r| r.get(0)
+        ).unwrap_or(0) > 0 {
             return Ok(());
         }
 
@@ -322,8 +368,8 @@ impl GraphEngine {
         };
 
         self.db.execute(
-            "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
-            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
+            "INSERT OR REPLACE INTO nodes (id, content, title, node_type, source, metadata, created_at, updated_at, content_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at, &chash],
         ).map_err(|e| e.to_string())?;
         self.fts_upsert(&node.id, &node.title, &node.content);
 
@@ -333,13 +379,20 @@ impl GraphEngine {
     }
 
     pub fn add_node(&mut self, content: &str, title: &str, node_type: &str, source: &str, metadata: &str) -> Result<Node> {
-        let nid = Self::node_id(content);
         let now = Self::now();
+        let chash = Self::content_hash(content);
 
-        // 第一层: hash 匹配
-        if let Some(&idx) = self.node_map.get(&nid) {
-            self.graph[idx].updated_at = now;
-            return Ok(self.graph[idx].clone());
+        // 第一层: content_hash 精确去重(不再依赖 id=hash)
+        let dup_id: Option<String> = self.db.query_row(
+            "SELECT id FROM nodes WHERE content_hash = ?", params![chash],
+            |r| r.get(0)
+        ).ok();
+        if let Some(existing_id) = dup_id {
+            if let Some(&idx) = self.node_map.get(&existing_id) {
+                self.graph[idx].updated_at = now.clone();
+                let _ = self.db.execute("UPDATE nodes SET updated_at = ? WHERE id = ?", params![&now, existing_id]);
+                return Ok(self.graph[idx].clone());
+            }
         }
 
         // 模型未就绪时:跳过 embedding 相似度去重,走 raw 写入(hash 去重已覆盖第一层)
@@ -347,19 +400,24 @@ impl GraphEngine {
             return self.add_node_raw_fallback(content, title, node_type, source, metadata);
         }
 
-        // 第二层: embedding 相似度
+        // 第二层: embedding 相似度去重(>=0.85)
         let new_emb = self.embed(content)?;
         for (existing_id, existing_emb) in &self.embeddings {
             let sim = Self::cosine_sim(&new_emb, existing_emb);
             if sim >= DEDUP_THRESHOLD {
                 if let Some(&idx) = self.node_map.get(existing_id) {
                     self.graph[idx].updated_at = now.clone();
+                    let _ = self.db.execute("UPDATE nodes SET updated_at = ? WHERE id = ?", params![&now, existing_id]);
+                    // D1 修复:不再静默丢弃新内容。调用方(写 API)能通过返回的已存在节点
+                    // 判断这是去重命中,而非新建。新内容在写 API 层走 update 路径。
+                    log::info!("add_node: near-duplicate (sim={:.3}) of {}, new content preserved via API layer", sim, existing_id);
                     return Ok(self.graph[idx].clone());
                 }
             }
         }
 
-        // 第三层: 新建
+        // 第三层: 新建(UUID id,不再依赖 content hash)
+        let nid = Self::new_node_id();
         let nt = if is_valid_type(node_type) { node_type.to_string() } else { "knowledge".to_string() };
         let t = if title.is_empty() { content.chars().take(40).collect() } else { title.to_string() };
         let node = Node {
@@ -374,8 +432,8 @@ impl GraphEngine {
         };
 
         self.db.execute(
-            "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
-            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
+            "INSERT OR REPLACE INTO nodes (id, content, title, node_type, source, metadata, created_at, updated_at, content_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at, &chash],
         )?;
         self.fts_upsert(&node.id, &node.title, &node.content);
 
@@ -386,13 +444,15 @@ impl GraphEngine {
     }
 
     /// add_node 的降级路径:embedder 未就绪时,跳过 embedding 相似度去重,
-    /// 直接 raw 写入(hash 去重已在第一层覆盖)。模型就绪后由 enrich_all 补 embedding。
+    /// 直接 raw 写入(content_hash 去重已在第一层覆盖)。模型就绪后由 enrich_all 补 embedding。
     fn add_node_raw_fallback(&mut self, content: &str, title: &str, node_type: &str, source: &str, metadata: &str) -> Result<Node> {
         let nt = if is_valid_type(node_type) { node_type.to_string() } else { "knowledge".to_string() };
         let t = if title.is_empty() { content.chars().take(40).collect() } else { title.to_string() };
         let now = Self::now();
+        let nid = Self::new_node_id();
+        let chash = Self::content_hash(content);
         let node = Node {
-            id: Self::node_id(content),
+            id: nid.clone(),
             content: content.to_string(),
             title: t,
             node_type: nt,
@@ -402,10 +462,10 @@ impl GraphEngine {
             updated_at: now,
         };
         self.db.execute(
-            "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
-            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
+            "INSERT OR REPLACE INTO nodes (id, content, title, node_type, source, metadata, created_at, updated_at, content_hash) VALUES (?,?,?,?,?,?,?,?,?)",
+            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at, &chash],
         )?;
-        self.fts_upsert(&node.id, &node.title, &node.content);
+        self.fts_upsert(&nid, &node.title, &node.content);
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(node.id.clone(), idx);
         Ok(node)
@@ -519,15 +579,25 @@ impl GraphEngine {
         for (rank, (id, _)) in sem_sims.iter().take(top_k * 4).enumerate() {
             *rrf_scores.entry(id.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank as f32 + 1.0);
         }
-        // 归一化 RRF 到 [0,1](便于后续阈值和融合)
+        // 归一化 RRF 到 [0,1](用于排序)
         let max_rrf = rrf_scores.values().cloned().fold(0.0f32, f32::max).max(1e-8);
         let mut sims: Vec<(String, f32)> = rrf_scores.iter()
             .map(|(id, score)| (id.clone(), score / max_rrf))
             .collect();
         sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
+        // A1 修复:构建 sem_map 做准入门槛(O(1) 查,避免重复算 cosine)
+        // 准入条件:原始 cosine >= 0.2 OR BM25 命中(任一即可)
+        // RRF 只做排序,不做门槛(RRF 归一化后所有候选 >0.3,门槛是死代码)
+        let sem_map: HashMap<String, f32> = sem_sims.iter().cloned().collect();
+        let bm25_set: std::collections::HashSet<String> = bm25_results.iter().map(|(id, _)| id.clone()).collect();
+        let is_relevant = |id: &str| -> bool {
+            let sem = sem_map.get(id).copied().unwrap_or(0.0);
+            sem >= 0.2 || bm25_set.contains(id)
+        };
+
         let seeds: Vec<(String, f32)> = sims.iter().take(SEED_TOP_K)
-            .filter(|(_, s)| *s >= MIN_SIM_THRESHOLD)
+            .filter(|(id, _)| is_relevant(id))
             .cloned()
             .collect();
         if seeds.is_empty() {
@@ -536,13 +606,13 @@ impl GraphEngine {
 
         if !spread {
             return Ok(sims.iter().take(top_k)
-                .filter(|(_, s)| *s >= MIN_SIM_THRESHOLD)
+                .filter(|(id, _)| is_relevant(id))
                 .filter_map(|(id, sim)| {
                     self.node_map.get(id).map(|&idx| {
                         let node = &self.graph[idx];
-                        let sem = sem_sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
-                        let is_kw = bm25_results.iter().any(|(bid, _)| bid == id);
-                        let mt = if is_kw && sem > 0.3 { "hybrid" } else if is_kw { "keyword" } else { "semantic" };
+                        let sem = sem_map.get(id).copied().unwrap_or(0.0);
+                        let is_kw = bm25_set.contains(id);
+                        let mt = if is_kw && sem >= 0.2 { "hybrid" } else if is_kw { "keyword" } else { "semantic" };
                         RetrieveResult {
                             id: node.id.clone(), content: node.content.clone(),
                             title: node.title.clone(), node_type: node.node_type.clone(),
@@ -584,18 +654,18 @@ impl GraphEngine {
 
         let mut results: Vec<(RetrieveResult, f64)> = self.embeddings.keys()
             .filter_map(|id| {
-                // 用 RRF 融合分(而非纯语义分)做阈值和融合
+                // A1 修复:准入用原始 cosine + BM25 命中,不用 RRF 归一化分
+                if !is_relevant(id) { return None; }
                 let rrf = sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
-                if rrf < MIN_SIM_THRESHOLD { return None; }
-                let sem_orig = sem_sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
+                let sem_orig = sem_map.get(id).copied().unwrap_or(0.0);
                 let pr = pr_scores.get(id).copied().unwrap_or(0.0) / pr_sum.max(1e-8);
                 let fused = 0.5 * rrf as f64 + 0.5 * pr;
                 let idx = self.node_map.get(id)?;
                 let node = &self.graph[*idx];
                 let priority = type_priority.get(node.node_type.as_str()).copied().unwrap_or(9.0);
                 let sort_key = (fused * 100.0).round() / 100.0 - 0.01 * priority;
-                let is_kw = bm25_results.iter().any(|(bid, _)| bid == id);
-                let mt = if is_kw && sem_orig > 0.3 { "hybrid_spread" } else if is_kw { "keyword_spread" } else { "graph_spread" };
+                let is_kw = bm25_set.contains(id);
+                let mt = if is_kw && sem_orig >= 0.2 { "hybrid_spread" } else if is_kw { "keyword_spread" } else { "graph_spread" };
                 Some((RetrieveResult {
                     id: node.id.clone(), content: node.content.clone(),
                     title: node.title.clone(), node_type: node.node_type.clone(),
@@ -643,19 +713,29 @@ impl GraphEngine {
     }
 
     /// 更新节点的标题和内容(保留 id, type, source, metadata)
+    /// C2 修复:存历史到 node_history 表,可追溯/恢复
     pub fn update_node_text(&mut self, id: &str, new_title: &str, new_content: &str) -> Result<()> {
         let idx = *self
             .node_map
             .get(id)
             .context("node not found")?;
         let node = &mut self.graph[idx];
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 存历史(旧标题+旧内容)到 node_history,可追溯
+        self.db.execute(
+            "INSERT INTO node_history (node_id, old_title, old_content, changed_at) VALUES (?,?,?,?)",
+            params![id, &node.title, &node.content, &now],
+        )?;
+
         node.title = new_title.to_string();
         node.content = new_content.to_string();
-        node.updated_at = chrono::Utc::now().to_rfc3339();
-        // 同步到 SQLite + FTS5
+        node.updated_at = now.clone();
+        // 同步到 SQLite + FTS5(content_hash 也更新,保持一致性)
+        let chash = Self::content_hash(new_content);
         self.db.execute(
-            "UPDATE nodes SET title = ?, content = ?, updated_at = ? WHERE id = ?",
-            params![new_title, new_content, node.updated_at, id],
+            "UPDATE nodes SET title = ?, content = ?, updated_at = ?, content_hash = ? WHERE id = ?",
+            params![new_title, new_content, &now, &chash, id],
         )?;
         self.fts_upsert(id, new_title, new_content);
         Ok(())
