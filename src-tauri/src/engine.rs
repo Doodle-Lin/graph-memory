@@ -85,6 +85,16 @@ impl GraphEngine {
             CREATE INDEX IF NOT EXISTS idx_node_created ON nodes(created_at);",
         )?;
 
+        // FTS5 全文检索(trigram tokenizer,中文友好,不需要 jieba)
+        // BM25 关键词搜索:精确匹配型号/端口/路径,弥补 embedding 对标识符的弱点
+        let _ = db.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                node_id UNINDEXED, title, content, tokenize='trigram'
+            );"
+        );
+        let fts_count: i64 = db.query_row("SELECT COUNT(*) FROM nodes_fts", [], |r| r.get(0)).unwrap_or(0);
+        log::info!("FTS5 table: {} entries (trigram tokenizer)", fts_count);
+
         // 懒加载 embedding 模型(不在启动时加载,避免阻塞窗口创建)
         let mut engine = Self {
             db,
@@ -135,6 +145,17 @@ impl GraphEngine {
             }
         }
         log::info!("Loaded {} nodes, {} edges", self.graph.node_count(), self.graph.edge_count());
+
+        // FTS5 表如果为空但 nodes 有数据(首次建表/迁移),从 nodes 填充
+        let fts_count: i64 = self.db.query_row("SELECT COUNT(*) FROM nodes_fts", [], |r| r.get(0)).unwrap_or(0);
+        let node_count: i64 = self.db.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap_or(0);
+        if fts_count == 0 && node_count > 0 {
+            let added = self.db.execute(
+                "INSERT INTO nodes_fts(node_id, title, content) SELECT id, title, content FROM nodes",
+                [],
+            ).unwrap_or(0);
+            log::info!("FTS5 populated from existing nodes: {} entries", added);
+        }
         Ok(())
     }
 
@@ -155,6 +176,80 @@ impl GraphEngine {
     /// embedder 是否已加载(用于判断能否走 embedding 去重/auto_link)
     pub fn embedder_ready(&self) -> bool {
         self.embedder.borrow().is_some()
+    }
+
+    // ── FTS5 同步辅助 ──
+    /// 插入/更新 FTS5 索引(先删后插,避免重复)
+    fn fts_upsert(&self, id: &str, title: &str, content: &str) {
+        let _ = self.db.execute("DELETE FROM nodes_fts WHERE node_id = ?", params![id]);
+        let _ = self.db.execute(
+            "INSERT INTO nodes_fts(node_id, title, content) VALUES(?,?,?)",
+            params![id, title, content],
+        );
+    }
+    fn fts_delete(&self, id: &str) {
+        let _ = self.db.execute("DELETE FROM nodes_fts WHERE node_id = ?", params![id]);
+    }
+
+    /// BM25 关键词搜索(FTS5 trigram)。返回 (node_id, score),score 越高越好。
+    /// trigram tokenizer 自动把 query 和 content 切成 3-gram 匹配,中文友好。
+    /// 但 FTS5 MATCH 默认 AND 语义——query 里有个词文档没有就全空。
+    /// 所以拆成 term(ASCII 串 + CJK 3-gram)用 OR 连接,任何匹配都返回,BM25 排序。
+    fn bm25_search(&self, query: &str, limit: usize) -> Vec<(String, f32)> {
+        let terms = Self::split_query_terms(query);
+        if terms.is_empty() { return Vec::new(); }
+        let fts_query = terms.join(" OR ");
+        let mut stmt = match self.db.prepare(
+            "SELECT node_id, bm25(nodes_fts) as rank FROM nodes_fts
+             WHERE nodes_fts MATCH ? ORDER BY rank LIMIT ?"
+        ) {
+            Ok(s) => s,
+            Err(e) => { log::warn!("FTS5 prepare failed: {} (query: {})", e, fts_query); return Vec::new(); }
+        };
+        let rows = match stmt.query_map(params![fts_query, limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let rank: f64 = row.get::<_, f64>(1)?;
+            Ok((id, -rank as f32))
+        }) {
+            Ok(r) => r,
+            Err(e) => { log::warn!("FTS5 query failed: {} (query: {})", e, fts_query); return Vec::new(); }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// 把 query 拆成 FTS5 搜索 term:ASCII 字母数字串(如"8397")+ CJK 3-gram(如"板子怎")
+    /// 用 OR 连接给 FTS5,避免 AND 语义导致对话词("怎么连")不在文档里就全空
+    fn split_query_terms(query: &str) -> Vec<String> {
+        let mut terms = Vec::new();
+        let mut ascii_buf = String::new();
+        let mut cjk_buf: Vec<char> = Vec::new();
+        let flush_cjk = |cjk: &mut Vec<char>, terms: &mut Vec<String>| {
+            if cjk.len() >= 3 {
+                for i in 0..cjk.len() - 2 {
+                    terms.push(format!("{}{}{}", cjk[i], cjk[i+1], cjk[i+2]));
+                }
+            } else if cjk.len() > 0 {
+                // 不足 3 字的 CJK,直接用原串(trigram 可能匹配不到,但 OR 不影响其他 term)
+                terms.push(cjk.iter().collect());
+            }
+            cjk.clear();
+        };
+        for ch in query.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                if !cjk_buf.is_empty() { flush_cjk(&mut cjk_buf, &mut terms); }
+                ascii_buf.push(ch);
+            } else if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+                if !ascii_buf.is_empty() { terms.push(ascii_buf.clone()); ascii_buf.clear(); }
+                cjk_buf.push(ch);
+            } else {
+                if !ascii_buf.is_empty() { terms.push(ascii_buf.clone()); ascii_buf.clear(); }
+                if !cjk_buf.is_empty() { flush_cjk(&mut cjk_buf, &mut terms); }
+            }
+        }
+        if !ascii_buf.is_empty() { terms.push(ascii_buf); }
+        if !cjk_buf.is_empty() { flush_cjk(&mut cjk_buf, &mut terms); }
+        // 去空
+        terms.into_iter().filter(|t| !t.is_empty()).collect()
     }
 
     /// 批量补全:为所有缺 embedding 的节点计算 embedding,并跑 auto_link 建边。
@@ -230,6 +325,7 @@ impl GraphEngine {
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
             params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
         ).map_err(|e| e.to_string())?;
+        self.fts_upsert(&node.id, &node.title, &node.content);
 
         let idx = self.graph.add_node(node);
         self.node_map.insert(nid, idx);
@@ -281,6 +377,7 @@ impl GraphEngine {
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
             params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
         )?;
+        self.fts_upsert(&node.id, &node.title, &node.content);
 
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(nid.clone(), idx);
@@ -308,6 +405,7 @@ impl GraphEngine {
             "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
             params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
         )?;
+        self.fts_upsert(&node.id, &node.title, &node.content);
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(node.id.clone(), idx);
         Ok(node)
@@ -376,14 +474,55 @@ impl GraphEngine {
 
     pub fn retrieve(&mut self, query: &str, top_k: Option<usize>, spread: bool) -> Result<Vec<RetrieveResult>> {
         let top_k = top_k.unwrap_or(RETRIEVAL_TOP_K);
-        // 模型没就绪时:不能 embed query,直接返回空(而非 500 panic)
+
+        // ── 混合检索:BM25(关键词) + Embedding(语义) → RRF 融合 ──
+        // BM25:精确匹配型号/端口/路径(FTS5 trigram,中文友好)
+        // Embedding:概念匹配,同义词/意图
+        // RRF:按排名融合,不依赖分数尺度,工业标准
+
+        // 1. BM25 关键词搜索
+        let bm25_results = self.bm25_search(query, top_k * 4);
+
+        // 模型没就绪:只用 BM25(不需要 embedding)
         if !self.embedder_ready() || self.embeddings.is_empty() {
-            return Ok(Vec::new());
+            return Ok(bm25_results.iter().take(top_k)
+                .filter_map(|(id, score)| {
+                    self.node_map.get(id).map(|&idx| {
+                        let node = &self.graph[idx];
+                        RetrieveResult {
+                            id: node.id.clone(), content: node.content.clone(),
+                            title: node.title.clone(), node_type: node.node_type.clone(),
+                            source: node.source.clone(), created_at: node.created_at.clone(),
+                            updated_at: node.updated_at.clone(),
+                            score: *score as f64, semantic_score: 0.0,
+                            pagerank_score: 0.0, match_type: "keyword".to_string(),
+                        }
+                    })
+                })
+                .collect());
         }
 
         let query_emb = self.embed(query)?;
-        let mut sims: Vec<(String, f32)> = self.embeddings.iter()
+
+        // 2. Embedding 语义搜索(O(N) 遍历,N 小时够快)
+        let mut sem_sims: Vec<(String, f32)> = self.embeddings.iter()
             .map(|(id, emb)| (id.clone(), Self::cosine_sim(&query_emb, emb)))
+            .collect();
+        sem_sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // 3. Reciprocal Rank Fusion(k=60,标准值)
+        let rrf_k = 60.0;
+        let mut rrf_scores: HashMap<String, f32> = HashMap::new();
+        for (rank, (id, _)) in bm25_results.iter().enumerate() {
+            *rrf_scores.entry(id.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank as f32 + 1.0);
+        }
+        for (rank, (id, _)) in sem_sims.iter().take(top_k * 4).enumerate() {
+            *rrf_scores.entry(id.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank as f32 + 1.0);
+        }
+        // 归一化 RRF 到 [0,1](便于后续阈值和融合)
+        let max_rrf = rrf_scores.values().cloned().fold(0.0f32, f32::max).max(1e-8);
+        let mut sims: Vec<(String, f32)> = rrf_scores.iter()
+            .map(|(id, score)| (id.clone(), score / max_rrf))
             .collect();
         sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
@@ -401,20 +540,23 @@ impl GraphEngine {
                 .filter_map(|(id, sim)| {
                     self.node_map.get(id).map(|&idx| {
                         let node = &self.graph[idx];
+                        let sem = sem_sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
+                        let is_kw = bm25_results.iter().any(|(bid, _)| bid == id);
+                        let mt = if is_kw && sem > 0.3 { "hybrid" } else if is_kw { "keyword" } else { "semantic" };
                         RetrieveResult {
                             id: node.id.clone(), content: node.content.clone(),
                             title: node.title.clone(), node_type: node.node_type.clone(),
                             source: node.source.clone(), created_at: node.created_at.clone(),
                             updated_at: node.updated_at.clone(),
-                            score: *sim as f64, semantic_score: *sim as f64,
-                            pagerank_score: 0.0, match_type: "semantic".to_string(),
+                            score: *sim as f64, semantic_score: sem as f64,
+                            pagerank_score: 0.0, match_type: mt.to_string(),
                         }
                     })
                 })
                 .collect());
         }
 
-        // 简化 PageRank: 语义分数 + 邻居传播
+        // 4. 图扩散(PageRank 简化版:语义分 + 邻居传播)
         let mut pr_scores: HashMap<String, f64> = HashMap::new();
         let total_seed: f32 = seeds.iter().map(|(_, s)| s).sum();
 
@@ -442,21 +584,25 @@ impl GraphEngine {
 
         let mut results: Vec<(RetrieveResult, f64)> = self.embeddings.keys()
             .filter_map(|id| {
-                let sem = Self::cosine_sim(&query_emb, &self.embeddings[id]) / sem_max;
-                if sem < MIN_SIM_THRESHOLD { return None; }
+                // 用 RRF 融合分(而非纯语义分)做阈值和融合
+                let rrf = sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
+                if rrf < MIN_SIM_THRESHOLD { return None; }
+                let sem_orig = sem_sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
                 let pr = pr_scores.get(id).copied().unwrap_or(0.0) / pr_sum.max(1e-8);
-                let fused = 0.5 * sem as f64 + 0.5 * pr;
+                let fused = 0.5 * rrf as f64 + 0.5 * pr;
                 let idx = self.node_map.get(id)?;
                 let node = &self.graph[*idx];
                 let priority = type_priority.get(node.node_type.as_str()).copied().unwrap_or(9.0);
                 let sort_key = (fused * 100.0).round() / 100.0 - 0.01 * priority;
+                let is_kw = bm25_results.iter().any(|(bid, _)| bid == id);
+                let mt = if is_kw && sem_orig > 0.3 { "hybrid_spread" } else if is_kw { "keyword_spread" } else { "graph_spread" };
                 Some((RetrieveResult {
                     id: node.id.clone(), content: node.content.clone(),
                     title: node.title.clone(), node_type: node.node_type.clone(),
                     source: node.source.clone(), created_at: node.created_at.clone(),
                     updated_at: node.updated_at.clone(),
-                    score: fused, semantic_score: sem as f64, pagerank_score: pr,
-                    match_type: if pr > 0.01 { "graph_spread" } else { "semantic" }.to_string(),
+                    score: fused, semantic_score: sem_orig as f64, pagerank_score: pr,
+                    match_type: mt.to_string(),
                 }, sort_key))
             })
             .collect();
@@ -506,11 +652,12 @@ impl GraphEngine {
         node.title = new_title.to_string();
         node.content = new_content.to_string();
         node.updated_at = chrono::Utc::now().to_rfc3339();
-        // 同步到 SQLite
+        // 同步到 SQLite + FTS5
         self.db.execute(
             "UPDATE nodes SET title = ?, content = ?, updated_at = ? WHERE id = ?",
             params![new_title, new_content, node.updated_at, id],
         )?;
+        self.fts_upsert(id, new_title, new_content);
         Ok(())
     }
 
@@ -576,9 +723,10 @@ impl GraphEngine {
                 self.node_map.insert(self.graph[i].id.clone(), i);
             }
             self.embeddings.remove(id);
-            // 从 SQLite 删
+            // 从 SQLite + FTS5 删
             let _ = self.db.execute("DELETE FROM nodes WHERE id = ?", params![id]);
             let _ = self.db.execute("DELETE FROM edges WHERE source = ? OR target = ?", params![id, id]);
+            self.fts_delete(id);
             true
         } else {
             false
