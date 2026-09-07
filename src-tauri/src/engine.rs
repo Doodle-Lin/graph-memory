@@ -466,9 +466,22 @@ impl GraphEngine {
     }
 
     pub fn stats(&self) -> serde_json::Value {
+        // 类型/来源分布(遍历全图,供前端筛选器显示准确计数)
+        let mut type_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut source_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for node in self.graph.node_weights() {
+            *type_counts.entry(node.node_type.clone()).or_insert(0) += 1;
+            *source_counts.entry(node.source.clone()).or_insert(0) += 1;
+        }
+        let edge_count = self.graph.edge_count();
+        let max_edges = self.graph.node_count() * (self.graph.node_count().saturating_sub(1));
+        let density = if max_edges > 0 { edge_count as f64 / max_edges as f64 } else { 0.0 };
         serde_json::json!({
             "node_count": self.graph.node_count(),
-            "edge_count": self.graph.edge_count(),
+            "edge_count": edge_count,
+            "density": (density * 1000.0).round() / 1000.0,
+            "type_counts": type_counts,
+            "source_counts": source_counts,
         })
     }
 

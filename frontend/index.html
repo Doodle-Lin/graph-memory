@@ -631,7 +631,7 @@ async function loadGraph() {
 function updateStats(stats) {
   document.getElementById('stat-nodes').textContent = stats.node_count;
   document.getElementById('stat-edges').textContent = stats.edge_count;
-  document.getElementById('stat-density').textContent = stats.density;
+  document.getElementById('stat-density').textContent = stats.density != null ? (stats.density * 100).toFixed(1) + '%' : '0';
 }
 
 // ── 节点详情(右栏) ───────────────────────────────────────
@@ -755,6 +755,7 @@ async function search() {
 }
 async function loadRecent() {
   const results = await apiRecent(20);
+  // 筛选器计数由 /api/stats 全量统计(不靠 20 条最近节点),在启动 IIFE 已拉
   const filtered = results.filter(r => { const typeOk = activeTypes.size===0||activeTypes.has(r.node_type); const srcOk = activeSources.size===0||activeSources.has(r.source); return typeOk && srcOk; });
   loadSearchResults(filtered.map(r => ({...r, score:0, match_type:'recent'})));
 }
@@ -1058,21 +1059,10 @@ document.getElementById('refine-btn').addEventListener('click', refineNodes);
   try {
     const s = await apiStats();
     updateStats(s);
-    // 占位:筛选器显示"打开图谱后加载"
-    const tc = document.getElementById('filter-types');
-    const sc = document.getElementById('filter-sources');
-    if (tc && !tc.querySelector('.filter-chip')) {
-      const ph = document.createElement('span');
-      ph.className = 'filter-clear'; ph.textContent = '图谱加载后显示';
-      ph.style.cursor = 'default';
-      tc.appendChild(ph);
-    }
-    if (sc && !sc.querySelector('.filter-chip')) {
-      const ph = document.createElement('span');
-      ph.className = 'filter-clear'; ph.textContent = '图谱加载后显示';
-      ph.style.cursor = 'default';
-      sc.appendChild(ph);
-    }
+    // 用 /api/stats 的 type_counts/source_counts 填筛选器(全图准确计数)
+    if (s.type_counts) { allTypeCounts = s.type_counts; }
+    if (s.source_counts) { allSourceCounts = s.source_counts; }
+    buildFilterBar();
   } catch(e) { console.error('init stats failed:', e); }
 })();
 loadRecent();
