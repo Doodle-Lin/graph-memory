@@ -319,6 +319,41 @@
   #llm-modal .btn-cancel:hover { background:var(--panel-hover); }
   #llm-modal .env-hint { font-size:11px; color:var(--text-faint); margin-top:10px; line-height:1.5; padding:8px 10px; background:var(--bg-soft); border-radius:var(--radius-xs); border:1px solid var(--border-soft); }
 
+  /* ── 提炼进度面板 ── */
+  #refine-panel {
+    position:absolute; top:54px; right:14px; z-index:20; width:460px; max-width:90vw;
+    max-height:70vh; background:var(--panel-2); border:1px solid var(--border);
+    border-radius:var(--radius); box-shadow:var(--shadow-lg); display:none;
+    flex-direction:column; animation:panelIn .25s var(--ease-out);
+  }
+  #refine-panel.active { display:flex; }
+  #refine-panel .rp-header {
+    padding:12px 16px 8px; display:flex; align-items:center; gap:8px;
+    border-bottom:1px solid var(--border-soft);
+  }
+  #refine-panel .rp-header .rp-title { font-size:13px; font-weight:650; color:var(--text); }
+  #refine-panel .rp-close {
+    margin-left:auto; background:none; border:none; color:var(--text-faint);
+    cursor:pointer; font-size:16px; line-height:1; padding:2px 4px; transition:color .15s;
+  }
+  #refine-panel .rp-close:hover { color:var(--text); }
+  #refine-bar { padding:8px 16px; }
+  #refine-bar-track { width:100%; height:6px; background:var(--bg-soft); border-radius:3px; overflow:hidden; }
+  #refine-bar-fill { height:100%; background:var(--accent-grad); border-radius:3px; width:0%; transition:width .3s var(--ease); }
+  #refine-summary { font-size:12px; color:var(--text-dim); padding:4px 16px 6px; }
+  #refine-log { flex:1; overflow-y:auto; padding:6px 16px 12px; }
+  #refine-log::-webkit-scrollbar { width:6px; }
+  #refine-log::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+  .refine-row {
+    display:flex; align-items:center; gap:8px; padding:4px 0;
+    font-size:12px; border-bottom:1px solid var(--border-soft);
+  }
+  .refine-row .r-old { color:var(--text-dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-decoration:line-through; opacity:0.6; }
+  .refine-row .r-arrow { color:var(--text-faint); flex-shrink:0; }
+  .refine-row .r-new { color:var(--accent); flex:1.5; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
+  .refine-row .r-len { color:var(--text-faint); font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0; }
+  .refine-row.refine-error .r-err { color:var(--danger); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1.5; }
+
   #toast {
     position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
     background:var(--panel-2); border:1px solid var(--border); border-radius:var(--radius-sm);
@@ -439,6 +474,19 @@
 
     <!-- 添加节点表单(浮动) -->
     <div id="add-form">
+
+    <!-- 提炼进度面板(浮动) -->
+    <div id="refine-panel">
+      <div class="rp-header">
+        <span class="rp-title">🧪 LLM 提炼</span>
+        <button class="rp-close" onclick="document.getElementById('refine-panel').classList.remove('active')">✕</button>
+      </div>
+      <div id="refine-bar">
+        <div id="refine-bar-track"><div id="refine-bar-fill"></div></div>
+      </div>
+      <div id="refine-summary">准备中…</div>
+      <div id="refine-log"></div>
+    </div>
       <h3>添加知识节点</h3>
       <div class="field-label">类型</div>
       <select id="add-type">
@@ -837,16 +885,78 @@ function relayoutGraph() {
 
 function showToast(msg) { const toast = document.getElementById('toast'); toast.textContent = msg; toast.classList.add('show'); setTimeout(() => toast.classList.remove('show'), 2000); }
 
-// ── LLM 提炼 ─────────────────────────────────────────────
+// ── LLM 提炼(SSE 流式进度) ──────────────────────────────
 async function refineNodes() {
   const btn = document.getElementById('refine-btn');
-  btn.disabled = true; btn.textContent = '提炼中...'; showToast('正在用 LLM 提炼节点标题(可能需要几分钟)...');
+  btn.disabled = true; btn.textContent = '提炼中...';
+
+  // 打开提炼进度面板
+  const panel = document.getElementById('refine-panel');
+  const log = document.getElementById('refine-log');
+  const bar = document.getElementById('refine-bar');
+  const barFill = document.getElementById('refine-bar-fill');
+  const summary = document.getElementById('refine-summary');
+  log.innerHTML = ''; bar.style.display = 'block'; barFill.style.width = '0%';
+  summary.textContent = ''; panel.classList.add('active');
+
   try {
-    const res = await fetch(`${API}/api/refine`, { method:'POST' });
-    const data = await res.json();
-    if (data.message) showToast(data.message);
-    if (data.refined > 0) { if (cyInited) loadGraph(); loadRecent(); }
-  } catch(e) { showToast('提炼失败: ' + e.message); }
+    const resp = await fetch(`${API}/api/refine`, { method:'POST' });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let total = 0, refined = 0, errors = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // 解析 SSE 事件(以 \n\n 分隔)
+      const events = buf.split('\n\n');
+      buf = events.pop() || ''; // 最后一段可能不完整
+      for (const ev of events) {
+        const lines = ev.split('\n');
+        let eventType = 'message', data = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) eventType = line.slice(7);
+          else if (line.startsWith('data: ')) data = line.slice(6);
+        }
+        if (!data) continue;
+        const d = JSON.parse(data);
+
+        if (eventType === 'start') {
+          total = d.total;
+          summary.textContent = `共 ${total} 个节点待提炼(跳过 ${d.skipped} 个已够短)`;
+        } else if (eventType === 'progress') {
+          refined++;
+          const pct = total > 0 ? (d.index / total * 100) : 0;
+          barFill.style.width = pct + '%';
+          summary.textContent = `${d.index} / ${total} — ${d.new_title}`;
+          // 对比行
+          const row = document.createElement('div');
+          row.className = 'refine-row';
+          row.innerHTML = `<span class="r-old">${d.old_title}</span> <span class="r-arrow">→</span> <span class="r-new">${d.new_title}</span> <span class="r-len">${d.old_len}→${d.new_len}字</span>`;
+          log.appendChild(row);
+          log.scrollTop = log.scrollHeight;
+        } else if (eventType === 'error') {
+          errors++;
+          const row = document.createElement('div');
+          row.className = 'refine-row refine-error';
+          row.innerHTML = `<span class="r-old">${d.old_title}</span> <span class="r-err">⚠ ${d.error}</span>`;
+          log.appendChild(row);
+          log.scrollTop = log.scrollHeight;
+        } else if (eventType === 'done') {
+          refined = d.refined; errors = d.errors;
+          barFill.style.width = '100%';
+          summary.textContent = d.message;
+          if (d.refined > 0) { if (cyInited) loadGraph(); loadRecent(); }
+          showToast(d.message);
+        }
+      }
+    }
+  } catch(e) {
+    summary.textContent = '提炼失败: ' + e.message;
+    showToast('提炼失败: ' + e.message);
+  }
   btn.disabled = false; btn.textContent = '提炼';
 }
 

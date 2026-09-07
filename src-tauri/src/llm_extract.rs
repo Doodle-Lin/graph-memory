@@ -75,7 +75,13 @@ const REFINE_PROMPT: &str = r#"你是一个知识提炼专家。将下面的原�
 ## 规则
 1. title: 用 5-20 字概括核心知识点(不是截断原文,是提炼!)
    - 例如:"vLLM 部署偏好" 而非 "用户说要用vLLM来部署..."
-2. content: 保留完整信息,去掉对话噪音(寒暄、命令、碎片),保留技术细节
+2. content: 保留所有有用信息!具体规则:
+   - 保留所有技术细节:服务器地址、端口、命令、路径、配置参数、版本号
+   - 保留所有因果关系和前提条件("因为X所以Y"、"如果A则B")
+   - 保留所有数字、阈值、性能指标
+   - 去掉对话噪音:寒暄、确认、碎片化指令、重复的上下文引用
+   - 去掉会话痕迹:"用户说"、"我问了"、"然后我"等
+   - 如果原文本身就是结构化知识(无对话噪音),content 可与原文基本一致
 3. 不要用会话名/文件名作为标题,要从内容本身提炼
 4. 只输出两行,严格格式:
    TITLE: 标题
@@ -84,6 +90,7 @@ const REFINE_PROMPT: &str = r#"你是一个知识提炼专家。将下面的原�
 ## 原始文本(来源: {source})"#;
 
 /// 用 LLM 提炼单个节点的标题和内容。返回 (new_title, new_content)
+/// 返回的 new_content 在 LLM 失败或返回过短时,保留原始内容(避免信息丢失)
 pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(String, String)> {
     let prompt = REFINE_PROMPT.replace("{source}", source);
     let user_content = format!("{}\n{}", prompt, trunc(content, 4000));
@@ -102,12 +109,23 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
         "temperature": 0.3
     });
 
+    let url = if cfg.base_url.ends_with('/') {
+        format!("{}v1/chat/completions", cfg.base_url)
+    } else {
+        format!("{}/v1/chat/completions", cfg.base_url)
+    };
     let resp = client
-        .post(format!("{}/chat/completions", cfg.base_url))
+        .post(&url)
         .header("Authorization", format!("Bearer {}", cfg.api_key))
         .json(&body)
         .send()?;
 
+    // 检查 HTTP 状态码,给出具体错误而非泛化的 "empty_response"
+    let status = resp.status();
+    if !status.is_success() {
+        let err_text = resp.text().unwrap_or_default();
+        anyhow::bail!("LLM HTTP {}: {}", status, trunc(err_text, 200));
+    }
     let json: Value = resp.json()?;
     let text = json["choices"][0]["message"]["content"]
         .as_str()
@@ -123,19 +141,28 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
     // 解析 TITLE: 和 CONTENT:
     let mut title = String::new();
     let mut content_out = String::new();
+    let mut in_content = false;
     for line in text.lines() {
         if let Some(t) = line.strip_prefix("TITLE:") {
             title = t.trim().to_string();
         } else if let Some(c) = line.strip_prefix("CONTENT:") {
             content_out = c.trim().to_string();
+            in_content = true;
+        } else if in_content {
+            // CONTENT: 可能跨多行,追加
+            content_out.push('\n');
+            content_out.push_str(line);
         }
     }
 
     if title.is_empty() {
         anyhow::bail!("no TITLE in response: {}", trunc(text, 100));
     }
-    if content_out.is_empty() {
-        content_out = content.chars().take(200).collect();
+    // 信息保留守卫:如果提炼后 content 比原文短太多(<30% 且 <50 字),
+    // 说明 LLM 可能丢信息,保留原文 content
+    if content_out.is_empty() || (content_out.chars().count() < 50 && content.len() > 100) {
+        log::warn!("refine produced thin content, keeping original ({} chars)", content.chars().count());
+        content_out = content.to_string();
     }
 
     Ok((title, content_out))

@@ -184,8 +184,7 @@ fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
+    );    let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
 }
 
@@ -215,8 +214,7 @@ fn parse_json_body(req: &str) -> serde_json::Value {
 
 /// 健壮地读取完整 HTTP 请求:先读到 headers 结束(\r\n\r\n),
 /// 再按 Content-Length 读完整 body。避免单次 read() 截断大 body。
-fn read_full_request(stream: &mut TcpStream) -> Option<String> {
-    let mut buf = Vec::with_capacity(8192);
+fn read_full_request(stream: &mut TcpStream) -> Option<String> {    let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
     // 1. 读到包含 \r\n\r\n (headers 结束)
     loop {
@@ -282,6 +280,11 @@ fn parse_query_str<'a>(q: &'a str, key: &str, default: &'a str) -> &'a str {
         }
     }
     default
+}
+
+/// 安全截断(按字符),供 SSE 事件 JSON 用
+fn trunc_str(s: impl AsRef<str>, n: usize) -> String {
+    s.as_ref().chars().take(n).collect()
 }
 
 /// 处理引擎 API。返回 true 表示命中并已响应,false 表示不是引擎 API(走静态文件)。
@@ -465,40 +468,66 @@ fn handle_engine_api(
         return true;
     }
     // POST /api/refine —— 用 LLM 批量重提炼已有节点的标题+内容
+    // 改为 SSE 流式返回:每处理一个节点发一个 event,前端实时显示进度+before/after 对比
     if clean == "/api/refine" && method == "POST" {
         let cfg = crate::llm_extract::load_config();
         if cfg.is_none() {
             send_err(stream, 400, "LLM not configured (need GM_LLM_API_KEY / GM_LLM_BASE_URL / GM_LLM_MODEL)");
             return true;
         }
+        let cfg = cfg.unwrap();
         let nodes = e.all_nodes_raw();
-        let total = nodes.len();
+        // 只提炼需要提炼的(标题长或内容长)
+        let to_refine: Vec<_> = nodes.iter()
+            .filter(|(_, title, content, _)| title.len() >= 30 || content.len() >= 200)
+            .collect();
+        let total = to_refine.len();
+        let skipped = nodes.len() - total;
+
+        // SSE headers (text/event-stream, 不缓存)
+        let sse_header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+        let _ = stream.write_all(sse_header);
+
+        // 发开始事件
+        let start_event = format!("event: start\ndata: {}\n\n",
+            serde_json::json!({"total": total, "skipped": skipped}));
+        let _ = stream.write_all(start_event.as_bytes());
+
         let mut refined = 0;
         let mut errors = 0;
-        for (id, title, content, source) in &nodes {
-            // 跳过已经很短(像标题)的节点
-            if title.len() < 30 && content.len() < 200 {
-                continue;
-            }
-            match crate::llm_extract::refine_node(content, source, cfg.as_ref().unwrap()) {
+        for (i, (id, title, content, source)) in to_refine.iter().enumerate() {
+            match crate::llm_extract::refine_node(content, source, &cfg) {
                 Ok((new_title, new_content)) => {
                     if let Err(err) = e.update_node_text(id, &new_title, &new_content) {
                         log::warn!("update_node_text failed for {}: {}", id, err);
                         errors += 1;
+                        let ev = format!("event: error\ndata: {}\n\n",
+                            serde_json::json!({"index": i+1, "total": total, "id": id,
+                                "old_title": trunc_str(title, 60), "error": err.to_string()}));
+                        let _ = stream.write_all(ev.as_bytes());
                     } else {
                         refined += 1;
+                        let ev = format!("event: progress\ndata: {}\n\n",
+                            serde_json::json!({"index": i+1, "total": total, "id": id,
+                                "old_title": trunc_str(title, 60), "new_title": trunc_str(new_title, 60),
+                                "old_len": content.chars().count(), "new_len": new_content.chars().count()}));
+                        let _ = stream.write_all(ev.as_bytes());
                     }
                 }
                 Err(err) => {
                     log::warn!("refine failed for {}: {}", id, err);
                     errors += 1;
+                    let ev = format!("event: error\ndata: {}\n\n",
+                        serde_json::json!({"index": i+1, "total": total, "id": id,
+                            "old_title": trunc_str(title, 60), "error": trunc_str(err.to_string(), 120)}));
+                    let _ = stream.write_all(ev.as_bytes());
                 }
             }
         }
-        send_json(stream, serde_json::json!({
-            "total": total, "refined": refined, "errors": errors,
-            "message": format!("提炼 {} / {} 个节点 ({} 错误)", refined, total, errors),
-        }));
+        let done_event = format!("event: done\ndata: {}\n\n",
+            serde_json::json!({"total": total, "refined": refined, "errors": errors,
+                "message": format!("提炼 {} / {} 个节点 ({} 错误)", refined, total, errors)}));
+        let _ = stream.write_all(done_event.as_bytes());
         return true;
     }
 
