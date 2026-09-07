@@ -26,7 +26,8 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// 解析 Hermes 记忆根目录:HERMES_HOME → ~/.hermes → Windows 桌面端默认路径
+/// 解析 Hermes 记忆根目录:HERMES_HOME → ~/.hermes(有 memories) →
+/// Windows %LOCALAPPDATA%\hermes(NousResearch CLI)→ Hermes Agent CN Desktop → 回退 ~/.hermes
 fn hermes_home() -> PathBuf {
     if let Ok(h) = std::env::var("HERMES_HOME") {
         if !h.is_empty() {
@@ -35,11 +36,17 @@ fn hermes_home() -> PathBuf {
     }
     let h = home_dir();
     let dot_hermes = h.join(".hermes");
-    if dot_hermes.join("memories").exists() || dot_hermes.join("config.yaml").exists() {
+    // POSIX 上 ~/.hermes 是标准位置;Windows 上 ~/.hermes 可能是骨架,只在真有 memories 时才认
+    if dot_hermes.join("memories").exists() {
         return dot_hermes;
     }
-    // Windows 桌面端默认安装路径(Hermes Agent CN Desktop 的标准数据位置)
+    // Windows:NousResearch hermes-agent CLI,记忆在 %LOCALAPPDATA%\hermes\memories
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let cli = PathBuf::from(&local).join("hermes");
+        if cli.join("memories").exists() {
+            return cli;
+        }
+        // Hermes Agent CN Desktop 桌面端默认路径
         let desktop = PathBuf::from(local).join("Hermes Agent CN Desktop/data/hermes-home");
         if desktop.join("memories").exists() {
             return desktop;
