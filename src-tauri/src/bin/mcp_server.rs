@@ -19,6 +19,12 @@
 // JSON-RPC 2.0 over stdio,兼容 MCP 协议。
 
 use std::io::{self, BufRead, Write};
+
+/// 安全截断字符串(按字符,不按字节),避免中文字节切片 panic。
+/// 接受 &str 或 String(impl AsRef<str>)。
+fn trunc(s: impl AsRef<str>, n: usize) -> String {
+    s.as_ref().chars().take(n).collect()
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -53,9 +59,9 @@ fn http_post_json(path: &str, body: &serde_json::Value) -> Result<serde_json::Va
     let status = resp.status();
     let text = resp.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, &text[..text.len().min(200)]));
+        return Err(format!("HTTP {}: {}", status, trunc(&text, 200)));
     }
-    serde_json::from_str(&text).map_err(|e| format!("json: {} :: {}", e, &text[..text.len().min(200)]))
+    serde_json::from_str(&text).map_err(|e| format!("json: {} :: {}", e, trunc(&text, 200)))
 }
 
 fn http_get(path: &str) -> Result<serde_json::Value, String> {
@@ -67,9 +73,9 @@ fn http_get(path: &str) -> Result<serde_json::Value, String> {
     let status = resp.status();
     let text = resp.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status, &text[..text.len().min(200)]));
+        return Err(format!("HTTP {}: {}", status, trunc(&text, 200)));
     }
-    serde_json::from_str(&text).map_err(|e| format!("json: {} :: {}", e, &text[..text.len().min(200)]))
+    serde_json::from_str(&text).map_err(|e| format!("json: {} :: {}", e, trunc(&text, 200)))
 }
 
 fn tools_list() -> serde_json::Value {
@@ -206,7 +212,7 @@ fn handle_tool_call(name: &str, args: &serde_json::Value) -> Result<Vec<serde_js
                 lines.push(format!("[{}] {}", n.get("node_type").and_then(|v| v.as_str()).unwrap_or("?"),
                     n.get("title").and_then(|v| v.as_str()).unwrap_or("?")));
                 let content = n.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                lines.push(format!("  {}", &content[..content.len().min(100)]));
+                lines.push(format!("  {}", trunc(content, 100)));
                 lines.push(String::new());
             }
             Ok(text_content(lines.join("\n")))

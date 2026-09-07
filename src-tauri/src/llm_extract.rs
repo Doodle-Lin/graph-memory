@@ -11,6 +11,12 @@ use crate::engine::GraphEngine;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// 安全截断字符串(按字符,不按字节),避免中文字节切片 panic。
+/// 接受 &str 或 String(impl AsRef<str>)。
+fn trunc(s: impl AsRef<str>, n: usize) -> String {
+    s.as_ref().chars().take(n).collect()
+}
+
 const EXTRACT_PROMPT: &str = r#"你是一个知识提炼专家。从下面的对话/记忆文本中提取有价值的知识节点和它们之间的关系。
 
 ## 提取规则
@@ -80,7 +86,7 @@ const REFINE_PROMPT: &str = r#"你是一个知识提炼专家。将下面的原�
 /// 用 LLM 提炼单个节点的标题和内容。返回 (new_title, new_content)
 pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(String, String)> {
     let prompt = REFINE_PROMPT.replace("{source}", source);
-    let user_content = format!("{}\n{}", prompt, &content[..content.len().min(4000)]);
+    let user_content = format!("{}\n{}", prompt, trunc(content, 4000));
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -126,7 +132,7 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
     }
 
     if title.is_empty() {
-        anyhow::bail!("no TITLE in response: {}", &text[..text.len().min(100)]);
+        anyhow::bail!("no TITLE in response: {}", trunc(text, 100));
     }
     if content_out.is_empty() {
         content_out = content.chars().take(200).collect();
@@ -138,7 +144,7 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
 /// 调用 LLM 提炼知识,返回 {nodes, edges} 或 {error}
 fn call_llm(text: &str, source: &str, cfg: &LlmConfig) -> Value {
     let prompt = EXTRACT_PROMPT.replace("{source}", source);
-    let user_content = format!("{}\n{}", prompt, &text[..text.len().min(8000)]);
+    let user_content = format!("{}\n{}", prompt, trunc(text, 8000));
 
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -207,14 +213,14 @@ fn call_llm(text: &str, source: &str, cfg: &LlmConfig) -> Value {
                 Err(err) => serde_json::json!({
                     "error": format!("json parse: {}", err),
                     "nodes": [], "edges": [],
-                    "raw": &c[..c.len().min(200)]
+                    "raw": trunc(c, 200)
                 }),
             }
         }
         _ => serde_json::json!({
             "error": "no_json_in_response",
             "nodes": [], "edges": [],
-            "raw": &c[..c.len().min(200)]
+            "raw": trunc(c, 200)
         }),
     }
 }

@@ -726,9 +726,21 @@ function loadSearchResults(results) {
 function highlightNodes(ids) { if (!cy) return; cy.elements().removeClass('highlighted').removeClass('faded'); const idSet = new Set(ids); cy.nodes().forEach(n => { if (idSet.has(n.id())) n.addClass('highlighted'); else n.addClass('faded'); }); cy.edges().forEach(e => { if (idSet.has(e.source().id())&&idSet.has(e.target().id())) e.addClass('highlighted'); else e.addClass('faded'); }); }
 function highlightNeighbors(node) { if (!cy) return; cy.elements().removeClass('highlighted').removeClass('faded'); node.addClass('highlighted'); const neighbors = node.neighborhood(); neighbors.addClass('highlighted'); cy.elements().not(node).not(neighbors).addClass('faded'); }
 function focusNode(id) {
-  if (cy) { const node = cy.getElementById(id); if (node && node.length > 0) { selectedNode = node[0]; showNodeDetail(node[0]); switchView('detail'); return; } }
-  // fallback:从结果列表里找
-  showNodeDetail(selectedNode || { data: { id } });
+  if (cy) {
+    const node = cy.getElementById(id);
+    if (node && node.length > 0) {
+      selectedNode = node[0];
+      showNodeDetail(node[0]);
+      switchView('detail');
+      return;
+    }
+  }
+  // fallback:从结果列表里找匹配 id 的对象(搜索结果是 plain object,不是 cy 节点)
+  if (selectedNode && (selectedNode.id === id || (selectedNode.id && selectedNode.id() === id))) {
+    showNodeDetail(selectedNode);
+  } else {
+    showNodeDetail({ data: { id, title: id, content: '', node_type: 'knowledge', source: '' } });
+  }
   switchView('detail');
 }
 
@@ -746,9 +758,34 @@ async function deleteSelectedNode() {
 async function expandNeighbors() {
   if (!selectedNode) return;
   const id = selectedNode.id ? selectedNode.id() : selectedNode.id;
-  if (cy && selectedNode.connectedEdges) { highlightNeighbors(selectedNode); switchView('graph'); return; }
-  // 无 cy 时:切到图谱(会 lazy init)
+  // 若 cy 已初始化且节点来自 cy,直接高亮
+  if (cy && selectedNode.connectedEdges) {
+    highlightNeighbors(selectedNode);
+    switchView('graph');
+    return;
+  }
+  // 搜索结果路径:切到图谱(lazy init),初始化完成后选中该节点并高亮邻居
   switchView('graph');
+  // 等 lazy init 完成(switchView 异步触发 initCy+loadGraph)
+  if (!cyInited) {
+    await new Promise(r => setTimeout(r, 600));
+  }
+  if (cy) {
+    const node = cy.getElementById(id);
+    if (node && node.length > 0) {
+      selectedNode = node[0];
+      highlightNeighbors(node[0]);
+    } else {
+      // 节点不在当前图快照里:退化为 HTTP 查邻居
+      try {
+        const res = await fetch(`${API}/api/neighbors/${id}?depth=2`);
+        if (res.ok) {
+          const data = await res.json();
+          highlightNodes([id, ...(data.neighbors || []).map(n => n.id)]);
+        }
+      } catch (_) {}
+    }
+  }
 }
 
 // ── 添加表单 ─────────────────────────────────────────────
@@ -899,7 +936,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && document.getElementById('llm-modal').classList.contains('active')) closeLlmModal();
 });
 
-// ── 启动:不预加载图谱,只加载统计+最近节点+接入面板 ──────
+// ── 启动:只加载统计 + 最近节点 + 接入面板(不预加载全图) ─────
+// 筛选器 chips 在首次切到图谱 tab 的 loadGraph() 里构建(那里已拿到全图数据)。
+// 避免启动时拉全图快照——正是 lazy init 要省的开销。
 document.getElementById('search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
 document.getElementById('search-btn').addEventListener('click', search);
 document.getElementById('import-btn').addEventListener('click', importMemories);
@@ -909,11 +948,21 @@ document.getElementById('refine-btn').addEventListener('click', refineNodes);
   try {
     const s = await apiStats();
     updateStats(s);
-    // 若已有数据,用图统计初始化筛选器类型计数
-    const g = await apiGraph();
-    allTypeCounts = {}; allSourceCounts = {};
-    for (const n of g.nodes) { const nt = n.data.node_type || 'unknown'; const ns = n.data.source || 'unknown'; allTypeCounts[nt] = (allTypeCounts[nt]||0)+1; allSourceCounts[ns] = (allSourceCounts[ns]||0)+1; }
-    buildFilterBar();
+    // 占位:筛选器显示"打开图谱后加载"
+    const tc = document.getElementById('filter-types');
+    const sc = document.getElementById('filter-sources');
+    if (tc && !tc.querySelector('.filter-chip')) {
+      const ph = document.createElement('span');
+      ph.className = 'filter-clear'; ph.textContent = '图谱加载后显示';
+      ph.style.cursor = 'default';
+      tc.appendChild(ph);
+    }
+    if (sc && !sc.querySelector('.filter-chip')) {
+      const ph = document.createElement('span');
+      ph.className = 'filter-clear'; ph.textContent = '图谱加载后显示';
+      ph.style.cursor = 'default';
+      sc.appendChild(ph);
+    }
   } catch(e) { console.error('init stats failed:', e); }
 })();
 loadRecent();

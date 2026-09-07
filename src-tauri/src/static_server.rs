@@ -179,8 +179,10 @@ pub struct EngineHandle {
 
 fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
     let body = json.to_string();
+    // 不发 Access-Control-Allow-Origin: webview 同源(127.0.0.1:9121),
+    // MCP server 用 reqwest(非浏览器),都不需要 CORS。放开 = 让任意网站可读写图谱。
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -190,20 +192,76 @@ fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
 fn send_err(stream: &mut TcpStream, status: u16, msg: &str) {
     let body = serde_json::json!({"error": msg}).to_string();
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         status, body.len()
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
 }
 
-/// 从请求里解析 JSON body(找 \r\n\r\n 之后的内容)
+/// 从请求里解析 JSON body(找 \r\n\r\n 之后的内容)。
+/// 返回 400 风格的 None 时调用方自行处理;此处仍宽松:解析失败给空 {}。
 fn parse_json_body(req: &str) -> serde_json::Value {
     if let Some(pos) = req.find("\r\n\r\n") {
         let body = &req[pos + 4..];
-        return serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+        if body.is_empty() { return serde_json::json!({}); }
+        return serde_json::from_str(body).unwrap_or_else(|e| {
+            log::warn!("JSON body parse failed: {}", e);
+            serde_json::json!({})
+        });
     }
     serde_json::json!({})
+}
+
+/// 健壮地读取完整 HTTP 请求:先读到 headers 结束(\r\n\r\n),
+/// 再按 Content-Length 读完整 body。避免单次 read() 截断大 body。
+fn read_full_request(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    // 1. 读到包含 \r\n\r\n (headers 结束)
+    loop {
+        let n = stream.read(&mut tmp).ok()?;
+        if n == 0 { break; }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+        if buf.len() > 50_000_000 { log::warn!("request headers too large"); return None; }
+    }
+    if buf.is_empty() { return None; }
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(buf.len());
+    // 2. 解析 Content-Length,按需补读 body
+    let headers_str = String::from_utf8_lossy(&buf[..header_end]);
+    let content_length = extract_header(&headers_str, "content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let body_have = buf.len() - header_end;
+    let mut body = buf[header_end..].to_vec();
+    if content_length > body_have {
+        let mut remaining = content_length - body_have;
+        while remaining > 0 {
+            let n = stream.read(&mut tmp).ok()?;
+            if n == 0 { break; }
+            let take = n.min(remaining);
+            body.extend_from_slice(&tmp[..take]);
+            remaining -= take;
+        }
+    }
+    // 3. 重组完整请求字符串(headers + body),供后续 parse_json_body 复用
+    let mut full = headers_str.into_owned();
+    full.push_str(&String::from_utf8_lossy(&body));
+    Some(full)
+}
+
+/// 从 headers 文本里取某个 header 值(大小写不敏感)
+fn extract_header(headers: &str, name: &str) -> Option<String> {
+    for line in headers.lines() {
+        let line = line.trim();
+        if let Some(colon) = line.find(':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                return Some(line[colon + 1..].to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_query_int(q: &str, key: &str, default: usize) -> usize {
@@ -306,6 +364,45 @@ fn handle_engine_api(
                 }));
             }
             Err(e) => send_err(stream, 500, &e.to_string()),
+        }
+        return true;
+    }
+    // POST /api/update —— 按查询检索命中则更新文本,否则创建新节点
+    if clean == "/api/update" && method == "POST" {
+        let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let new_content = body.get("new_content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let new_title = body.get("new_title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let node_type = body.get("node_type").and_then(|v| v.as_str()).unwrap_or("knowledge").to_string();
+        if query.is_empty() {
+            send_err(stream, 400, "query is required");
+            return true;
+        }
+        match e.retrieve(&query, Some(1), false) {
+            Ok(results) => {
+                if let Some(hit) = results.first() {
+                    let title = if new_title.is_empty() { hit.title.clone() } else { new_title.clone() };
+                    match e.update_node_text(&hit.id, &title, &new_content) {
+                        Ok(_) => send_json(stream, serde_json::json!({
+                            "action": "updated", "node_id": hit.id, "message": "已更新已有节点"
+                        })),
+                        Err(err) => send_err(stream, 500, &err.to_string()),
+                    }
+                } else {
+                    // 未命中:创建新节点
+                    match e.add_node(&new_content, &new_title, &node_type, "agent:update", "{}") {
+                        Ok(node) => {
+                            let links = e.auto_link(&node.id, 5).unwrap_or_default();
+                            send_json(stream, serde_json::json!({
+                                "action": "created", "node": node,
+                                "auto_links": serde_json::to_value(links).unwrap(),
+                                "message": "未找到匹配节点,已创建新节点"
+                            }));
+                        }
+                        Err(err) => send_err(stream, 500, &err.to_string()),
+                    }
+                }
+            }
+            Err(err) => send_err(stream, 500, &err.to_string()),
         }
         return true;
     }
@@ -417,26 +514,15 @@ fn handle_engine_api(
         send_json(stream, result);
         return true;
     }
-    // GET /api/llm/status —— 检查 LLM 配置状态
-    if clean == "/api/llm/status" && method == "GET" {
-        let configured = std::env::var("GM_LLM_API_KEY").map(|s| !s.is_empty()).unwrap_or(false);
-        send_json(stream, serde_json::json!({
-            "configured": configured,
-            "model": std::env::var("GM_LLM_MODEL").unwrap_or_default(),
-            "base_url": std::env::var("GM_LLM_BASE_URL").unwrap_or_default(),
-        }));
-        return true;
-    }
+
     false
 }
 
 fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&EngineHandle>) {
-    let mut buf = [0u8; 65536];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let req = match read_full_request(&mut stream) {
+        Some(r) => r,
+        None => return,
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
     let first_line = req.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
@@ -470,6 +556,15 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         return;
     }
     // ── LLM 配置:读 .env + 即时设进程环境变量(不依赖引擎) ──
+    if clean == "/api/llm/status" && method == "GET" {
+        let configured = std::env::var("GM_LLM_API_KEY").map(|s| !s.is_empty()).unwrap_or(false);
+        send_json(&mut stream, serde_json::json!({
+            "configured": configured,
+            "model": std::env::var("GM_LLM_MODEL").unwrap_or_default(),
+            "base_url": std::env::var("GM_LLM_BASE_URL").unwrap_or_default(),
+        }));
+        return;
+    }
     if clean == "/api/llm/config" && method == "POST" {
         let body = parse_json_body(&req);
         let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -478,7 +573,10 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         match write_llm_env(api_key, base_url, model) {
             Ok(path) => {
                 // 即时生效:设置进程环境变量,refine 立刻可用(无需重启)
-                std::env::set_var("GM_LLM_API_KEY", api_key);
+                // 注意:api_key 为空时保留现有 key(前端不回显真实 key,传空表示不改)
+                if !api_key.is_empty() {
+                    std::env::set_var("GM_LLM_API_KEY", api_key);
+                }
                 std::env::set_var("GM_LLM_BASE_URL", base_url);
                 std::env::set_var("GM_LLM_MODEL", model);
                 log::info!("LLM config updated: base_url={}, model={}", base_url, model);
@@ -548,7 +646,7 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         });
         let body = json.to_string();
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(header.as_bytes());
@@ -559,14 +657,14 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
     if clean == "/api/start_download" && method == "POST" {
         if state.downloading.load(Ordering::Relaxed) || state.done.load(Ordering::Relaxed) {
             let body = r#"{"status":"already_downloading"}"#;
-            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\n\r\n";
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(body.as_bytes());
             return;
         }
         state.downloading.store(true, Ordering::Relaxed);
         let body = r#"{"status":"download_started"}"#;
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n";
         let _ = stream.write_all(header.as_bytes());
         let _ = stream.write_all(body.as_bytes());
         return;
@@ -583,7 +681,7 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         Ok(body) => {
             let ct = content_type(&full);
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n",
                 ct, body.len()
             );
             let _ = stream.write_all(header.as_bytes());
@@ -620,13 +718,15 @@ fn write_llm_env(api_key: &str, base_url: &str, model: &str) -> Result<String, S
         .map(|c| c.lines().map(|l| l.to_string()).collect())
         .unwrap_or_default();
 
-    // 更新或追加三个 GM_LLM_ key
+    // 更新或追加 GM_LLM_ key(空值表示不改,保留 .env 现有行)
     let updates = [
         ("GM_LLM_API_KEY", api_key),
         ("GM_LLM_BASE_URL", base_url),
         ("GM_LLM_MODEL", model),
     ];
     for (key, val) in &updates {
+        // 空 value 跳过(保留现有 .env 行,不覆盖)
+        if val.is_empty() { continue; }
         let prefix = format!("{}=", key);
         if let Some(line) = lines.iter_mut().find(|l| l.trim_start().starts_with(&prefix)) {
             *line = format!("{}={}", key, val);

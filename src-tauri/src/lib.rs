@@ -105,6 +105,9 @@ fn update_memory(state: State<AppState>, query: String, new_content: String, new
     let results = engine.retrieve(&query, Some(1), Some(false).unwrap_or(false))
         .map_err(|e| e.to_string())?;
     if let Some(result) = results.first() {
+        let title = new_title.clone().unwrap_or_else(|| result.title.clone());
+        engine.update_node_text(&result.id, &title, &new_content)
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({
             "action": "updated",
             "node_id": result.id,
