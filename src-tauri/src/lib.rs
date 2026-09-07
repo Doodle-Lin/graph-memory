@@ -249,12 +249,20 @@ fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(loading) = app.get_webview_window("loading") {
         loading.close().ok();
     }
-    // 打开主窗口(如果还没打开)
+    // 打开主窗口(如果还没打开)。不启动新 static server——
+    // setup 里已启动了一个带引擎的 server 并写了 ~/.graph-memory/port。
+    // 从端口文件读实际端口,避免覆盖(否则 MCP server 会指向无引擎的端口)。
     if app.get_webview_window("main").is_none() {
-        let dir = find_frontend_dir().ok_or("frontend dir not found")?;
-        let port = static_server::start(dir, static_server::ModelState::new()).ok_or("static server failed")?;
+        let port = {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME")).unwrap_or_default();
+            let port_file = std::path::PathBuf::from(&home).join(".graph-memory/port");
+            std::fs::read_to_string(&port_file).ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .unwrap_or(9121)
+        };
         let url = format!("http://127.0.0.1:{}/index.html", port);
-        tauri::WebviewWindowBuilder::new(
+        match tauri::WebviewWindowBuilder::new(
             &app,
             "main",
             tauri::WebviewUrl::External(url.parse().map_err(|e| format!("{:?}", e))?)
@@ -266,7 +274,10 @@ fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
         .center()
         .devtools(true)
         .build()
-        .map_err(|e| e.to_string())?;
+        {
+            Ok(_) => log::info!("main window opened via open_main_window, port={}", port),
+            Err(e) => log::error!("open_main_window build failed: {}", e),
+        }
     }
     Ok(())
 }

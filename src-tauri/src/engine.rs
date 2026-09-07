@@ -59,7 +59,9 @@ pub struct GraphEngine {
     graph: DiGraph<Node, Edge>,
     node_map: HashMap<String, NodeIndex>,
     embeddings: HashMap<String, Vec<f32>>,
-    embedder: Option<fastembed::TextEmbedding>,
+    // embedder 用 RefCell 而非 Option,因为 fastembed::TextEmbedding::embed
+    // 需要 &mut self(虽然内部线程安全)。RefCell 在单线程 Mutex 内无额外开销。
+    embedder: std::cell::RefCell<Option<fastembed::TextEmbedding>>,
 }
 
 impl GraphEngine {
@@ -89,7 +91,7 @@ impl GraphEngine {
             graph: DiGraph::new(),
             node_map: HashMap::new(),
             embeddings: HashMap::new(),
-            embedder: None,
+            embedder: std::cell::RefCell::new(None),
         };
         engine.load_from_db()?;
         Ok(engine)
@@ -147,12 +149,12 @@ impl GraphEngine {
     }
 
     pub fn set_embedder(&mut self, embedder: fastembed::TextEmbedding) {
-        self.embedder = Some(embedder);
+        *self.embedder.borrow_mut() = Some(embedder);
     }
 
     /// embedder 是否已加载(用于判断能否走 embedding 去重/auto_link)
     pub fn embedder_ready(&self) -> bool {
-        self.embedder.is_some()
+        self.embedder.borrow().is_some()
     }
 
     /// 批量补全:为所有缺 embedding 的节点计算 embedding,并跑 auto_link 建边。
@@ -188,31 +190,15 @@ impl GraphEngine {
         Ok((pending.len(), edges))
     }
 
-    fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
-        // 懒加载: 第一次调用时才初始化模型(避免阻塞窗口创建)
-        if self.embedder.is_none() {
-            // 使用 hf-mirror 镜像(内网 HF 不可达)
-            if std::env::var("HF_ENDPOINT").is_err() {
-                std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
-            }
-            let cache_dir = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(|h| std::path::PathBuf::from(h).join(".cache/fastembed"))
-                .unwrap_or_else(|_| std::path::PathBuf::from(".cache/fastembed"));
-            // HF_HOME 优先于 cache_dir(fastembed 内部 pull_from_hf 的行为),两者保持一致
-            std::env::set_var("HF_HOME", &cache_dir);
-            log::info!(
-                "Loading embedding model (BGE-Small-ZH-v1.5) cache_dir={}",
-                cache_dir.display()
-            );
-            self.embedder = Some(fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::new(fastembed::EmbeddingModel::BGESmallZHV15)
-                    .with_cache_dir(cache_dir),
-            ).map_err(|e| anyhow::anyhow!("Failed to load embedding model: {}. Set HF_ENDPOINT if behind firewall.", e))?);
-        }
-        let embedder = self.embedder.as_mut().context("Embedding model not loaded")?;
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        // 模型加载由启动时的后台线程负责(lib.rs setup)。
+        // 不在 embed() 里懒加载——避免在 Mutex 锁内触发数分钟的模型下载/加载。
+        // embedder 未就绪时直接报错,调用方应先用 embedder_ready() 守卫。
+        // RefCell::borrow_mut → RefMut<Option<TextEmbedding>> → as_mut() 拿 &mut TextEmbedding
+        let mut guard = self.embedder.borrow_mut();
+        let embedder = guard.as_mut().context("Embedding model not loaded yet")?;
         let embeddings = embedder.embed(vec![text.to_string()], None)?;
-        Ok(embeddings.into_iter().next().unwrap())
+        Ok(embeddings.into_iter().next().unwrap_or_default())
     }
 
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -260,6 +246,11 @@ impl GraphEngine {
             return Ok(self.graph[idx].clone());
         }
 
+        // 模型未就绪时:跳过 embedding 相似度去重,走 raw 写入(hash 去重已覆盖第一层)
+        if !self.embedder_ready() {
+            return self.add_node_raw_fallback(content, title, node_type, source, metadata);
+        }
+
         // 第二层: embedding 相似度
         let new_emb = self.embed(content)?;
         for (existing_id, existing_emb) in &self.embeddings {
@@ -294,6 +285,31 @@ impl GraphEngine {
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(nid.clone(), idx);
         self.embeddings.insert(nid, new_emb);
+        Ok(node)
+    }
+
+    /// add_node 的降级路径:embedder 未就绪时,跳过 embedding 相似度去重,
+    /// 直接 raw 写入(hash 去重已在第一层覆盖)。模型就绪后由 enrich_all 补 embedding。
+    fn add_node_raw_fallback(&mut self, content: &str, title: &str, node_type: &str, source: &str, metadata: &str) -> Result<Node> {
+        let nt = if is_valid_type(node_type) { node_type.to_string() } else { "knowledge".to_string() };
+        let t = if title.is_empty() { content.chars().take(40).collect() } else { title.to_string() };
+        let now = Self::now();
+        let node = Node {
+            id: Self::node_id(content),
+            content: content.to_string(),
+            title: t,
+            node_type: nt,
+            source: source.to_string(),
+            metadata: if metadata.is_empty() { "{}".to_string() } else { metadata.to_string() },
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.db.execute(
+            "INSERT OR REPLACE INTO nodes VALUES (?,?,?,?,?,?,?,?)",
+            params![node.id, node.content, node.title, node.node_type, node.source, node.metadata, node.created_at, node.updated_at],
+        )?;
+        let idx = self.graph.add_node(node.clone());
+        self.node_map.insert(node.id.clone(), idx);
         Ok(node)
     }
 
@@ -360,7 +376,8 @@ impl GraphEngine {
 
     pub fn retrieve(&mut self, query: &str, top_k: Option<usize>, spread: bool) -> Result<Vec<RetrieveResult>> {
         let top_k = top_k.unwrap_or(RETRIEVAL_TOP_K);
-        if self.embeddings.is_empty() {
+        // 模型没就绪时:不能 embed query,直接返回空(而非 500 panic)
+        if !self.embedder_ready() || self.embeddings.is_empty() {
             return Ok(Vec::new());
         }
 

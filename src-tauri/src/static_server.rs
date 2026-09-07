@@ -355,9 +355,10 @@ fn handle_engine_api(
         let source = body.get("source").and_then(|v| v.as_str()).unwrap_or("agent");
         let auto_link = body.get("auto_link").and_then(|v| v.as_bool()).unwrap_or(true);
         let max_links = body.get("max_links").and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(5);
+        // embedder 未就绪时:add_node 走 raw 降级(hash 去重),auto_link 跳过(无 embedding 无法建边)
         match e.add_node(content, title, nt, source, "{}") {
             Ok(node) => {
-                let links = if auto_link { e.auto_link(&node.id, max_links).unwrap_or_default() } else { Vec::new() };
+                let links = if auto_link && e.embedder_ready() { e.auto_link(&node.id, max_links).unwrap_or_default() } else { Vec::new() };
                 send_json(stream, serde_json::json!({
                     "node": node,
                     "auto_links": serde_json::to_value(links).unwrap(),

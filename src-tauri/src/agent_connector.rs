@@ -77,6 +77,38 @@ pub fn detect_agents() -> Vec<AgentInfo> {
     agents
 }
 
+/// 读实际监听端口(从 ~/.graph-memory/port),用于写 agent 配置的 GM_API_URL。
+/// 这样 9121 被占用回退随机端口时,agent 仍能连上。
+fn discover_api_url() -> String {
+    // 1. 环境变量优先(测试/自定义)
+    if let Ok(url) = std::env::var("GM_API_URL") {
+        if !url.is_empty() { return url; }
+    }
+    // 2. 读端口文件
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let port_file = std::path::PathBuf::from(&home).join(".graph-memory/port");
+    if let Ok(port_str) = std::fs::read_to_string(&port_file) {
+        let port = port_str.trim();
+        if !port.is_empty() {
+            return format!("http://127.0.0.1:{}", port);
+        }
+    }
+    // 3. 回退默认
+    "http://127.0.0.1:9121".to_string()
+}
+
+/// 原子写:先写 temp 文件,再 rename(避免与 agent 自身写竞争导致丢失更新)
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let tmp = path.with_extension("tmp.gm-write");
+    std::fs::write(&tmp, content)
+        .map_err(|e| format!("write tmp failed: {}", e))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename failed: {}", e))?;
+    Ok(())
+}
+
 /// 把 graph-memory MCP server 写入指定 agent 的配置
 pub fn connect_agent(agent_id: &str, exe_path: &str) -> Result<(), String> {
     // Hermes 用 YAML 配置,走独立路径
@@ -113,24 +145,24 @@ pub fn connect_agent(agent_id: &str, exe_path: &str) -> Result<(), String> {
         .and_then(|v| v.as_object_mut())
         .ok_or("mcpServers is not an object")?;
 
-    // 写入 graph-memory 配置
+    // 写入 graph-memory 配置(用实际端口,不写死 9121)
+    let api_url = discover_api_url();
     mcp.insert(
         "graph-memory".into(),
         serde_json::json!({
             "command": exe_path,
             "env": {
-                "GM_API_URL": "http://127.0.0.1:9121"
+                "GM_API_URL": api_url
             }
         }),
     );
 
-    // 写回
+    // 原子写回(temp + rename)
     let out = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("serialize failed: {}", e))?;
-    std::fs::write(&config_path, out)
-        .map_err(|e| format!("write failed: {}", e))?;
+    atomic_write(&config_path, &out)?;
 
-    log::info!("Connected agent '{}' to graph-memory MCP (config: {})", agent_id, config_path.display());
+    log::info!("Connected agent '{}' to graph-memory MCP (config: {}, api: {})", agent_id, config_path.display(), api_url);
     Ok(())
 }
 
@@ -166,8 +198,7 @@ pub fn disconnect_agent(agent_id: &str) -> Result<(), String> {
 
     let out = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("serialize failed: {}", e))?;
-    std::fs::write(&config_path, out)
-        .map_err(|e| format!("write failed: {}", e))?;
+    atomic_write(&config_path, &out)?;
 
     log::info!("Disconnected agent '{}' from graph-memory", agent_id);
     Ok(())
@@ -271,7 +302,7 @@ fn load_hermes_yaml(config_path: &std::path::Path) -> Result<serde_json::Value, 
         .map_err(|e| format!("yaml parse failed: {}", e))
 }
 
-/// 写前备份 + 序列化写回
+/// 写前备份 + 原子写回(temp + rename,避免与 hermes 自身写竞争)
 fn write_hermes_yaml(config_path: &std::path::Path, config: &serde_json::Value) -> Result<(), String> {
     // 备份原文件(覆盖已有 .bak)
     let bak = config_path.with_extension("yaml.bak");
@@ -280,7 +311,7 @@ fn write_hermes_yaml(config_path: &std::path::Path, config: &serde_json::Value) 
     }
     let out = serde_yaml::to_string(config)
         .map_err(|e| format!("yaml serialize failed: {}", e))?;
-    std::fs::write(config_path, out)
+    atomic_write(config_path, &out)
         .map_err(|e| format!("write failed: {}", e))?;
     Ok(())
 }
@@ -298,13 +329,14 @@ fn connect_hermes(exe_path: &str) -> Result<(), String> {
         .get_mut("mcp_servers")
         .and_then(|v| v.as_object_mut())
         .ok_or("mcp_servers is not an object")?;
+    let api_url = discover_api_url();
     mcp.insert(
         "graph-memory".into(),
         serde_json::json!({
             "command": exe_path,
             "args": [],
             "env": {
-                "GM_API_URL": "http://127.0.0.1:9121"
+                "GM_API_URL": api_url
             },
             "enabled": true
         }),
