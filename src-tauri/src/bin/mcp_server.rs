@@ -232,48 +232,96 @@ fn make_error(id: &serde_json::Value, code: i64, message: &str) -> String {
 fn main() {
     let _ = env_logger::try_init();
     log::info!("Graph Memory MCP Server starting, api_base={}", api_base());
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let initialized = Arc::new(AtomicBool::new(false));
 
-    for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
-        if line.trim().is_empty() { continue; }
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // MCP stdio 传输:兼容两种帧格式
+    // 1. Content-Length 分帧(LSP 风格):"Content-Length: N\r\n\r\n{json}"
+    // 2. 换行分隔(原 MCP spec):"{json}\n"
+    // Claude Code 用 Content-Length 分帧,原实现只支持换行分隔 → 响应被丢 → hang
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    let mut line_buf = String::new();
 
-        let out = match method {
-            "initialize" => {
-                initialized.store(true, Ordering::Relaxed);
-                make_result(&id, serde_json::json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "graph-memory", "version": "0.2.0"}
-                }))
-            }
-            "initialized" | "notifications/initialized" => { continue; }
-            "tools/list" => make_result(&id, serde_json::json!({"tools": tools_list()})),
-            "tools/call" => {
-                let name = msg.get("params").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
-                let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(serde_json::json!({}));
-                match handle_tool_call(name, &args) {
-                    Ok(content) => make_result(&id, serde_json::json!({"content": content})),
-                    Err(e) => make_result(&id, serde_json::json!({
-                        "content": [{"type": "text", "text": format!("错误: {}", e)}],
-                        "isError": true
-                    })),
-                }
-            }
-            "ping" => make_result(&id, serde_json::json!({})),
-            _ => make_error(&id, -32601, &format!("method not found: {}", method)),
+    loop {
+        line_buf.clear();
+        let n = match reader.read_line(&mut line_buf) {
+            Ok(0) => break,  // EOF
+            Ok(n) => n,
+            Err(_) => break,
         };
+        let line = line_buf.trim().to_string();
+        if line.is_empty() { continue; }
 
-        if writeln!(stdout, "{}", out).is_err() { break; }
-        let _ = stdout.flush();
+        // 检测 Content-Length 分帧
+        if line.to_lowercase().starts_with("content-length:") {
+            let content_length: usize = line[15..].trim().parse().unwrap_or(0);
+            if content_length == 0 { continue; }
+            // 读空行(\r\n)
+            let mut crlf = String::new();
+            let _ = reader.read_line(&mut crlf);
+            // 读 content_length 字节的 JSON
+            let mut body = vec![0u8; content_length];
+            use std::io::Read;
+            if reader.read_exact(&mut body).is_err() { continue; }
+            let body_str = String::from_utf8_lossy(&body).to_string();
+            process_message(&body_str, &mut stdout, &initialized);
+        } else {
+            // 换行分隔的 JSON-RPC
+            process_message(&line, &mut stdout, &initialized);
+        }
     }
     log::info!("Graph Memory MCP Server exiting");
+}
+
+/// 处理一条 JSON-RPC 消息,用 Content-Length 分帧写回响应
+fn process_message(line: &str, stdout: &mut io::Stdout, _initialized: &Arc<AtomicBool>) {
+    log::info!("[mcp] recv: {}", &line[..line.len().min(120)]);
+    let msg: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => { log::info!("[mcp] parse err: {}", e); return; }
+    };
+    let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    log::info!("[mcp] method={} id={}", method, id);
+
+    let out = match method {
+        "initialize" => {
+            make_result(&id, serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "graph-memory", "version": "0.2.0"}
+            }))
+        }
+        "initialized" | "notifications/initialized" => { log::info!("[mcp] notification, no response"); return; }
+        "tools/list" => make_result(&id, serde_json::json!({"tools": tools_list()})),
+        "tools/call" => {
+            let name = msg.get("params").and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            let args = msg.get("params").and_then(|p| p.get("arguments")).cloned().unwrap_or(serde_json::json!({}));
+            log::info!("[mcp] tool_call: {}", name);
+            match handle_tool_call(name, &args) {
+                Ok(content) => { log::info!("[mcp] tool_call OK, {} blocks", content.len()); make_result(&id, serde_json::json!({"content": content})) }
+                Err(e) => { log::info!("[mcp] tool_call ERR: {}", e); make_result(&id, serde_json::json!({
+                    "content": [{"type": "text", "text": format!("错误: {}", e)}],
+                    "isError": true
+                })) },
+            }
+        }
+        "ping" => make_result(&id, serde_json::json!({})),
+        _ => make_error(&id, -32601, &format!("method not found: {}", method)),
+    };
+
+    log::info!("[mcp] sending response len={}", out.len());
+    // 换行分隔输出(MCP spec 标准)。Content-Length 分帧在 Windows 管道上有写入问题。
+    // 输入端兼容两种帧格式(见 main loop),输出端用换行分隔。
+    match writeln!(stdout, "{}", out) {
+        Ok(_) => {}
+        Err(e) => { log::info!("[mcp] write FAILED: {}", e); return; }
+    }
+    match stdout.flush() {
+        Ok(_) => log::info!("[mcp] flush OK"),
+        Err(e) => log::info!("[mcp] flush FAILED: {}", e),
+    }
 }
