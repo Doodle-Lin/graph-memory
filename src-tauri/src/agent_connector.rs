@@ -58,14 +58,19 @@ pub fn detect_agents() -> Vec<AgentInfo> {
         exe_path: None,
     });
 
-    // Hermes: 检测 hermes CLI 是否在 PATH 里
+    // Hermes: 检测 hermes CLI 是否在 PATH 里,配置走 YAML(非 ~/.hermes 而是 %LOCALAPPDATA%\hermes)
     let hermes_installed = which_hermes().is_some();
+    let hermes_cfg = hermes_config_path();
+    let hermes_connected = hermes_cfg
+        .as_ref()
+        .map(|p| is_hermes_connected(p))
+        .unwrap_or(false);
     agents.push(AgentInfo {
         id: "hermes".into(),
         name: "Hermes Agent".into(),
         installed: hermes_installed,
-        config_path: None, // Hermes MCP 配置位置待定
-        connected: false,
+        config_path: hermes_cfg.as_ref().map(|p| p.to_string_lossy().into()),
+        connected: hermes_connected,
         exe_path: None,
     });
 
@@ -74,6 +79,11 @@ pub fn detect_agents() -> Vec<AgentInfo> {
 
 /// 把 graph-memory MCP server 写入指定 agent 的配置
 pub fn connect_agent(agent_id: &str, exe_path: &str) -> Result<(), String> {
+    // Hermes 用 YAML 配置,走独立路径
+    if agent_id == "hermes" {
+        return connect_hermes(exe_path);
+    }
+
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "no home dir")?;
@@ -126,6 +136,11 @@ pub fn connect_agent(agent_id: &str, exe_path: &str) -> Result<(), String> {
 
 /// 断开:从 agent 配置中移除 graph-memory 条目
 pub fn disconnect_agent(agent_id: &str) -> Result<(), String> {
+    // Hermes 用 YAML 配置,走独立路径
+    if agent_id == "hermes" {
+        return disconnect_hermes();
+    }
+
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "no home dir")?;
@@ -188,4 +203,126 @@ fn which_hermes() -> Option<String> {
         }
     }
     None
+}
+
+// ── Hermes(YAML 配置)专用逻辑 ──────────────────────────────────
+
+/// 解析 Hermes 配置文件路径。
+/// 顺序:HERMES_HOME env → 平台默认(Win=%LOCALAPPDATA%\hermes, POSIX=~/.hermes)→ hermes config path 子进程。
+fn hermes_config_path() -> Option<PathBuf> {
+    // 1. HERMES_HOME 环境变量覆盖
+    if let Ok(hh) = std::env::var("HERMES_HOME") {
+        if !hh.trim().is_empty() {
+            let p = PathBuf::from(&hh).join("config.yaml");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    // 2. 平台默认
+    let default = if cfg!(target_os = "windows") {
+        std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("hermes").join("config.yaml"))
+    } else {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".hermes").join("config.yaml"))
+    };
+    if let Some(p) = default {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // 3. 回退:问 hermes 自己
+    if let Ok(out) = std::process::Command::new("hermes").arg("config").arg("path").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                let p = PathBuf::from(&s);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 检查 Hermes YAML 配置里是否已有 mcp_servers.graph-memory
+fn is_hermes_connected(config_path: &std::path::Path) -> bool {
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let config: serde_json::Value = match serde_yaml::from_str(&raw) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    config.get("mcp_servers")
+        .and_then(|v| v.get("graph-memory"))
+        .is_some()
+}
+
+/// 读 YAML 配置为 serde_json::Value(空文件视为空 map)
+fn load_hermes_yaml(config_path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("read failed: {}", e))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_yaml::from_str::<serde_json::Value>(&raw)
+        .map_err(|e| format!("yaml parse failed: {}", e))
+}
+
+/// 写前备份 + 序列化写回
+fn write_hermes_yaml(config_path: &std::path::Path, config: &serde_json::Value) -> Result<(), String> {
+    // 备份原文件(覆盖已有 .bak)
+    let bak = config_path.with_extension("yaml.bak");
+    if config_path.exists() {
+        std::fs::copy(config_path, &bak).ok();
+    }
+    let out = serde_yaml::to_string(config)
+        .map_err(|e| format!("yaml serialize failed: {}", e))?;
+    std::fs::write(config_path, out)
+        .map_err(|e| format!("write failed: {}", e))?;
+    Ok(())
+}
+
+/// 接入 Hermes:在 YAML 的 mcp_servers.graph-memory 写入 stdio 条目
+fn connect_hermes(exe_path: &str) -> Result<(), String> {
+    let config_path = hermes_config_path()
+        .ok_or_else(|| "hermes config.yaml not found (设置 HERMES_HOME 或安装 hermes)".to_string())?;
+    let mut config = load_hermes_yaml(&config_path)?;
+    // 确保 mcp_servers 存在且是 map
+    if config.get("mcp_servers").is_none() {
+        config["mcp_servers"] = serde_json::json!({});
+    }
+    let mcp = config
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("mcp_servers is not an object")?;
+    mcp.insert(
+        "graph-memory".into(),
+        serde_json::json!({
+            "command": exe_path,
+            "args": [],
+            "env": {
+                "GM_API_URL": "http://127.0.0.1:9121"
+            },
+            "enabled": true
+        }),
+    );
+    write_hermes_yaml(&config_path, &config)?;
+    log::info!("Connected hermes to graph-memory MCP (config: {})", config_path.display());
+    Ok(())
+}
+
+/// 断开 Hermes:从 YAML 移除 mcp_servers.graph-memory
+fn disconnect_hermes() -> Result<(), String> {
+    let config_path = hermes_config_path()
+        .ok_or_else(|| "hermes config.yaml not found".to_string())?;
+    let mut config = load_hermes_yaml(&config_path)?;
+    if let Some(mcp) = config.get_mut("mcp_servers").and_then(|v| v.as_object_mut()) {
+        mcp.remove("graph-memory");
+    }
+    write_hermes_yaml(&config_path, &config)?;
+    log::info!("Disconnected hermes from graph-memory");
+    Ok(())
 }

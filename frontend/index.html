@@ -1084,7 +1084,7 @@ async function loadAgentPanel() {
       left.textContent = `${dot} ${a.name}`;
       left.style.opacity = a.installed ? '1' : '0.5';
       row.appendChild(left);
-      if (a.installed && a.id !== 'hermes') {
+      if (a.installed) {
         const btn = document.createElement('button');
         btn.textContent = a.connected ? '断开' : '接入';
         btn.style.cssText = 'padding:2px 10px;font-size:12px;cursor:pointer;border-radius:4px;border:1px solid #30363d;background:';

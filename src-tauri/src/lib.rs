@@ -358,6 +358,58 @@ pub fn run() {
                 Err(e) => log::error!("failed to create main window: {}", e),
             }
 
+            // ── 系统托盘:关窗隐藏后唯一唤回入口,右键菜单"显示/退出" ──
+            use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
+            use tauri::menu::{Menu, MenuItem};
+            let tray_menu = match Menu::with_items(app, &[
+                &MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?,
+                &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
+            ]) {
+                Ok(m) => m,
+                Err(e) => { log::error!("tray menu build failed: {}", e); return Ok(()); }
+            };
+            let tray_icon = app.default_window_icon()
+                .map(|i| i.clone())
+                .ok_or("no default window icon for tray");
+            match tray_icon {
+                Ok(icon) => {
+                    if let Err(e) = TrayIconBuilder::with_id("main-tray")
+                        .icon(icon)
+                        .tooltip("Graph Memory")
+                        .menu(&tray_menu)
+                        .on_tray_icon_event(|tray, e| {
+                            // 左键单击唤回主窗口
+                            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                                let app = tray.app_handle();
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        })
+                        .on_menu_event(|app, e| match e.id().as_ref() {
+                            "show" => {
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                            "quit" => {
+                                // 带 exit code,绕过 RunEvent::ExitRequested 的 code.is_none() 守卫
+                                app.exit(0);
+                            }
+                            _ => {}
+                        })
+                        .build(app)
+                    {
+                        log::error!("tray icon build failed: {}", e);
+                    } else {
+                        log::info!("system tray installed");
+                    }
+                }
+                Err(e) => log::error!("tray icon source missing: {}", e),
+            }
+
             if model_ready {
                 log::info!("Model cached, loading embedder in background...");
                 let app_handle = app.handle().clone();
