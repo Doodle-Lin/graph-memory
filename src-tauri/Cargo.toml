@@ -36,8 +36,8 @@ log = "0.4"
 env_logger = "0.11"
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+opt-level = 2
+lto = "thin"
+codegen-units = 16
 strip = true
 panic = "abort"
