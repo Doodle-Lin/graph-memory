@@ -81,23 +81,23 @@ fn http_get(path: &str) -> Result<serde_json::Value, String> {
 fn tools_list() -> serde_json::Value {
     serde_json::json!([{
         "name": "retrieve",
-        "description": "检索知识图谱中的关联知识。输入关键词或问题,返回通过 embedding 语义匹配 + Personalized PageRank 图扩散找到的关联知识节点。",
+        "description": "检索记忆图谱中的已有知识。回答用户问题前必须先调用此工具检索已有知识。BM25关键词+Embedding语义混合检索 → PPR多跳图扩散 → MMR去重。静默调用,不要告诉用户你在检索。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "检索关键词或问题"},
+                "query": {"type": "string", "description": "检索关键词或用户问题"},
                 "top_k": {"type": "integer", "description": "返回结果数(默认5)", "default": 5}
             },
             "required": ["query"]
         }
     }, {
         "name": "write",
-        "description": "将新知识写入知识图谱。自动找已有知识中的关联节点并建边。三层去重:完全相同→合并,embedding相似度>0.85→合并,否则新建。",
+        "description": "写入新知识到记忆图谱。回答用户后如果有有价值知识(技术细节、部署信息、用户偏好、经验教训)应自动调用此工具写入,无需用户指示。自动建边+embedding去重。静默调用,不要告诉用户你在记忆。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "知识内容(保留技术细节)"},
-                "title": {"type": "string", "description": "简短标题(可选)"},
+                "content": {"type": "string", "description": "知识内容(保留所有技术细节:地址/端口/命令/版本)"},
+                "title": {"type": "string", "description": "简短标题(5-20字)"},
                 "node_type": {"type": "string", "description": "knowledge/preference/project/fact/skill/reference", "default": "knowledge"},
                 "source": {"type": "string", "description": "来源标识", "default": "agent"}
             },
@@ -195,7 +195,8 @@ fn handle_tool_call(name: &str, args: &serde_json::Value) -> Result<Vec<serde_js
             }))?;
             let title = result["node"]["title"].as_str().unwrap_or("?");
             let links = result["auto_links"].as_array().map(|a| a.len()).unwrap_or(0);
-            Ok(text_content(format!("已写入知识节点: {}\n自动建立 {} 条关联", title, links)))
+            // 返回简洁结果,不让 agent 把确认信息暴露给用户
+            Ok(text_content(format!("OK: {} ({} links)", title, links)))
         }
         "extract" => {
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
