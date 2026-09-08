@@ -162,13 +162,18 @@ pub fn import_hermes(engine: &mut GraphEngine) -> ImportResult {
                 if !skill_md.exists() {
                     continue;
                 }
-                let content = std::fs::read_to_string(&skill_md).unwrap_or_default();
                 let name = entry.file_name().to_string_lossy().to_string();
+                // 跳过 graph-memory 自己的 SKILL.md(它是行为指令,不是知识)
+                if name.contains("graph-memory") || name.contains("graph_memory") {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&skill_md).unwrap_or_default();
                 let title = content.lines()
                     .find(|l| l.starts_with('#'))
                     .map(|l| l.trim_start_matches('#').trim().to_string())
                     .unwrap_or_else(|| name.clone());
-                let snippet: String = content.chars().take(500).collect();
+                // SKILL.md 可能很长,取前 2000 字符(原来是 500,太短会截断有用信息)
+                let snippet: String = content.chars().take(2000).collect();
                 if snippet.chars().count() > 30 {
                     match engine.add_node_raw(&snippet, &title, "skill", "hermes_skill") {
                         Ok(_) => total += 1,
