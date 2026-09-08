@@ -163,7 +163,68 @@ pub fn connect_agent(agent_id: &str, exe_path: &str) -> Result<(), String> {
     atomic_write(&config_path, &out)?;
 
     log::info!("Connected agent '{}' to graph-memory MCP (config: {}, api: {})", agent_id, config_path.display(), api_url);
+
+    // 自动部署 SKILL.md 到 agent 的 skill 目录
+    if let Err(e) = deploy_skill(agent_id) {
+        log::warn!("skill deployment failed for {}: {}", agent_id, e);
+    }
+
     Ok(())
+}
+
+/// 部署 SKILL.md 到 agent 的 skill 目录,让 agent 读到完整行为指令
+/// (retrieve/write 的自动触发规则、何时用、示例流程)
+pub fn deploy_skill(agent_id: &str) -> Result<(), String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "no home dir")?;
+
+    // SKILL.md 源文件:exe 同目录 → cwd → 项目根
+    let skill_src = find_skill_source()?;
+
+    // 目标 skill 目录(各 agent 不同)
+    let skill_dir = match agent_id {
+        "claude" => {
+            // Claude Code: ~/.claude/skills/graph-memory/
+            PathBuf::from(&home).join(".claude/skills/graph-memory")
+        }
+        "hermes" => {
+            // Hermes: HERMES_HOME/skills/graph-memory(或 %LOCALAPPDATA%\hermes)
+            let hermes_home = hermes_config_path()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from(&home).join(".hermes"));
+            hermes_home.join("skills/graph-memory")
+        }
+        "codex" => {
+            PathBuf::from(&home).join(".codex/skills/graph-memory")
+        }
+        _ => return Err(format!("unknown agent: {}", agent_id)),
+    };
+
+    std::fs::create_dir_all(&skill_dir).map_err(|e| format!("create skill dir failed: {}", e))?;
+    let skill_dst = skill_dir.join("SKILL.md");
+    std::fs::copy(&skill_src, &skill_dst).map_err(|e| format!("copy skill failed: {}", e))?;
+    log::info!("Deployed SKILL.md to {} ({})", skill_dst.display(), agent_id);
+    Ok(())
+}
+
+/// 找 SKILL.md 源文件:exe 同目录 → cwd → 上级目录
+fn find_skill_source() -> Result<PathBuf, String> {
+    let candidates = [
+        // exe 同目录(生产构建)
+        std::env::current_exe().ok()
+            .and_then(|p| p.parent().map(|d| d.join("SKILL.md"))),
+        // cwd(开发模式,cwd = src-tauri)
+        std::env::current_dir().ok().map(|d| d.join("SKILL.md")),
+        // cwd 上一级(项目根)
+        std::env::current_dir().ok().and_then(|d| d.parent().map(|p| p.join("SKILL.md"))),
+    ];
+    for c in candidates.iter().flatten() {
+        if c.exists() {
+            return Ok(c.canonicalize().unwrap_or_else(|_| c.clone()));
+        }
+    }
+    Err("SKILL.md not found (checked exe dir, cwd, parent)".to_string())
 }
 
 /// 断开:从 agent 配置中移除 graph-memory 条目
@@ -201,6 +262,24 @@ pub fn disconnect_agent(agent_id: &str) -> Result<(), String> {
     atomic_write(&config_path, &out)?;
 
     log::info!("Disconnected agent '{}' from graph-memory", agent_id);
+
+    // 同时移除 SKILL.md
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let skill_dir = match agent_id {
+        "claude" => PathBuf::from(&home).join(".claude/skills/graph-memory"),
+        "hermes" => {
+            let hh = hermes_config_path()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from(&home).join(".hermes"));
+            hh.join("skills/graph-memory")
+        }
+        "codex" => PathBuf::from(&home).join(".codex/skills/graph-memory"),
+        _ => return Ok(()),
+    };
+    let _ = std::fs::remove_dir_all(&skill_dir);
+    log::info!("Removed SKILL.md for {}", agent_id);
     Ok(())
 }
 
@@ -343,6 +422,12 @@ fn connect_hermes(exe_path: &str) -> Result<(), String> {
     );
     write_hermes_yaml(&config_path, &config)?;
     log::info!("Connected hermes to graph-memory MCP (config: {})", config_path.display());
+
+    // 自动部署 SKILL.md
+    if let Err(e) = deploy_skill("hermes") {
+        log::warn!("skill deployment failed for hermes: {}", e);
+    }
+
     Ok(())
 }
 
@@ -356,5 +441,11 @@ fn disconnect_hermes() -> Result<(), String> {
     }
     write_hermes_yaml(&config_path, &config)?;
     log::info!("Disconnected hermes from graph-memory");
+
+    // 移除 SKILL.md
+    if let Some(hp) = hermes_config_path().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let _ = std::fs::remove_dir_all(hp.join("skills/graph-memory"));
+        log::info!("Removed SKILL.md for hermes");
+    }
     Ok(())
 }
