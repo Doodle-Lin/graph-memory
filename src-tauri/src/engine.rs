@@ -50,7 +50,8 @@ pub struct RetrieveResult {
 }
 
 const DEDUP_THRESHOLD: f32 = 0.85;
-const MIN_SIM_THRESHOLD: f32 = 0.3;
+const MIN_SIM_THRESHOLD: f32 = 0.3;  // 准入阈值(用于 retrieve,基于原始 cosine)
+const AUTO_LINK_THRESHOLD: f32 = 0.5; // B1:auto_link 建边阈值(0.3→0.5,减少噪声边)
 const SEED_TOP_K: usize = 2;
 const RETRIEVAL_TOP_K: usize = 5;
 
@@ -345,6 +346,19 @@ impl GraphEngine {
         if norm_a == 0. || norm_b == 0. { 0. } else { dot / (norm_a * norm_b) }
     }
 
+    /// B2:边类型在 PPR 扩散中的权重(depends_on 强传播,same_topic 弱传播)
+    fn relation_weight(relation: &str) -> f64 {
+        match relation {
+            "depends_on" => 1.2,
+            "part_of" => 1.1,
+            "derived_from" => 1.0,
+            "strongly_related" => 1.0,
+            "related_to" => 0.8,
+            "same_topic" => 0.5,
+            _ => 0.8,
+        }
+    }
+
     /// 直接写入 SQLite(不生成 embedding,用于批量导入)
     pub fn add_node_raw(&mut self, content: &str, title: &str, node_type: &str, source: &str) -> Result<(), String> {
         let nid = Self::new_node_id();
@@ -483,7 +497,8 @@ impl GraphEngine {
 
         let mut created = Vec::new();
         for (target_id, sim) in sims.into_iter().take(max_links) {
-            if sim < MIN_SIM_THRESHOLD { break; }
+            // B1:阈值 0.3→0.5,减少噪声边(BGE-Small 0.3 太松,9边/节点是毛球)
+            if sim < AUTO_LINK_THRESHOLD { break; }
             // 已存在同向边则跳过(避免重复)
             if let (Some(&s_idx), Some(&t_idx)) = (self.node_map.get(nid), self.node_map.get(&target_id)) {
                 if self.graph.find_edge(s_idx, t_idx).is_some() { continue; }
@@ -626,26 +641,57 @@ impl GraphEngine {
                 .collect());
         }
 
-        // 4. 图扩散(PageRank 简化版:语义分 + 邻居传播)
-        let mut pr_scores: HashMap<String, f64> = HashMap::new();
-        let total_seed: f32 = seeds.iter().map(|(_, s)| s).sum();
+        // 4. 真 Personalized PageRank(PPR):多跳传播
+        // 替代 1-hop boost。PPR 迭代:p = α·seed + (1-α)·W^T·p
+        // α=0.5(50% 留在种子,50% 沿边传播),3 轮=3 跳
+        // B2:边类型参与扩散(depends_on 权重高,same_topic 低)
+        // B3:双向扩散(edges_directed Both,不只 out-edges)
+        use petgraph::Direction;
+        let damping = 0.5;
+        let iterations = 3;
 
-        for (id, emb) in &self.embeddings {
-            let sim = Self::cosine_sim(&query_emb, emb);
-            let mut score: f64 = (sim / total_seed) as f64;
-            if let Some(&idx) = self.node_map.get(id) {
-                for edge_ref in self.graph.edges(idx) {
-                    let neighbor_id = &self.graph[edge_ref.target()].id;
-                    if let Some(n_sim) = sims.iter().find(|(n_id, _)| n_id == neighbor_id) {
-                        score += 0.3 * n_sim.1 as f64 * edge_ref.weight().weight;
-                    }
-                }
-            }
-            pr_scores.insert(id.clone(), score);
+        // 种子分:非种子=0,种子=其 RRF 归一化分
+        let seed_map: HashMap<String, f32> = seeds.iter().cloned().collect();
+
+        // 初始化 PPR
+        let mut ppr: HashMap<String, f64> = HashMap::new();
+        for (id, _) in &sem_sims {
+            ppr.insert(id.clone(), seed_map.get(id).copied().unwrap_or(0.0) as f64);
         }
 
-        let pr_sum: f64 = pr_scores.values().sum();
-        let sem_max = sims.first().map(|(_, s)| *s).unwrap_or(1.0);
+        // PPR 迭代
+        for _iter in 0..iterations {
+            let mut new_ppr: HashMap<String, f64> = HashMap::new();
+            for (id, _) in &sem_sims {
+                let idx = match self.node_map.get(id) { Some(&i) => i, None => continue };
+                // 从邻居收集分数(双向 B3:Outgoing + Incoming)
+                let mut incoming: f64 = 0.0;
+                let mut degree: usize = 0;
+                // Outgoing 边:邻居 = target
+                for edge_ref in self.graph.edges_directed(idx, Direction::Outgoing) {
+                    let neighbor_id = &self.graph[edge_ref.target()].id;
+                    let neighbor_p = ppr.get(neighbor_id).copied().unwrap_or(0.0);
+                    let rw = Self::relation_weight(&edge_ref.weight().relation);
+                    incoming += neighbor_p * edge_ref.weight().weight * rw;
+                    degree += 1;
+                }
+                // Incoming 边:邻居 = source
+                for edge_ref in self.graph.edges_directed(idx, Direction::Incoming) {
+                    let neighbor_id = &self.graph[edge_ref.source()].id;
+                    let neighbor_p = ppr.get(neighbor_id).copied().unwrap_or(0.0);
+                    let rw = Self::relation_weight(&edge_ref.weight().relation);
+                    incoming += neighbor_p * edge_ref.weight().weight * rw;
+                    degree += 1;
+                }
+                let teleport = seed_map.get(id).copied().unwrap_or(0.0) as f64;
+                let propagated = incoming / degree.max(1) as f64;
+                new_ppr.insert(id.clone(), damping * teleport + (1.0 - damping) * propagated);
+            }
+            ppr = new_ppr;
+        }
+
+        // A3 修复:归一化 PPR 到 [0,1](和 RRF 同尺度,融合权重要有意义)
+        let max_ppr = ppr.values().cloned().fold(0.0f64, f64::max).max(1e-8);
 
         let type_priority: HashMap<&str, f64> = [
             ("knowledge", 0.0), ("project", 1.0), ("fact", 2.0),
@@ -658,7 +704,7 @@ impl GraphEngine {
                 if !is_relevant(id) { return None; }
                 let rrf = sims.iter().find(|(sid, _)| sid == id).map(|(_, s)| *s).unwrap_or(0.0);
                 let sem_orig = sem_map.get(id).copied().unwrap_or(0.0);
-                let pr = pr_scores.get(id).copied().unwrap_or(0.0) / pr_sum.max(1e-8);
+                let pr = ppr.get(id).copied().unwrap_or(0.0) / max_ppr;
                 let fused = 0.5 * rrf as f64 + 0.5 * pr;
                 let idx = self.node_map.get(id)?;
                 let node = &self.graph[*idx];
