@@ -535,6 +535,38 @@ pub fn run() {
                 });
             }
 
+            // ── 后台维护线程:每 60 分钟跑零 token 的维护(遗忘 + 去重扫描) ──
+            // 不跑 LLM 提炼(只在手动点按钮或导入后跑一次,避免重复花 token)
+            {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // 等 30s 让模型加载 + 首次 enrich 完成
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    loop {
+                        log::info!("[maintenance] starting periodic cleanup...");
+                        let state = app_handle.state::<AppState>();
+                        let mut engine = state.engine.lock().unwrap();
+
+                        // 1. 遗忘陈旧节点(>180天 + access<2 + degree<2 保留桥节点)
+                        let (deleted, kept) = engine.forget_stale(180, 2);
+                        if deleted > 0 {
+                            log::info!("[maintenance] forgot {} stale nodes, {} kept", deleted, kept);
+                        }
+
+                        // 2. 去重扫描(只读,不合并,日志记录候选数)
+                        let pairs = engine.dedup_scan(0.7, 0.85, 50);
+                        if !pairs.is_empty() {
+                            log::info!("[maintenance] dedup scan: {} near-duplicate pairs found (review via /api/dedup/scan)", pairs.len());
+                        }
+
+                        drop(engine);
+
+                        // 每 60 分钟跑一次
+                        std::thread::sleep(std::time::Duration::from_secs(3600));
+                    }
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -477,9 +477,11 @@ fn handle_engine_api(
         }
         let cfg = cfg.unwrap();
         let nodes = e.all_nodes_raw();
-        // 只提炼需要提炼的(标题长或内容长)
+        // 只提炼需要提炼的:标题长或内容长 + 未被标记已提炼(refined:true)
         let to_refine: Vec<_> = nodes.iter()
-            .filter(|(_, title, content, _)| title.len() >= 30 || content.len() >= 200)
+            .filter(|(id, title, content, _)| {
+                (title.len() >= 30 || content.len() >= 200) && !e.is_refined(id)
+            })
             .collect();
         let total = to_refine.len();
         let skipped = nodes.len() - total;
@@ -507,6 +509,7 @@ fn handle_engine_api(
                         let _ = stream.write_all(ev.as_bytes());
                     } else {
                         refined += 1;
+                        e.mark_refined(id);
                         let ev = format!("event: progress\ndata: {}\n\n",
                             serde_json::json!({"index": i+1, "total": total, "id": id,
                                 "old_title": trunc_str(title, 60), "new_title": trunc_str(new_title, 60),
@@ -528,6 +531,13 @@ fn handle_engine_api(
             serde_json::json!({"total": total, "refined": refined, "errors": errors,
                 "message": format!("提炼 {} / {} 个节点 ({} 错误)", refined, total, errors)}));
         let _ = stream.write_all(done_event.as_bytes());
+        return true;
+    }
+
+    // GET /api/dedup/scan —— 近似对候选(只读,零 LLM)
+    if clean == "/api/dedup/scan" && method == "GET" {
+        let pairs = e.dedup_scan(0.7, 0.85, 50);
+        send_json(stream, serde_json::json!({"pairs": pairs, "count": pairs.len()}));
         return true;
     }
 

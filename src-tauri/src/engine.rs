@@ -1051,6 +1051,62 @@ impl GraphEngine {
         (deleted, kept)
     }
 
+    /// 去重扫描(只读,零 LLM token):找 embedding 0.7-0.85 的近似对,
+    /// 返回候选列表供前端展示 / agent 用 consolidate 合并。不自动合并。
+    pub fn dedup_scan(&self, min_sim: f32, max_sim: f32, limit: usize) -> Vec<serde_json::Value> {
+        let ids: Vec<String> = self.embeddings.keys().cloned().collect();
+        let mut pairs = Vec::new();
+        for i in 0..ids.len() {
+            for j in (i+1)..ids.len() {
+                let a = &self.embeddings[&ids[i]];
+                let b = &self.embeddings[&ids[j]];
+                let sim = Self::cosine_sim(a, b);
+                if sim >= min_sim && sim < max_sim {
+                    let ai = self.node_map.get(&ids[i]).copied();
+                    let bi = self.node_map.get(&ids[j]).copied();
+                    if let (Some(ai), Some(bi)) = (ai, bi) {
+                        let na = &self.graph[ai];
+                        let nb = &self.graph[bi];
+                        pairs.push(serde_json::json!({
+                            "id_a": na.id, "id_b": nb.id,
+                            "title_a": na.title, "title_b": nb.title,
+                            "similarity": sim,
+                        }));
+                    }
+                }
+                if pairs.len() >= limit { return pairs; }
+            }
+        }
+        pairs
+    }
+
+    /// 检查节点是否已被提炼过(metadata 含 "refined":true)
+    pub fn is_refined(&self, id: &str) -> bool {
+        if let Some(&idx) = self.node_map.get(id) {
+            self.graph[idx].metadata.contains("\"refined\":true")
+        } else { false }
+    }
+
+    /// 标记节点已提炼(metadata 加 "refined":true)
+    pub fn mark_refined(&mut self, id: &str) {
+        if let Some(&idx) = self.node_map.get(id) {
+            let node = &mut self.graph[idx];
+            if !node.metadata.contains("\"refined\":true") {
+                let old = node.metadata.trim_end_matches('}').trim_end_matches(',');
+                let new = if old == "{" || old.is_empty() {
+                    r#"{"refined":true}"#.to_string()
+                } else {
+                    format!(r#"{},"refined":true}}"#, old)
+                };
+                node.metadata = new;
+                let _ = self.db.execute(
+                    "UPDATE nodes SET metadata = ? WHERE id = ?",
+                    params![&node.metadata, id],
+                );
+            }
+        }
+    }
+
     /// 更新节点的标题和内容(保留 id, type, source, metadata)
     /// C2 修复:存历史到 node_history 表,可追溯/恢复
     pub fn update_node_text(&mut self, id: &str, new_title: &str, new_content: &str) -> Result<()> {
