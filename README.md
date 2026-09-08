@@ -1,234 +1,178 @@
 # Graph Memory
 
-> A local knowledge-graph memory for AI coding agents — one cross-project graph that any conversation can query, so an agent in one session reaches knowledge captured in every other.
+> 本地知识图谱记忆系统 — 一个桌面常驻的记忆网关，让 AI agent（Claude Code / Codex / Hermes）跨会话检索和写入同一张知识图谱，不用从头交代。
 
-本地知识图谱记忆系统,替代传统 agent 按会话分割的记忆方式。用知识图谱 + PageRank 扩散检索实现跨概念关联,让 agent 在一个会话内访问所有项目的知识。
+**English:** Graph Memory is a local knowledge-graph memory gateway. Agents read/write a shared graph via MCP tools, so knowledge captured in one session is reachable in every other. Runs locally — embeddings are a local BGE-Small-ZH model, the graph is SQLite + FTS5, and the LLM is only used (optionally) for knowledge extraction.
 
-**English summary:** Graph Memory replaces per-session memory with a single local knowledge graph. Retrieval seeds from semantic nearest-neighbors and spreads via Personalized PageRank over auto-built edges, fusing 50% semantic + 50% graph-diffusion scores. It exposes 5 tools to agents over MCP and ships a Cytoscape.js visualization. Everything runs locally — embeddings are a local sentence-transformers model, the graph is a JSON file, and the LLM is only used (optionally) for knowledge extraction.
+## 特性
 
-## 特性 / Features
-
-- **图式关联检索** — PageRank 沿图扩散,从一个技术点带出相关的部署细节、经验教训或用户偏好
-- **LLM 知识提炼** — 从对话/记忆中自动提取结构化知识节点
-- **三层去重** — MD5 → embedding 相似度 >0.85 → 新建
-- **记忆修正** — 发现过时信息可更新已有节点
-- **MCP 集成** — 通过 MCP 自动为各 Agent 暴露 5 个工具
-- **可视化** — Cytoscape.js 暗色主题,筛选/增删改查
-- **本地运行** — 数据不出本机,embedding 模型本地加载
+- **混合检索** — BM25 (FTS5 trigram) + Embedding (BGE-Small-ZH) → RRF 融合 → PPR 多跳图扩散 → MMR 多样性
+- **多实体分路检索** — "8397板子和A800的区别" 能同时覆盖两个实体邻域
+- **跨 agent 接入** — 一键接入 Claude Code / Hermes / Codex，自动部署 SKILL.md 行为指令
+- **知识生命周期** — 写入（auto_link 建边 + 三层去重）→ 提炼（LLM，标记防重复花 token）→ 更新（存历史）→ 合并 → 遗忘（后台自动）
+- **embedding 持久化** — SQLite 存储向量，重启不重算
+- **时间衰减 + 访问计数** — 常用的、近期更新的节点优先返回
+- **后台维护** — 每 60 分钟自动遗忘陈旧节点 + 去重扫描，零 LLM token
+- **系统托盘常驻** — 关窗不退进程，保证 agent 随时能调到 HTTP API
+- **本地运行** — 数据不出本机，embedding 模型本地加载
 
 ## 快速开始
 
-### 1. 安装
+### 1. 构建
 
 ```bash
-git clone https://github.com/yourname/graph-memory.git
+git clone https://github.com/Doodle-Lin/graph-memory.git
 cd graph-memory
-pip install -e ".[mcp,dotenv]"
+cd src-tauri
+cargo tauri build
 ```
 
-### 2. 配置
+产物：`target/release/bundle/nsis/Graph Memory_0.2.0_x64-setup.exe`
+
+### 2. 启动
+
+双击安装后启动，或开发模式：
 
 ```bash
-cp .env.example .env
-# 编辑 .env 填入 LLM API key 和 base_url(检索/写入不需要 LLM,只有 extract 需要)
+cd src-tauri
+cargo tauri dev
 ```
 
-### 3. 启动
+首次启动会下载 embedding 模型（BGE-Small-ZH-v1.5，~100MB），之后缓存到本地。
 
-```bash
-python -m graph_memory.server
-```
+### 3. 导入已有记忆
 
-打开 http://127.0.0.1:9121/ 看可视化界面。
-
-> 首次启动会下载 embedding 模型(默认 `BAAI/bge-base-zh-v1.5`,约 400MB),之后缓存到本地。
-
-### 3a. 演示数据（可选）
-
-首次体验时,可种入一组通用技术知识样例,让空白项目开箱即用:
-
-```bash
-python seed_demo.py
-```
-
-随后在 http://127.0.0.1:9121/ 即可看到一张小图。清空演示数据:删除 `data/graph.json` 和 `data/embeddings.npz` 后重启 server。
-
-### 3b. Docker 一键运行
-
-```bash
-docker build -t graph-memory .
-docker run -p 9121:9121 -v gm_data:/app/data -v gm_models:/root/.cache/huggingface graph-memory
-```
-
-### 4. 导入已有记忆
-
-首次使用时,从 Hermes / Claude Code / Codex 导入已有记忆:
+在应用界面点"导入"按钮，或：
 
 ```bash
 curl -X POST http://127.0.0.1:9121/api/import?source=all
 ```
 
-也可以批量提炼 Claude Code session 历史:
+支持 Hermes（MEMORY.md / USER.md / skills）、Claude Code（memory/*.md）、Codex（history.jsonl）。
 
-```bash
-curl -X POST http://127.0.0.1:9121/api/extract/sessions
-```
+### 4. 接入 Agent
 
-> 导入路径可通过环境变量覆盖(`HERMES_HOME` / `CLAUDE_HOME` / `CODEX_HOME`),默认指向各 Agent 在用户主目录下的标准位置。
+在应用左侧"Agent 接入"面板，点"接入"按钮。会自动：
+- 写 MCP 配置到 agent 的配置文件（Claude: `.claude.json` / Hermes: `config.yaml`）
+- 部署 SKILL.md 到 agent 的 skills 目录（教 agent 自动检索/写入记忆）
+
+重启 agent 后，自动获得 7 个记忆工具。
+
+### 5. 配置 LLM 提炼（可选）
+
+在应用界面点齿轮按钮，填入 Base URL / API Key / 模型名。提炼功能立即可用，检索/写入不需要 LLM。
 
 ## 在 Agent 中使用
 
-### MCP Server（自动可用）
+Agent 加载 SKILL.md 后会自动执行：
+- **回答前**：静默调 `retrieve` 检索已有知识
+- **回答后**：如果有有价值知识，自动调 `write` 写入
+- **发现过时**：调 `update` 修正
+- **无需用户指令** — agent 自动判断内容是否有价值
 
-在你的 Agent 的 MCP 配置中加入 `graph-memory` MCP server,重启后自动获得 5 个工具:
+### MCP 工具（7 个）
 
 | 工具 | 说明 |
 |---|---|
-| `mcp_graph_memory_retrieve` | 检索知识(关键词→PageRank扩散) |
-| `mcp_graph_memory_write` | 写入新知识(自动建边+去重) |
-| `mcp_graph_memory_extract` | LLM 提炼对话→知识 |
-| `mcp_graph_memory_update` | 修正过时知识 |
-| `mcp_graph_memory_recent` | 查看最近添加 |
-
-agent 在对话中可以直接调用这些工具,无需手动操作。
-
-> MCP server 通过 stdio 运行,以 HTTP 客户端身份代理到 FastAPI 后端,本身不加载模型,避免与后端持有两份不一致的图数据。
-
-### Skill（agent 指导）
-
-`SKILL.md` 是给 agent 的使用指导,agent 加载后会按规则:
-- 回答前先检索图记忆
-- 回答后提取有价值的新知识写入
-- 发现过时信息时主动更新
-
-### 使用方式
-
-**方式 1：直接跟 agent 对话**
-
-> "帮我看看某服务器上的推理项目"
-
-agent 会自动调 `retrieve` 检索相关知识,拿到项目路径/端口/分支信息后回答。
-
-**方式 2：让 agent 记住新知识**
-
-> "记住,vLLM 0.25 新增了 speculative decoding 支持"
-
-agent 会调 `write` 写入知识图谱,自动关联已有节点。
-
-**方式 3：修正过时信息**
-
-> "某服务的端口已经改了,不是 8000 了"
-
-agent 会调 `update` 更新已有节点。
-
-**方式 4：可视化浏览**
-
-打开 http://127.0.0.1:9121/ 搜索、筛选、增删改查。
+| `retrieve` | 检索记忆（BM25+Embedding+RRF → PPR 多跳 → MMR） |
+| `write` | 写入新知识（auto_link 建边 + 三层去重） |
+| `extract` | LLM 提炼对话→知识（批量，跨批次边解析） |
+| `update` | 修正已有节点（存历史，content_hash 同步） |
+| `recent` | 查看最近添加 |
+| `consolidate` | 合并两个近似节点（边迁移，内容存历史） |
+| `forget` | 遗忘陈旧节点（>180天 + access<2 + 保留桥节点） |
 
 ## 架构
 
 ```
-┌──────────────────────────────────────────┐
-│  Agent (Hermes / Claude Code / ...)       │
-│  ┌─────────────┐  ┌──────────────────┐   │
-│  │ MCP Client  │  │ Skill (指导)     │   │
-│  └──────┬──────┘  └──────────────────┘   │
-│         │ stdio                           │
-│  ┌──────▼──────┐                          │
-│  │ MCP Server  │  (轻量, 不加载模型)       │
-│  │ mcp_server  │                          │
-│  └──────┬──────┘                          │
-└─────────┼─────────────────────────────────┘
-          │ HTTP
-┌─────────▼─────────────────────────────────┐
-│  FastAPI Server (port 9121)              │
-│  ┌───────────┐  ┌──────────┐  ┌────────┐ │
-│  │ GraphEngine│  │ LLM提取  │  │ 导入器 │ │
-│  │ NetworkX  │  │ OpenAI   │  │        │ │
-│  │ PageRank  │  │ 兼容API  │  └────────┘ │
-│  │ bge embed │  └──────────┘              │
-│  └───────────┘                            │
-│       │                                   │
-│  ┌────▼────┐  ┌────────────┐              │
-│  │ graph   │  │ embeddings │              │
-│  │ .json   │  │ .npz       │              │
-│  └─────────┘  └────────────┘              │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│  Agent (Claude Code / Codex / Hermes)          │
+│  ┌─────────────┐  ┌──────────────────┐        │
+│  │ MCP Client  │  │ SKILL.md (行为指令) │        │
+│  └──────┬──────┘  └──────────────────┘        │
+│         │ stdio (JSON-RPC 2.0)                │
+│  ┌──────▼──────┐                             │
+│  │ MCP Server  │  (轻量 HTTP 代理)            │
+│  └──────┬──────┘                             │
+└─────────┼─────────────────────────────────────┘
+          │ HTTP (127.0.0.1:9121)
+┌─────────▼─────────────────────────────────────┐
+│  Tauri 2 桌面进程 (graph-memory.exe)           │
+│  ┌──────────────┐  ┌────────────┐  ┌────────┐ │
+│  │ GraphEngine  │  │ LLM 提炼   │  │ 导入器 │ │
+│  │ SQLite+FTS5  │  │ OpenAI兼容 │  │        │ │
+│  │ BGE-Small-ZH │  └────────────┘  └────────┘ │
+│  │ PPR 多跳     │                              │
+│  │ MMR 去重     │  ┌────────────────────────┐ │
+│  └──────┬───────┘  │ 后台维护线程           │ │
+│         │          │ (每60min: forget+dedup)│ │
+│  ┌──────▼────┐     └────────────────────────┘ │
+│  │ SQLite    │  ┌──────────────────────────┐ │
+│  │ graph.db  │  │ Webview (前端 SPA)       │ │
+│  │ + FTS5    │  │ 检索列表 + 详情 + 图谱    │ │
+│  │ + embeddings│ └──────────────────────────┘ │
+│  └───────────┘  系统托盘常驻                  │
+└─────────────────────────────────────────────────┘
 ```
 
-MCP server 是轻量 HTTP 客户端,不加载 embedding 模型。所有计算在 FastAPI server 中完成,避免两个进程各自持有引擎导致数据不一致。
+## 检索算法
+
+```
+query → 实体抽取(ASCII标识符分路)
+  → BM25 (FTS5 trigram, OR 连接)  ─┐
+  → Embedding (BGE-Small-ZH 语义)  ─┤→ RRF(k=60) 融合 → 归一化
+  → 准入门槛(cosine≥0.2 OR BM25命中)  │
+                                     ↓
+                              PPR 迭代(3轮, α=0.5)
+                              双向扩散(Out+In)
+                              边类型加权(depends_on>same_topic)
+                                     ↓
+                              时间衰减(90天半衰期)
+                              访问计数加成(log(1+n))
+                              MMR 多样性(>0.85 跳过)
+                                     ↓
+                              top_k 结果
+```
 
 ## API
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/retrieve` | POST | 检索知识 (embedding + PageRank) |
-| `/api/write` | POST | 写入新知识 (自动建边 + 去重) |
-| `/api/update` | POST | 修正/更新已有知识 |
+| `/api/retrieve` | POST | 检索知识 |
+| `/api/write` | POST | 写入新知识 |
+| `/api/update` | POST | 更新已有节点 |
 | `/api/extract` | POST | LLM 提炼对话→知识 |
-| `/api/recent` | GET | 最近添加的节点 |
-| `/api/graph` | GET | 全图数据 (可视化) |
-| `/api/stats` | GET | 图统计 |
+| `/api/refine` | POST | SSE 流式批量提炼 |
+| `/api/recent` | GET | 最近添加 |
+| `/api/graph` | GET | 全图快照 |
+| `/api/stats` | GET | 图统计 + 类型/来源分布 |
 | `/api/search` | GET | 关键词搜索 |
+| `/api/neighbors/{id}` | GET | BFS 邻居 |
+| `/api/nodes/{id}` | DELETE | 删除节点 |
 | `/api/import` | POST | 导入外部记忆 |
-| `/api/extract/sessions` | POST | 批量提炼 session |
-| `/api/health` | GET | 健康检查 (Docker) |
-
-## 评测
-
-```bash
-python benchmark.py
-```
-
-30 道题 × 3 轮 × LLM 评分,对比"只靠 MEMORY.md"vs"加图记忆"的回答质量。
-
-> 题集需针对你自己的知识库定制(见 `benchmark.py` 顶部注释)。检索行为本身的回归用 `regression.py`(确定性快照对比,不依赖 LLM):
-
-```bash
-python regression.py snapshot baseline      # 改代码前
-python regression.py snapshot after-change  # 改代码后
-python regression.py compare baseline after-change
-```
-
-## 测试
-
-```bash
-pip install -e ".[test]"
-pytest tests/ -q
-```
-
-引擎层测试用确定性假 embedder,不下载真实模型,离线可跑。
-
-## 知识管理（防膨胀）
-
-日常使用久了图会膨胀。定期运行管理工具:
-
-```bash
-python manage.py status        # 查看图健康状态
-python manage.py dedup         # 扫描重复节点报告
-python manage.py merge          # 合并相似节点(embedding >0.85)
-python manage.py prune --dry-run   # 预览孤立+过时节点
-python manage.py prune              # 执行清理
-```
-
-清理规则:
-- 度 <2 且 90 天未更新的节点被删除(有关联的保留)
-- 合并相似节点时保留更长/更详细的内容
-- 所有操作支持 `--dry-run` 预览
+| `/api/enrich` | POST | 补全 embedding + 建边 |
+| `/api/consolidate` | POST | 合并两个节点 |
+| `/api/forget` | POST | 遗忘陈旧节点 |
+| `/api/dedup/scan` | GET | 近似对候选(只读) |
+| `/api/llm/status` | GET | LLM 配置状态 |
+| `/api/llm/config` | POST | 写 LLM 配置到 .env |
+| `/api/agents` | GET | 检测已安装的 agent |
+| `/api/agents/connect` | POST | 接入 agent(写配置+部署SKILL) |
+| `/api/agents/disconnect` | POST | 断开 agent(清配置+删SKILL) |
+| `/api/health` | GET | 健康检查 |
 
 ## 配置项
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `GM_LLM_API_KEY` | (无) | LLM API key,仅 extract 接口需要 |
+| `GM_LLM_API_KEY` | (无) | LLM API key，仅 extract/refine 需要 |
 | `GM_LLM_BASE_URL` | (无) | OpenAI 兼容 base url |
 | `GM_LLM_MODEL` | (无) | 模型名 |
-| `GM_EMBEDDING_MODEL` | `BAAI/bge-base-zh-v1.5` | 本地 embedding 模型 |
-| `GM_HOST` | `127.0.0.1` | 服务监听地址 |
-| `GM_PORT` | `9121` | 服务端口 |
-| `HERMES_HOME` | `~/.hermes` | Hermes 记忆根目录 |
-| `CLAUDE_HOME` | `~/.claude` | Claude Code 根目录 |
-| `CODEX_HOME` | `~/.codex` | Codex 根目录 |
+| `GM_EMBEDDING_MODEL` | BGE-Small-ZH-v1.5 | 本地嵌入模型 |
+| `GM_PORT` | 9121 | 服务端口 |
+| `HERMES_HOME` | %LOCALAPPDATA%\hermes | Hermes 记忆根 |
+| `CLAUDE_HOME` | ~/.claude | Claude Code 根 |
+| `CODEX_HOME` | ~/.codex | Codex 根 |
 
 ## License
 
