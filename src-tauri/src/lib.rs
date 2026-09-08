@@ -535,13 +535,51 @@ pub fn run() {
                 });
             }
 
-            // ── 后台维护线程:每 60 分钟跑零 token 的维护(遗忘 + 去重扫描) ──
-            // 不跑 LLM 提炼(只在手动点按钮或导入后跑一次,避免重复花 token)
+            // ── 后台维护线程:启动后自动提炼一轮(只提炼未标记的),之后每 60 分钟跑零 token 维护 ──
             {
                 let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
                     // 等 30s 让模型加载 + 首次 enrich 完成
                     std::thread::sleep(std::time::Duration::from_secs(30));
+
+                    // 首次:自动提炼未提炼过的节点(只跑一次,花 token 但标记后不重复)
+                    log::info!("[maintenance] auto-refine: checking for unrefined nodes...");
+                    let state = app_handle.state::<AppState>();
+                    let engine = state.engine.lock().unwrap();
+                    let nodes = engine.all_nodes_raw();
+                    let to_refine: Vec<_> = nodes.iter()
+                        .filter(|(id, title, content, _)| {
+                            (title.len() >= 30 || content.len() >= 200) && !engine.is_refined(id)
+                        })
+                        .collect();
+                    drop(engine);
+
+                    if !to_refine.is_empty() && crate::llm_extract::load_config().is_some() {
+                        log::info!("[maintenance] auto-refine: {} unrefined nodes, starting...", to_refine.len());
+                        let state = app_handle.state::<AppState>();
+                        let mut engine = state.engine.lock().unwrap();
+                        let cfg = crate::llm_extract::load_config().unwrap();
+                        let mut refined = 0;
+                        let mut errors = 0;
+                        for (id, title, content, source) in &to_refine {
+                            match crate::llm_extract::refine_node(content, source, &cfg) {
+                                Ok((new_title, new_content)) => {
+                                    if engine.update_node_text(id, &new_title, &new_content).is_ok() {
+                                        engine.mark_refined(id);
+                                        refined += 1;
+                                    } else { errors += 1; }
+                                }
+                                Err(e) => { log::warn!("[maintenance] refine failed for {}: {}", id, e); errors += 1; }
+                            }
+                        }
+                        log::info!("[maintenance] auto-refine done: {} refined, {} errors", refined, errors);
+                    } else if to_refine.is_empty() {
+                        log::info!("[maintenance] auto-refine: all nodes already refined, skipping");
+                    } else {
+                        log::info!("[maintenance] auto-refine: LLM not configured, skipping");
+                    }
+
+                    // 之后:每 60 分钟跑零 token 维护(遗忘 + 去重扫描)
                     loop {
                         log::info!("[maintenance] starting periodic cleanup...");
                         let state = app_handle.state::<AppState>();
