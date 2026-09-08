@@ -427,7 +427,7 @@
         <div class="es-title">选择一个节点查看详情</div>
         <div class="es-hint">从左侧检索或浏览最近节点,点击即可在此查看完整内容与关联关系。</div>
       </div>
-      <div id="node-detail" style="display:none;">
+      <div id="node-detail" style="display:none; padding-bottom:60px;">
         <div class="nd-header">
           <span class="nd-type-dot" id="nd-dot"></span>
           <span class="nd-type" id="nd-type"></span>
@@ -650,9 +650,18 @@ function updateStats(stats) {
 
 // ── 节点详情(右栏) ───────────────────────────────────────
 function showNodeDetail(node) {
-  const data = node.data ? node.data : node;  // 兼容 cy 节点 / 检索结果对象
+  // 兼容 cy 节点(data 是函数) / 检索结果对象(data 是属性) / plain object
+  let data;
+  if (typeof node.data === 'function') {
+    data = node.data();  // cy 节点:调用 data() 获取数据对象
+  } else if (node.data) {
+    data = node.data;     // 嵌套 data 属性
+  } else {
+    data = node;           // plain object
+  }
   document.getElementById('empty-state').style.display = 'none';
   document.getElementById('node-detail').style.display = 'block';
+  document.getElementById('edit-form').style.display = 'none';
   const typeColor = getColor(data.node_type);
   document.getElementById('nd-dot').style.background = typeColor;
   document.getElementById('nd-type').textContent = `${getTypeLabel(data.node_type)} · ${data.node_type || 'knowledge'}`;
@@ -661,8 +670,10 @@ function showNodeDetail(node) {
   document.getElementById('nd-source').textContent = data.source || 'manual';
   document.getElementById('nd-title').textContent = data.title || '(无标题)';
   document.getElementById('nd-content').textContent = data.content || '';
-  // 关联关系:仅 cy 节点有 connectedEdges
+
+  // 关联关系:cy 节点有 connectedEdges;搜索结果无,用 HTTP 查
   const relBox = document.getElementById('nd-relations');
+  const nodeId = data.id;
   if (node.connectedEdges) {
     const connectedEdges = node.connectedEdges();
     if (connectedEdges.length === 0) {
@@ -670,11 +681,12 @@ function showNodeDetail(node) {
     } else {
       const rows = connectedEdges.map(edge => {
         const ed = edge.data();
-        const isSource = ed.source === data.id;
+        const isSource = ed.source === nodeId;
         const otherId = isSource ? ed.target : ed.source;
         const other = cy.getElementById(otherId);
-        const otherTitle = (other && other.length > 0) ? (other.data('title') || other.data('content')?.slice(0,28) || otherId) : otherId;
-        const otherType = other && other.length > 0 ? other.data('node_type') : '';
+        const otherData = (other && other.length > 0) ? other.data() : null;
+        const otherTitle = otherData ? (otherData.title || otherData.content?.slice(0,28) || otherId) : otherId;
+        const otherType = otherData ? otherData.node_type : '';
         const relName = ed.relation || '关联';
         const arrow = isSource ? '→' : '←';
         return `<div class="rel-item" data-id="${otherId}"><span class="rel-label">${relName}</span><span class="rel-arrow">${arrow}</span><span class="tdot" style="width:8px;height:8px;border-radius:50%;background:${getColor(otherType)};flex-shrink:0;"></span><span class="rel-name">${otherTitle}</span></div>`;
@@ -683,7 +695,20 @@ function showNodeDetail(node) {
       relBox.querySelectorAll('.rel-item').forEach(el => { el.onclick = () => focusNode(el.dataset.id); });
     }
   } else {
-    relBox.innerHTML = '<div class="rel-empty">切换到图谱查看关联</div>';
+    // 非 cy 节点(搜索结果):异步查邻居
+    relBox.innerHTML = '<div class="rel-empty">加载关联中...</div>';
+    fetch(`${API}/api/neighbors/${nodeId}?depth=1`).then(r => r.json()).then(d => {
+      const neighbors = d.neighbors || [];
+      if (neighbors.length === 0) {
+        relBox.innerHTML = '<div class="rel-empty">暂无关联</div>';
+      } else {
+        const rows = neighbors.map(n => {
+          return `<div class="rel-item" data-id="${n.id}"><span class="tdot" style="width:8px;height:8px;border-radius:50%;background:${getColor(n.node_type)};flex-shrink:0;"></span><span class="rel-name">${n.title || n.content?.slice(0,28) || n.id}</span></div>`;
+        }).join('');
+        relBox.innerHTML = rows;
+        relBox.querySelectorAll('.rel-item').forEach(el => { el.onclick = () => focusNode(el.dataset.id); });
+      }
+    }).catch(() => { relBox.innerHTML = '<div class="rel-empty">加载失败</div>'; });
   }
 }
 
@@ -823,13 +848,21 @@ function focusNode(id) {
       return;
     }
   }
-  // fallback:从结果列表里找匹配 id 的对象(搜索结果是 plain object,不是 cy 节点)
-  if (selectedNode && (selectedNode.id === id || (selectedNode.id && selectedNode.id() === id))) {
-    showNodeDetail(selectedNode);
-  } else {
-    showNodeDetail({ data: { id, title: id, content: '', node_type: 'knowledge', source: '' } });
-  }
-  switchView('detail');
+  // fallback:cy 未初始化或节点不在图里 → HTTP 取节点详情
+  fetch(`${API}/api/search?q=${encodeURIComponent(id.slice(0,20))}&top_k=1`).then(r => r.json()).then(results => {
+    const found = results.find(n => n.id === id) || results[0];
+    if (found) {
+      selectedNode = found;
+      showNodeDetail(found);
+      switchView('detail');
+    } else {
+      showNodeDetail({ id, title: id, content: '', node_type: 'knowledge', source: '' });
+      switchView('detail');
+    }
+  }).catch(() => {
+    showNodeDetail({ id, title: id, content: '', node_type: 'knowledge', source: '' });
+    switchView('detail');
+  });
 }
 
 // ── 节点操作 ─────────────────────────────────────────────
