@@ -738,9 +738,34 @@ function buildFilterBar() {
   clearBtn.className = 'filter-clear'; clearBtn.textContent = '清除筛选'; clearBtn.onclick = clearFilters;
   srcContainer.appendChild(clearBtn);
 }
-function toggleType(t) { if (activeTypes.has(t)) activeTypes.delete(t); else activeTypes.add(t); updateFilterUI(); applyFilter(); }
-function toggleSource(s) { if (activeSources.has(s)) activeSources.delete(s); else activeSources.add(s); updateFilterUI(); applyFilter(); }
-function clearFilters() { activeTypes.clear(); activeSources.clear(); updateFilterUI(); applyFilter(); }
+function toggleType(t) { if (activeTypes.has(t)) activeTypes.delete(t); else activeTypes.add(t); updateFilterUI(); applyFilter(); reloadResults(); }
+function toggleSource(s) { if (activeSources.has(s)) activeSources.delete(s); else activeSources.add(s); updateFilterUI(); applyFilter(); reloadResults(); }
+function clearFilters() { activeTypes.clear(); activeSources.clear(); updateFilterUI(); applyFilter(); reloadResults(); }
+
+// 筛选器变化后重新加载结果列表
+// 有筛选器时:拉全图 /api/graph 过滤(否则 loadRecent 只看 20 条,16 条 skill 只显示 3 条)
+// 无筛选器时:回退 loadRecent(20 条最近)
+async function reloadResults() {
+  const q = document.getElementById('search-input').value.trim();
+  if (q) { search(); return; }  // 有搜索词时走 search
+  if (activeTypes.size > 0 || activeSources.size > 0) {
+    // 有筛选器:拉全图节点过滤
+    const data = await apiGraph();
+    let nodes = data.nodes.map(n => ({
+      id: n.id, title: n.data?.title || n.id, content: n.data?.content || '',
+      node_type: n.data?.node_type || 'knowledge', source: n.data?.source || '',
+      score: 0, match_type: 'filter'
+    }));
+    nodes = nodes.filter(r => {
+      const typeOk = activeTypes.size === 0 || activeTypes.has(r.node_type);
+      const srcOk = activeSources.size === 0 || activeSources.has(r.source);
+      return typeOk && srcOk;
+    });
+    loadSearchResults(nodes);
+  } else {
+    loadRecent();
+  }
+}
 function updateFilterUI() {
   document.querySelectorAll('#filter-types .filter-chip').forEach(chip => {
     const type = chip.dataset.type; const active = activeTypes.size === 0 || activeTypes.has(type);
