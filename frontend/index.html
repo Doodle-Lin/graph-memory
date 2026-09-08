@@ -830,9 +830,15 @@ function loadSearchResults(results) {
     const div = document.createElement('div');
     div.className = 'result-item';
     div.onclick = () => { selectedNode = r; showNodeDetail(r); switchView('detail'); };
-    const scoreStr = r.match_type === 'graph_spread' ? `扩散 ${r.pagerank_score?.toFixed(3)}` : r.match_type === 'recent' ? '最近' : `语义 ${r.semantic_score?.toFixed(3)}`;
+    const scoreStr = r.match_type === 'graph_spread' ? `扩散 ${r.pagerank_score?.toFixed(3)}` : r.match_type === 'recent' ? '最近' : r.match_type === 'filter' ? '筛选' : `语义 ${r.semantic_score?.toFixed(3)}`;
     const dotColor = getColor(r.node_type);
-    div.innerHTML = `<div class="title"><span class="t-left"><span class="tdot" style="background:${dotColor}"></span><span class="tname">${r.title}</span></span><span class="score">${scoreStr}</span></div><div class="content" onclick="this.classList.toggle('expanded')">${r.content || ''}</div><div class="tags"><span class="tag">${r.source}</span><span class="tag">${r.node_type}</span><span class="tag ${r.match_type==='graph_spread'?'match-graph':'match-semantic'}">${r.match_type}</span></div>`;
+    // XSS 防护:转义用户可控的 title/content/source
+    const safeTitle = String(r.title||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeContent = String(r.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeSource = String(r.source||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeType = String(r.node_type||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const safeMatch = String(r.match_type||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    div.innerHTML = `<div class="title"><span class="t-left"><span class="tdot" style="background:${dotColor}"></span><span class="tname">${safeTitle}</span></span><span class="score">${scoreStr}</span></div><div class="content" onclick="this.classList.toggle('expanded')">${safeContent}</div><div class="tags"><span class="tag">${safeSource}</span><span class="tag">${safeType}</span><span class="tag ${r.match_type==='graph_spread'?'match-graph':'match-semantic'}">${safeMatch}</span></div>`;
     container.appendChild(div);
   }
 }

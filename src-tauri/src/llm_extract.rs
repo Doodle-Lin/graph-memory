@@ -131,7 +131,14 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
         "temperature": 0.3
     });
 
-    let url = if cfg.base_url.ends_with('/') {
+    let url = if cfg.base_url.ends_with("/v1") || cfg.base_url.ends_with("/v1/") {
+        // 已含 /v1,不重复加
+        if cfg.base_url.ends_with('/') {
+            format!("{}chat/completions", cfg.base_url)
+        } else {
+            format!("{}/chat/completions", cfg.base_url)
+        }
+    } else if cfg.base_url.ends_with('/') {
         format!("{}v1/chat/completions", cfg.base_url)
     } else {
         format!("{}/v1/chat/completions", cfg.base_url)

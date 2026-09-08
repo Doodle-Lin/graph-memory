@@ -556,18 +556,21 @@ pub fn run() {
 
                     if !to_refine.is_empty() && crate::llm_extract::load_config().is_some() {
                         log::info!("[maintenance] auto-refine: {} unrefined nodes, starting...", to_refine.len());
-                        let state = app_handle.state::<AppState>();
-                        let mut engine = state.engine.lock().unwrap();
                         let cfg = crate::llm_extract::load_config().unwrap();
                         let mut refined = 0;
                         let mut errors = 0;
+                        // P0 修复:LLM 调用不加锁,只在写回时短暂加锁
                         for (id, title, content, source) in &to_refine {
                             match crate::llm_extract::refine_node(content, source, &cfg) {
                                 Ok((new_title, new_content)) => {
+                                    // 短暂加锁写回
+                                    let state = app_handle.state::<AppState>();
+                                    let mut engine = state.engine.lock().unwrap();
                                     if engine.update_node_text(id, &new_title, &new_content).is_ok() {
                                         engine.mark_refined(id);
                                         refined += 1;
                                     } else { errors += 1; }
+                                    drop(engine);
                                 }
                                 Err(e) => { log::warn!("[maintenance] refine failed for {}: {}", id, e); errors += 1; }
                             }

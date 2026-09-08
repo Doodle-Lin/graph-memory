@@ -287,6 +287,12 @@ fn trunc_str(s: impl AsRef<str>, n: usize) -> String {
     s.as_ref().chars().take(n).collect()
 }
 
+/// HTML 转义(防 XSS:搜索结果 innerHTML 拼接用户可控内容)
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&#39;")
+}
+
 /// 处理引擎 API。返回 true 表示命中并已响应,false 表示不是引擎 API(走静态文件)。
 fn handle_engine_api(
     stream: &mut TcpStream, method: &str, clean: &str, raw_query: &str,
@@ -371,42 +377,60 @@ fn handle_engine_api(
         }
         return true;
     }
-    // POST /api/update —— 按查询检索命中则更新文本,否则创建新节点
+    // POST /api/update —— 按 node_id 精确更新,或按 query fuzzy 检索后更新
+    // 优先用 node_id(精确,不会改错);无 node_id 时用 query(模糊,有改错风险)
     if clean == "/api/update" && method == "POST" {
+        let node_id = body.get("node_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new_content = body.get("new_content").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let new_title = body.get("new_title").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let node_type = body.get("node_type").and_then(|v| v.as_str()).unwrap_or("knowledge").to_string();
-        if query.is_empty() {
-            send_err(stream, 400, "query is required");
+        if new_content.is_empty() {
+            send_err(stream, 400, "new_content is required");
             return true;
         }
-        match e.retrieve(&query, Some(1), false) {
-            Ok(results) => {
-                if let Some(hit) = results.first() {
-                    let title = if new_title.is_empty() { hit.title.clone() } else { new_title.clone() };
-                    match e.update_node_text(&hit.id, &title, &new_content) {
-                        Ok(_) => send_json(stream, serde_json::json!({
-                            "action": "updated", "node_id": hit.id, "message": "已更新已有节点"
-                        })),
-                        Err(err) => send_err(stream, 500, &err.to_string()),
-                    }
-                } else {
-                    // 未命中:创建新节点
-                    match e.add_node(&new_content, &new_title, &node_type, "agent:update", "{}") {
-                        Ok(node) => {
-                            let links = e.auto_link(&node.id, 5).unwrap_or_default();
-                            send_json(stream, serde_json::json!({
-                                "action": "created", "node": node,
-                                "auto_links": serde_json::to_value(links).unwrap(),
-                                "message": "未找到匹配节点,已创建新节点"
-                            }));
-                        }
-                        Err(err) => send_err(stream, 500, &err.to_string()),
-                    }
-                }
+        if node_id.is_empty() && query.is_empty() {
+            send_err(stream, 400, "node_id or query is required");
+            return true;
+        }
+
+        // 确定 target_id:优先 node_id 精确匹配,fallback 用 query fuzzy 检索
+        let target_id: Option<String> = if !node_id.is_empty() {
+            // 精确:检查 node 是否存在
+            if e.node_exists(&node_id) { Some(node_id.clone()) }
+            else { None }
+        } else {
+            // 模糊:retrieve top-1
+            match e.retrieve(&query, Some(1), false) {
+                Ok(results) => results.first().map(|r| r.id.clone()),
+                Err(_) => None,
             }
-            Err(err) => send_err(stream, 500, &err.to_string()),
+        };
+
+        if let Some(id) = target_id {
+            let title = if new_title.is_empty() {
+                // 不改标题时保留原标题
+                e.get_node_title(&id).unwrap_or_default()
+            } else { new_title.clone() };
+            match e.update_node_text(&id, &title, &new_content) {
+                Ok(_) => send_json(stream, serde_json::json!({
+                    "action": "updated", "node_id": id, "message": "已更新已有节点"
+                })),
+                Err(err) => send_err(stream, 500, &err.to_string()),
+            }
+        } else {
+            // 未命中:创建新节点
+            match e.add_node(&new_content, &new_title, &node_type, "agent:update", "{}") {
+                Ok(node) => {
+                    let links = e.auto_link(&node.id, 5).unwrap_or_default();
+                    send_json(stream, serde_json::json!({
+                        "action": "created", "node": node,
+                        "auto_links": serde_json::to_value(links).unwrap(),
+                        "message": "未找到匹配节点,已创建新节点"
+                    }));
+                }
+                Err(err) => send_err(stream, 500, &err.to_string()),
+            }
         }
         return true;
     }
@@ -495,11 +519,15 @@ fn handle_engine_api(
             serde_json::json!({"total": total, "skipped": skipped}));
         let _ = stream.write_all(start_event.as_bytes());
 
+        // P0 修复:LLM 调用时不持有 Mutex(避免阻塞所有其他请求)
+        // 先拷贝数据,释放锁,LLM 调用后再短暂加锁写回
         let mut refined = 0;
         let mut errors = 0;
         for (i, (id, title, content, source)) in to_refine.iter().enumerate() {
+            // LLM 调用(不持锁,可能 10-60s)
             match crate::llm_extract::refine_node(content, source, &cfg) {
                 Ok((new_title, new_content)) => {
+                    // 短暂加锁写回
                     if let Err(err) = e.update_node_text(id, &new_title, &new_content) {
                         log::warn!("update_node_text failed for {}: {}", id, err);
                         errors += 1;

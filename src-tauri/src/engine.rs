@@ -1107,8 +1107,19 @@ impl GraphEngine {
         }
     }
 
+    /// 检查节点是否存在
+    pub fn node_exists(&self, id: &str) -> bool {
+        self.node_map.contains_key(id)
+    }
+
+    /// 获取节点标题
+    pub fn get_node_title(&self, id: &str) -> Option<String> {
+        self.node_map.get(id).map(|&idx| self.graph[idx].title.clone())
+    }
+
     /// 更新节点的标题和内容(保留 id, type, source, metadata)
     /// C2 修复:存历史到 node_history 表,可追溯/恢复
+    /// P1 修复:同步更新 embedding(内容变后旧 embedding 不再匹配)
     pub fn update_node_text(&mut self, id: &str, new_title: &str, new_content: &str) -> Result<()> {
         let idx = *self
             .node_map
@@ -1133,6 +1144,16 @@ impl GraphEngine {
             params![new_title, new_content, &now, &chash, id],
         )?;
         self.fts_upsert(id, new_title, new_content);
+
+        // P1 修复:重新计算 embedding(内容变了,旧 embedding 不再代表语义)
+        // 只在 embedder 就绪时更新,否则跳过(enrich_all 后续会补)
+        if self.embedder_ready() {
+            if let Ok(new_emb) = self.embed(new_content) {
+                self.persist_embedding(id, &new_emb);
+                self.embeddings.insert(id.to_string(), new_emb);
+            }
+        }
+
         Ok(())
     }
 
