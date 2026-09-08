@@ -11,6 +11,28 @@ use crate::engine::GraphEngine;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// F1: 解析节点 id——先查本批次 title_to_id(精确),miss 则全图 embedding 搜
+fn resolve_node_id(engine: &GraphEngine, title: &str, batch_map: &std::collections::HashMap<String, String>) -> Option<String> {
+    // 1. 本批次精确匹配
+    if let Some(id) = batch_map.get(title) {
+        return Some(id.clone());
+    }
+    // 2. 全图 embedding 搜(top-1, cosine >= 0.6)
+    if !engine.embedder_ready() { return None; }
+    let title_emb = engine.embed_for_external(title).ok()?;
+    if title_emb.is_empty() { return None; }
+    let best = engine.find_nearest_embedding(&title_emb, 0.6)?;
+    Some(best.0)
+}
+
+/// 余弦相似度(供 F2 批次内去重用)
+fn cosine_sim_static(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0. || norm_b == 0. { 0. } else { dot / (norm_a * norm_b) }
+}
+
 /// 安全截断字符串(按字符,不按字节),避免中文字节切片 panic。
 /// 接受 &str 或 String(impl AsRef<str>)。
 fn trunc(s: impl AsRef<str>, n: usize) -> String {
@@ -275,12 +297,36 @@ pub fn extract_and_import(engine: &mut GraphEngine, text: &str, source: &str, ma
     let mut nodes_created = 0;
     let mut edges_created = 0;
 
+    // F2:批次内去重(cosine >= 0.9 → 只保留第一个,避免 LLM 重复提取)
+    let mut batch_embeddings: Vec<(String, Vec<f32>)> = Vec::new();
+
     if let Some(nodes) = extracted["nodes"].as_array() {
         for n in nodes {
             let title = n.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let content = n.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let ntype = n.get("type").and_then(|v| v.as_str()).unwrap_or("knowledge");
             if content.len() < 10 { continue; }
+
+            // F2:批次内去重(如果有 embedding)
+            if engine.embedder_ready() {
+                let new_emb = match engine.embed_for_external(&content) {
+                    Ok(e) => e,
+                    Err(_) => Vec::new(),
+                };
+                if !new_emb.is_empty() {
+                    let mut is_dup = false;
+                    for (_, existing_emb) in &batch_embeddings {
+                        let sim = cosine_sim_static(&new_emb, existing_emb);
+                        if sim >= 0.9 { is_dup = true; break; }
+                    }
+                    if is_dup {
+                        log::info!("extract: batch-dedup skipped '{}'", trunc(&title, 30));
+                        continue;
+                    }
+                    batch_embeddings.push((title.clone(), new_emb));
+                }
+            }
+
             let src = format!("llm_extract:{}", source);
             match engine.add_node(&content, &title, ntype, &src, "{}") {
                 Ok(node) => {
@@ -294,16 +340,23 @@ pub fn extract_and_import(engine: &mut GraphEngine, text: &str, source: &str, ma
         }
     }
 
-    // 写入 LLM 标注的关系边
+    // F1:LLM 标注的边——跨批次解析(全图 embedding 搜,不只看本批次)
     if let Some(edges) = extracted["edges"].as_array() {
         for e in edges {
             let src_title = e.get("source_title").and_then(|v| v.as_str()).unwrap_or("");
             let tgt_title = e.get("target_title").and_then(|v| v.as_str()).unwrap_or("");
             let relation = e.get("relation").and_then(|v| v.as_str()).unwrap_or("related_to");
-            if let (Some(src_id), Some(tgt_id)) = (title_to_id.get(src_title), title_to_id.get(tgt_title)) {
-                if let Ok(_) = engine.add_edge(src_id, tgt_id, relation, 0.8, "{}") {
-                    edges_created += 1;
+            // F1:先查本批次 title_to_id(精确匹配),miss 则全图 embedding 搜
+            let src_id = resolve_node_id(engine, src_title, &title_to_id);
+            let tgt_id = resolve_node_id(engine, tgt_title, &title_to_id);
+            if let (Some(src_id), Some(tgt_id)) = (src_id, tgt_id) {
+                if src_id != tgt_id {  // 不自环
+                    if let Ok(_) = engine.add_edge(&src_id, &tgt_id, relation, 0.8, "{}") {
+                        edges_created += 1;
+                    }
                 }
+            } else {
+                log::info!("extract: edge unresolved '{}→{}'", trunc(src_title, 20), trunc(tgt_title, 20));
             }
         }
     }

@@ -329,6 +329,27 @@ impl GraphEngine {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// E1: 从 query 提取实体(ASCII 标识符:型号/版本号/端口号/IP)
+    /// 用于多实体分路检索。CJK 内容不做实体抽取(太复杂,交给 BM25 trigram)
+    fn extract_entities(query: &str) -> Vec<String> {
+        let mut entities = Vec::new();
+        let mut buf = String::new();
+        for ch in query.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                buf.push(ch);
+            } else {
+                if buf.len() >= 3 && !entities.contains(&buf) {
+                    entities.push(buf.clone());
+                }
+                buf.clear();
+            }
+        }
+        if buf.len() >= 3 && !entities.contains(&buf) {
+            entities.push(buf);
+        }
+        entities
+    }
+
     /// 把 query 拆成 FTS5 搜索 term:ASCII 字母数字串(如"8397")+ CJK 3-gram(如"板子怎")
     /// 用 OR 连接给 FTS5,避免 AND 语义导致对话词("怎么连")不在文档里就全空
     fn split_query_terms(query: &str) -> Vec<String> {
@@ -399,14 +420,30 @@ impl GraphEngine {
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        // 模型加载由启动时的后台线程负责(lib.rs setup)。
-        // 不在 embed() 里懒加载——避免在 Mutex 锁内触发数分钟的模型下载/加载。
-        // embedder 未就绪时直接报错,调用方应先用 embedder_ready() 守卫。
-        // RefCell::borrow_mut → RefMut<Option<TextEmbedding>> → as_mut() 拿 &mut TextEmbedding
         let mut guard = self.embedder.borrow_mut();
         let embedder = guard.as_mut().context("Embedding model not loaded yet")?;
         let embeddings = embedder.embed(vec![text.to_string()], None)?;
         Ok(embeddings.into_iter().next().unwrap_or_default())
+    }
+
+    /// 公开 embed(供 llm_extract.rs 跨批次边解析用,不修改图)
+    pub fn embed_for_external(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text)
+    }
+
+    /// 找全图最接近 query_emb 的节点(cosine >= min_sim)
+    /// 供 llm_extract.rs F1 跨批次边解析用
+    pub fn find_nearest_embedding(&self, query_emb: &[f32], min_sim: f32) -> Option<(String, f32)> {
+        let mut best: Option<(String, f32)> = None;
+        for (id, emb) in &self.embeddings {
+            let sim = Self::cosine_sim(query_emb, emb);
+            if sim >= min_sim {
+                if best.is_none() || sim > best.as_ref().unwrap().1 {
+                    best = Some((id.clone(), sim));
+                }
+            }
+        }
+        best
     }
 
     fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -626,8 +663,25 @@ impl GraphEngine {
         // Embedding:概念匹配,同义词/意图
         // RRF:按排名融合,不依赖分数尺度,工业标准
 
-        // 1. BM25 关键词搜索
-        let bm25_results = self.bm25_search(query, top_k * 4);
+        // E1: 实体抽取 + 分路检索
+        // 从 query 提取 ASCII 标识符(型号/端口/路径),对每个实体单独 BM25 查,
+        // 合并种子集。多实体查询("8397板子和A800的区别")能覆盖两个实体邻域。
+        let entities = Self::extract_entities(query);
+        let mut bm25_results = self.bm25_search(query, top_k * 4);
+        // 每个实体单独 BM25(补充主查询可能漏掉的实体精确匹配)
+        for ent in &entities {
+            if ent.len() >= 3 {  // 太短的实体不单独查(如"A8")
+                let ent_results = self.bm25_search(ent, top_k * 2);
+                bm25_results.extend(ent_results);
+            }
+        }
+        // 去重(同 id 取更高分)
+        let mut seen_bm: HashMap<String, f32> = HashMap::new();
+        for (id, score) in &bm25_results {
+            seen_bm.entry(id.clone()).and_modify(|s| *s = s.max(*score)).or_insert(*score);
+        }
+        let mut bm25_results: Vec<(String, f32)> = seen_bm.into_iter().collect();
+        bm25_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
         // 模型没就绪:只用 BM25(不需要 embedding)
         if !self.embedder_ready() || self.embeddings.is_empty() {
