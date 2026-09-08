@@ -136,6 +136,27 @@ fn tools_list() -> serde_json::Value {
                 "limit": {"type": "integer", "description": "返回条数(默认20)", "default": 20}
             }
         }
+    }, {
+        "name": "consolidate",
+        "description": "合并两个重复/近似节点。把 merge_id 节点合并到 keep_id(保留更丰富的),边迁移,内容存历史。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keep_id": {"type": "string", "description": "保留的节点 id(更丰富)"},
+                "merge_id": {"type": "string", "description": "被合并删除的节点 id"}
+            },
+            "required": ["keep_id", "merge_id"]
+        }
+    }, {
+        "name": "forget",
+        "description": "遗忘陈旧节点:删除超过 N 天未访问且访问次数低于阈值的节点(保留有边的桥节点)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_age_days": {"type": "integer", "description": "最大未访问天数(默认180)", "default": 180},
+                "min_access_count": {"type": "integer", "description": "访问次数低于此值的删除(默认2)", "default": 2}
+            }
+        }
     }])
 }
 
@@ -216,6 +237,28 @@ fn handle_tool_call(name: &str, args: &serde_json::Value) -> Result<Vec<serde_js
                 lines.push(String::new());
             }
             Ok(text_content(lines.join("\n")))
+        }
+        "consolidate" => {
+            let keep_id = args.get("keep_id").and_then(|v| v.as_str()).unwrap_or("");
+            let merge_id = args.get("merge_id").and_then(|v| v.as_str()).unwrap_or("");
+            if keep_id.is_empty() || merge_id.is_empty() {
+                return Err("keep_id 和 merge_id 不能为空".into());
+            }
+            let result = http_post_json("/api/consolidate", &serde_json::json!({
+                "keep_id": keep_id, "merge_id": merge_id
+            }))?;
+            let title = result["title"].as_str().unwrap_or("?");
+            Ok(text_content(format!("已合并: {} 的边迁移到 {},后者已删除。\n保留节点: {}", merge_id, keep_id, title)))
+        }
+        "forget" => {
+            let max_age = args.get("max_age_days").and_then(|v| v.as_u64()).unwrap_or(180);
+            let min_ac = args.get("min_access_count").and_then(|v| v.as_u64()).unwrap_or(2);
+            let result = http_post_json("/api/forget", &serde_json::json!({
+                "max_age_days": max_age, "min_access_count": min_ac
+            }))?;
+            let deleted = result["deleted"].as_u64().unwrap_or(0);
+            let kept = result["kept"].as_u64().unwrap_or(0);
+            Ok(text_content(format!("遗忘完成: 删除 {} 个陈旧节点,保留 {} 个", deleted, kept)))
         }
         other => Err(format!("未知工具: {}", other)),
     }

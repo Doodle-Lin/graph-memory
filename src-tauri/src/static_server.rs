@@ -531,6 +531,35 @@ fn handle_engine_api(
         return true;
     }
 
+    // POST /api/consolidate —— 合并两个节点(I1:维护工具)
+    if clean == "/api/consolidate" && method == "POST" {
+        let keep_id = body.get("keep_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let merge_id = body.get("merge_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if keep_id.is_empty() || merge_id.is_empty() {
+            send_err(stream, 400, "keep_id and merge_id are required");
+            return true;
+        }
+        match e.consolidate(&keep_id, &merge_id) {
+            Ok(node) => send_json(stream, serde_json::json!({
+                "ok": true, "node": node,
+                "message": format!("已合并 {} 到 {}", merge_id, keep_id),
+            })),
+            Err(err) => send_err(stream, 500, &err.to_string()),
+        }
+        return true;
+    }
+    // POST /api/forget —— 遗忘陈旧节点(I1:维护工具)
+    if clean == "/api/forget" && method == "POST" {
+        let max_age = body.get("max_age_days").and_then(|v| v.as_u64()).unwrap_or(180) as i64;
+        let min_ac = body.get("min_access_count").and_then(|v| v.as_u64()).unwrap_or(2) as i64;
+        let (deleted, kept) = e.forget_stale(max_age, min_ac);
+        send_json(stream, serde_json::json!({
+            "deleted": deleted, "kept": kept,
+            "message": format!("删除 {} 个陈旧节点,保留 {} 个", deleted, kept),
+        }));
+        return true;
+    }
+
     // POST /api/extract —— 用 LLM 从一段文本提炼知识并导入图
     if clean == "/api/extract" && method == "POST" {
         let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();

@@ -89,8 +89,24 @@ impl GraphEngine {
             );
             CREATE INDEX IF NOT EXISTS idx_node_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_node_source ON nodes(source);
-            CREATE INDEX IF NOT EXISTS idx_node_created ON nodes(created_at);",
+            CREATE INDEX IF NOT EXISTS idx_node_created ON nodes(created_at);
+            CREATE TABLE IF NOT EXISTS embeddings (
+                node_id TEXT PRIMARY KEY, model TEXT NOT NULL, vector BLOB NOT NULL,
+                FOREIGN KEY(node_id) REFERENCES nodes(id)
+            );",
         )?;
+
+        // 迁移:nodes 加 access_count / last_accessed 列(阶段3 C1)
+        for (col, default) in [("access_count", "0"), ("last_accessed", "")] {
+            let has: bool = db.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name='{}'", col),
+                [], |r| r.get::<_, i64>(0)
+            ).unwrap_or(0) > 0;
+            if !has {
+                log::info!("Migrating: adding {} column to nodes", col);
+                let _ = db.execute(&format!("ALTER TABLE nodes ADD COLUMN {} TEXT DEFAULT '{}'", col, default), []);
+            }
+        }
 
         // 迁移:旧表无 content_hash 列时添加(ALTER TABLE 不能用 IF NOT EXISTS)
         let has_content_hash: bool = db.query_row(
@@ -183,6 +199,26 @@ impl GraphEngine {
         }
         log::info!("Loaded {} nodes, {} edges", self.graph.node_count(), self.graph.edge_count());
 
+        // G1: 从 SQLite 加载持久化的 embeddings(避免每次重启重新算)
+        let emb_count_before = self.embeddings.len();
+        if let Ok(mut stmt) = self.db.prepare("SELECT node_id, vector FROM embeddings") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id, blob))
+            }) {
+                for row in rows.filter_map(|r| r.ok()) {
+                    if let Some(emb) = Self::blob_to_vec(&row.1) {
+                        self.embeddings.insert(row.0, emb);
+                    }
+                }
+            }
+        }
+        let emb_loaded = self.embeddings.len() - emb_count_before;
+        if emb_loaded > 0 {
+            log::info!("Loaded {} embeddings from SQLite (persisted)", emb_loaded);
+        }
+
         // FTS5 表如果为空但 nodes 有数据(首次建表/迁移),从 nodes 填充
         let fts_count: i64 = self.db.query_row("SELECT COUNT(*) FROM nodes_fts", [], |r| r.get(0)).unwrap_or(0);
         let node_count: i64 = self.db.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap_or(0);
@@ -196,11 +232,44 @@ impl GraphEngine {
         Ok(())
     }
 
-    /// content 的 hash(用于精确去重,与 node id 解耦)
     fn content_hash(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         hex::encode(hasher.finalize())[..16].to_string()
+    }
+
+    /// embedding Vec<f32> → BLOB(小端序)
+    fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(v.len() * 4);
+        for &f in v {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf
+    }
+
+    /// BLOB → embedding Vec<f32>
+    fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
+        if blob.len() % 4 != 0 || blob.is_empty() { return None; }
+        let mut v = Vec::with_capacity(blob.len() / 4);
+        for chunk in blob.chunks_exact(4) {
+            let bytes: [u8; 4] = chunk.try_into().ok()?;
+            v.push(f32::from_le_bytes(bytes));
+        }
+        Some(v)
+    }
+
+    /// 当前 embedding 模型名(用于持久化/迁移检测)
+    fn model_name() -> &'static str {
+        "bge-small-zh-v1.5"
+    }
+
+    /// 持久化单个 embedding 到 SQLite
+    fn persist_embedding(&self, id: &str, vec: &[f32]) {
+        let blob = Self::vec_to_blob(vec);
+        let _ = self.db.execute(
+            "INSERT OR REPLACE INTO embeddings (node_id, model, vector) VALUES (?,?,?)",
+            params![id, Self::model_name(), blob],
+        );
     }
 
     /// 生成唯一 node id(UUID v4,不再依赖 content hash)
@@ -315,6 +384,7 @@ impl GraphEngine {
             if let Some(&idx) = self.node_map.get(id) {
                 let content = self.graph[idx].content.clone();
                 let emb = self.embed(&content)?;
+                self.persist_embedding(id, &emb);
                 self.embeddings.insert(id.clone(), emb);
             }
         }
@@ -453,6 +523,7 @@ impl GraphEngine {
 
         let idx = self.graph.add_node(node.clone());
         self.node_map.insert(nid.clone(), idx);
+        self.persist_embedding(&nid, &new_emb);
         self.embeddings.insert(nid, new_emb);
         Ok(node)
     }
@@ -723,8 +794,63 @@ impl GraphEngine {
             })
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        results.truncate(top_k);
-        Ok(results.into_iter().map(|(r, _)| r).collect())
+
+        // C1:时间衰减 + 访问频次加成
+        // 常用的节点(被检索命中过)和近期更新的节点获得加成
+        let now_ts = chrono::Utc::now();
+        for (r, sort_key) in results.iter_mut() {
+            let idx = match self.node_map.get(&r.id) { Some(&i) => i, None => continue };
+            let node = &self.graph[idx];
+            // 访问计数:从 SQLite 读(节点可能被多次检索命中)
+            let access_count: i64 = self.db.query_row(
+                "SELECT COALESCE(CAST(access_count AS INTEGER), 0) FROM nodes WHERE id = ?",
+                params![&r.id], |row| row.get(0)
+            ).unwrap_or(0);
+            let access_boost = (1.0 + access_count as f64).ln() * 0.05;  // log(1+n)*0.05, 最多 ~0.15
+
+            // 时间衰减:90 天半衰期,exp(-Δt/(90*86400))
+            let updated = chrono::DateTime::parse_from_rfc3339(&node.updated_at).ok();
+            let decay = if let Some(t) = updated {
+                let age_days = (now_ts - t.with_timezone(&chrono::Utc)).num_days().max(0) as f64;
+                (-age_days / 90.0).exp()  // 90 天衰减到 ~37%
+            } else { 1.0 };
+
+            *sort_key = *sort_key * (1.0 + access_boost) * (0.5 + 0.5 * decay);  // 衰减最多减半,不完全归零
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // H2:MMR 多样性——去重近似结果,避免 top_k 被同主题碎片占满
+        // 贪心选:每次选分数最高的,但惩罚与已选结果 embedding 太近的(>0.85)
+        let mut selected: Vec<(RetrieveResult, f64)> = Vec::new();
+        let mut remaining = results;
+        while selected.len() < top_k && !remaining.is_empty() {
+            // 选分数最高的
+            remaining.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let (best, best_key) = remaining.remove(0);
+            // 检查与已选的相似度
+            let best_emb = self.embeddings.get(&best.id).cloned().unwrap_or_default();
+            let mut too_similar = false;
+            for s in &selected {
+                if let Some(s_emb) = self.embeddings.get(&s.0.id) {
+                    let sim = Self::cosine_sim(&best_emb, s_emb);
+                    if sim >= 0.85 { too_similar = true; break; }
+                }
+            }
+            if !too_similar {
+                selected.push((best, best_key));
+            }
+            // 如果太相似,跳过(不加入 selected,也不放回 remaining)
+        }
+
+        // C1:更新命中节点的 access_count + last_accessed(异步写回)
+        for (r, _) in &selected {
+            let _ = self.db.execute(
+                "UPDATE nodes SET access_count = COALESCE(CAST(access_count AS INTEGER), 0) + 1, last_accessed = ? WHERE id = ?",
+                params![now_ts.to_rfc3339(), &r.id],
+            );
+        }
+
+        Ok(selected.into_iter().map(|(r, _)| r).collect())
     }
 
     pub fn stats(&self) -> serde_json::Value {
@@ -756,6 +882,119 @@ impl GraphEngine {
                 (n.id.clone(), n.title.clone(), n.content.clone(), n.source.clone())
             })
             .collect()
+    }
+
+    // ── I1: 维护工具(consolidate / forget) ────────────────
+
+    /// 合并两个节点:保留 A(更丰富的),把 B 的边迁移到 A,B 删除。
+    /// B 的 content 追加到 A 的 metadata 里(不丢信息)。
+    /// 返回合并后的节点 A。
+    pub fn consolidate(&mut self, keep_id: &str, merge_id: &str) -> Result<Node> {
+        if keep_id == merge_id {
+            anyhow::bail!("cannot consolidate a node with itself");
+        }
+        let merge_idx = *self.node_map.get(merge_id)
+            .with_context(|| format!("merge node not found: {}", merge_id))?;
+        let keep_idx = *self.node_map.get(keep_id)
+            .with_context(|| format!("keep node not found: {}", keep_id))?;
+
+        // 1. 存历史(B 的内容)
+        let merge_node = self.graph[merge_idx].clone();
+        self.db.execute(
+            "INSERT INTO node_history (node_id, old_title, old_content, changed_at) VALUES (?,?,?,?)",
+            params![merge_id, &merge_node.title, &merge_node.content, Self::now()],
+        )?;
+
+        // 2. 把 B 的所有边迁移到 A(source/target 中 merge_id 替换为 keep_id)
+        let edges_to_migrate: Vec<(String, String, String, f64, String, String)> = {
+            let mut stmt = self.db.prepare(
+                "SELECT source, target, relation, weight, metadata, created_at FROM edges WHERE source = ? OR target = ?"
+            )?;
+            let rows = stmt.query_map(params![merge_id, merge_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                    r.get::<_, f64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (src, tgt, rel, w, meta, cat) in edges_to_migrate {
+            let new_src = if src == merge_id { keep_id.to_string() } else { src };
+            let new_tgt = if tgt == merge_id { keep_id.to_string() } else { tgt };
+            if new_src != new_tgt {  // 不自环
+                self.db.execute(
+                    "INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?)",
+                    params![new_src, new_tgt, rel, w, meta, cat],
+                )?;
+                if let (Some(&s), Some(&t)) = (self.node_map.get(&new_src), self.node_map.get(&new_tgt)) {
+                    self.graph.add_edge(s, t, Edge {
+                        source: new_src, target: new_tgt, relation: rel, weight: w, metadata: meta, created_at: cat,
+                    });
+                }
+            }
+        }
+
+        // 3. 删 B 的旧边(已在 delete_node 时清理,但这里先清 SQLite)
+        self.db.execute("DELETE FROM edges WHERE source = ? OR target = ?", params![merge_id, merge_id])?;
+
+        // 4. 在 A 的 metadata 记录合并来源(先提取 metadata 字符串,避免借用冲突)
+        let old_meta = self.graph[keep_idx].metadata.clone();
+        let merge_info = format!(r#"{{"merged_from": "{}", "merged_title": "{}"}}"#, merge_id, merge_node.title);
+        let new_meta = if old_meta == "{}" { merge_info } else { format!(r#"{},"merged_from":"{}""#, old_meta, merge_id) };
+
+        // 5. 删 B(节点 + embedding + FTS + history 保留)
+        self.delete_node(merge_id);
+
+        // 6. 更新 A 的 metadata(在 delete_node 之后,避免借用冲突)
+        if let Some(&idx) = self.node_map.get(keep_id) {
+            self.graph[idx].metadata = new_meta.clone();
+        }
+        self.db.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            params![&new_meta, keep_id],
+        )?;
+
+        log::info!("Consolidated {} into {}", merge_id, keep_id);
+        Ok(self.graph[keep_idx].clone())
+    }
+
+    /// 遗忘:删除超过 N 天未访问且 access_count 低于阈值的节点。
+    /// 返回 (删除数, 保留数)。
+    pub fn forget_stale(&mut self, max_age_days: i64, min_access_count: i64) -> (usize, usize) {
+        let now = chrono::Utc::now();
+        let stale: Vec<String> = self.graph.node_indices().filter_map(|idx| {
+            let n = &self.graph[idx];
+            // 解析 last_accessed(空则用 updated_at)
+            let la_str = {
+                let la = self.db.query_row(
+                    "SELECT COALESCE(last_accessed, updated_at) FROM nodes WHERE id = ?",
+                    params![&n.id], |r| r.get::<_, String>(0)
+                ).unwrap_or_default();
+                la
+            };
+            let access_count: i64 = self.db.query_row(
+                "SELECT COALESCE(CAST(access_count AS INTEGER), 0) FROM nodes WHERE id = ?",
+                params![&n.id], |r| r.get(0)
+            ).unwrap_or(0);
+
+            let age_days = chrono::DateTime::parse_from_rfc3339(&la_str).ok()
+                .map(|t| (now - t.with_timezone(&chrono::Utc)).num_days())
+                .unwrap_or(0);
+
+            if age_days > max_age_days && access_count < min_access_count {
+                // 检查度:有 >=2 条边的节点保留(是图中桥节点)
+                let degree = self.graph.edges_directed(idx, petgraph::Direction::Outgoing).count()
+                    + self.graph.edges_directed(idx, petgraph::Direction::Incoming).count();
+                if degree >= 2 { return None; }
+                Some(n.id.clone())
+            } else { None }
+        }).collect();
+
+        let deleted = stale.len();
+        let kept = self.graph.node_count() - deleted;
+        for id in &stale {
+            self.delete_node(id);
+        }
+        log::info!("forget_stale: deleted {} nodes (>{} days, <{} accesses, degree<2)", deleted, max_age_days, min_access_count);
+        (deleted, kept)
     }
 
     /// 更新节点的标题和内容(保留 id, type, source, metadata)
@@ -849,9 +1088,11 @@ impl GraphEngine {
                 self.node_map.insert(self.graph[i].id.clone(), i);
             }
             self.embeddings.remove(id);
-            // 从 SQLite + FTS5 删
+            // 从 SQLite + FTS5 + embeddings 删
             let _ = self.db.execute("DELETE FROM nodes WHERE id = ?", params![id]);
             let _ = self.db.execute("DELETE FROM edges WHERE source = ? OR target = ?", params![id, id]);
+            let _ = self.db.execute("DELETE FROM embeddings WHERE node_id = ?", params![id]);
+            let _ = self.db.execute("DELETE FROM node_history WHERE node_id = ?", params![id]);
             self.fts_delete(id);
             true
         } else {
