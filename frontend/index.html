@@ -785,7 +785,7 @@ function applyFilter() {
 // ── 搜索/结果列表 ───────────────────────────────────────
 async function search() {
   const q = document.getElementById('search-input').value.trim();
-  if (!q) { loadRecent(); return; }
+  if (!q) { reloadResults(); return; }  // 无搜索词:按筛选器加载
   const results = await apiSearch(q, 15);
   const seen = new Set();
   const deduped = results.filter(r => { const key = r.content?.slice(0,50) || r.title; if (seen.has(key)) return false; seen.add(key); return true; });
