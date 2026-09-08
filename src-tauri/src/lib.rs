@@ -567,6 +567,26 @@ pub fn run() {
                 });
             }
 
+            // ── 开机自启:写注册表 Run 键 ──
+            {
+                let exe = std::env::current_exe().unwrap_or_default();
+                let exe_path = exe.to_string_lossy().to_string();
+                // Windows: HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+                if cfg!(target_os = "windows") {
+                    let reg = std::process::Command::new("reg")
+                        .args(["add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                               "/v", "GraphMemory", "/t", "REG_SZ", "/d", &exe_path, "/f"])
+                        .output();
+                    if let Ok(o) = reg {
+                        if o.status.success() {
+                            log::info!("Auto-start registered: {}", exe_path);
+                        } else {
+                            log::warn!("Auto-start registration failed: {}", String::from_utf8_lossy(&o.stderr));
+                        }
+                    }
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
