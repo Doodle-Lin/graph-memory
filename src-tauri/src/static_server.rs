@@ -293,11 +293,99 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;").replace('\'', "&#39;")
 }
 
+/// /api/refine 独立处理:LLM 调用不全程持有 Mutex
+/// 只在读取候选列表和写回结果时短暂加锁
+fn handle_refine(stream: &mut TcpStream, eng: &EngineHandle) -> bool {
+    let cfg = crate::llm_extract::load_config();
+    if cfg.is_none() {
+        send_err(stream, 400, "LLM not configured (need GM_LLM_API_KEY / GM_LLM_BASE_URL / GM_LLM_MODEL)");
+        return true;
+    }
+    let cfg = cfg.unwrap();
+
+    // 短暂加锁:读候选列表(克隆数据,释放锁后 LLM 调用不持锁)
+    let (to_refine, total, skipped) = {
+        let e = eng.engine.lock().unwrap();
+        let nodes = e.all_nodes_raw();
+        let to_refine: Vec<(String, String, String, String)> = nodes.iter()
+            .filter(|(id, title, content, _)| {
+                (title.len() >= 30 || content.len() >= 200) && !e.is_refined(id)
+            })
+            .cloned()
+            .collect();
+        let total = to_refine.len();
+        let skipped = nodes.len() - total;
+        (to_refine, total, skipped)
+    }; // 锁释放
+
+    // SSE headers
+    let sse_header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    let _ = stream.write_all(sse_header);
+    let start_event = format!("event: start\ndata: {}\n\n",
+        serde_json::json!({"total": total, "skipped": skipped}));
+    let _ = stream.write_all(start_event.as_bytes());
+
+    let mut refined = 0;
+    let mut errors = 0;
+    for (i, (id, title, content, source)) in to_refine.iter().enumerate() {
+        // LLM 调用(不持锁,可能 10-60s)
+        match crate::llm_extract::refine_node(content, source, &cfg) {
+            Ok((new_title, new_content)) => {
+                // 短暂加锁写回
+                let write_result = {
+                    let mut e = eng.engine.lock().unwrap();
+                    let r = e.update_node_text(id, &new_title, &new_content);
+                    if r.is_ok() { e.mark_refined(id); }
+                    r
+                }; // 锁释放
+                match write_result {
+                    Ok(_) => {
+                        refined += 1;
+                        let ev = format!("event: progress\ndata: {}\n\n",
+                            serde_json::json!({"index": i+1, "total": total, "id": id,
+                                "old_title": trunc_str(title, 60), "new_title": trunc_str(new_title, 60),
+                                "old_len": content.chars().count(), "new_len": new_content.chars().count()}));
+                        let _ = stream.write_all(ev.as_bytes());
+                    }
+                    Err(err) => {
+                        log::warn!("update_node_text failed for {}: {}", id, err);
+                        errors += 1;
+                        let ev = format!("event: error\ndata: {}\n\n",
+                            serde_json::json!({"index": i+1, "total": total, "id": id,
+                                "old_title": trunc_str(title, 60), "error": err.to_string()}));
+                        let _ = stream.write_all(ev.as_bytes());
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("refine failed for {}: {}", id, err);
+                errors += 1;
+                let ev = format!("event: error\ndata: {}\n\n",
+                    serde_json::json!({"index": i+1, "total": total, "id": id,
+                        "old_title": trunc_str(title, 60), "error": trunc_str(err.to_string(), 120)}));
+                let _ = stream.write_all(ev.as_bytes());
+            }
+        }
+    }
+    let done_event = format!("event: done\ndata: {}\n\n",
+        serde_json::json!({"total": total, "refined": refined, "errors": errors,
+            "message": format!("提炼 {} / {} 个节点 ({} 错误)", refined, total, errors)}));
+    let _ = stream.write_all(done_event.as_bytes());
+    true
+}
+
 /// 处理引擎 API。返回 true 表示命中并已响应,false 表示不是引擎 API(走静态文件)。
 fn handle_engine_api(
     stream: &mut TcpStream, method: &str, clean: &str, raw_query: &str,
     body: serde_json::Value, eng: &EngineHandle,
 ) -> bool {
+
+    // /api/refine 特殊处理:LLM 调用周期长,不能全程持有锁
+    // 提前返回,在函数体内自行管理锁的获取/释放
+    if clean == "/api/refine" && method == "POST" {
+        return handle_refine(stream, eng);
+    }
+
     let mut e = eng.engine.lock().unwrap();
 
     if clean == "/api/health" && method == "GET" {
@@ -491,76 +579,7 @@ fn handle_engine_api(
         }
         return true;
     }
-    // POST /api/refine —— 用 LLM 批量重提炼已有节点的标题+内容
-    // 改为 SSE 流式返回:每处理一个节点发一个 event,前端实时显示进度+before/after 对比
-    if clean == "/api/refine" && method == "POST" {
-        let cfg = crate::llm_extract::load_config();
-        if cfg.is_none() {
-            send_err(stream, 400, "LLM not configured (need GM_LLM_API_KEY / GM_LLM_BASE_URL / GM_LLM_MODEL)");
-            return true;
-        }
-        let cfg = cfg.unwrap();
-        let nodes = e.all_nodes_raw();
-        // 只提炼需要提炼的:标题长或内容长 + 未被标记已提炼(refined:true)
-        let to_refine: Vec<_> = nodes.iter()
-            .filter(|(id, title, content, _)| {
-                (title.len() >= 30 || content.len() >= 200) && !e.is_refined(id)
-            })
-            .collect();
-        let total = to_refine.len();
-        let skipped = nodes.len() - total;
-
-        // SSE headers (text/event-stream, 不缓存)
-        let sse_header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-        let _ = stream.write_all(sse_header);
-
-        // 发开始事件
-        let start_event = format!("event: start\ndata: {}\n\n",
-            serde_json::json!({"total": total, "skipped": skipped}));
-        let _ = stream.write_all(start_event.as_bytes());
-
-        // P0 修复:LLM 调用时不持有 Mutex(避免阻塞所有其他请求)
-        // 先拷贝数据,释放锁,LLM 调用后再短暂加锁写回
-        let mut refined = 0;
-        let mut errors = 0;
-        for (i, (id, title, content, source)) in to_refine.iter().enumerate() {
-            // LLM 调用(不持锁,可能 10-60s)
-            match crate::llm_extract::refine_node(content, source, &cfg) {
-                Ok((new_title, new_content)) => {
-                    // 短暂加锁写回
-                    if let Err(err) = e.update_node_text(id, &new_title, &new_content) {
-                        log::warn!("update_node_text failed for {}: {}", id, err);
-                        errors += 1;
-                        let ev = format!("event: error\ndata: {}\n\n",
-                            serde_json::json!({"index": i+1, "total": total, "id": id,
-                                "old_title": trunc_str(title, 60), "error": err.to_string()}));
-                        let _ = stream.write_all(ev.as_bytes());
-                    } else {
-                        refined += 1;
-                        e.mark_refined(id);
-                        let ev = format!("event: progress\ndata: {}\n\n",
-                            serde_json::json!({"index": i+1, "total": total, "id": id,
-                                "old_title": trunc_str(title, 60), "new_title": trunc_str(new_title, 60),
-                                "old_len": content.chars().count(), "new_len": new_content.chars().count()}));
-                        let _ = stream.write_all(ev.as_bytes());
-                    }
-                }
-                Err(err) => {
-                    log::warn!("refine failed for {}: {}", id, err);
-                    errors += 1;
-                    let ev = format!("event: error\ndata: {}\n\n",
-                        serde_json::json!({"index": i+1, "total": total, "id": id,
-                            "old_title": trunc_str(title, 60), "error": trunc_str(err.to_string(), 120)}));
-                    let _ = stream.write_all(ev.as_bytes());
-                }
-            }
-        }
-        let done_event = format!("event: done\ndata: {}\n\n",
-            serde_json::json!({"total": total, "refined": refined, "errors": errors,
-                "message": format!("提炼 {} / {} 个节点 ({} 错误)", refined, total, errors)}));
-        let _ = stream.write_all(done_event.as_bytes());
-        return true;
-    }
+    // POST /api/refine 已提前到 handle_refine 处理(不持有全程锁)
 
     // GET /api/dedup/scan —— 近似对候选(只读,零 LLM)
     if clean == "/api/dedup/scan" && method == "GET" {
