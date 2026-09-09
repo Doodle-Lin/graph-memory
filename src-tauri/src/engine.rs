@@ -387,7 +387,7 @@ impl GraphEngine {
 
     /// 批量补全:为所有缺 embedding 的节点计算 embedding,并跑 auto_link 建边。
     /// 用于"导入时模型还没就绪 → 先 raw 写入 → 模型就绪后补全"的两阶段流程。
-    /// 返回 (补了 embedding 的节点数, 建的边数)。
+    /// 返回 (补了 embedding 的节点数, 建的边数, 去重合并的节点数)。
     pub fn enrich_all(&mut self) -> Result<(usize, usize)> {
         if !self.embedder_ready() {
             return Ok((0, 0));
@@ -398,6 +398,11 @@ impl GraphEngine {
             .filter(|id| !self.embeddings.contains_key(id))
             .collect();
         if pending.is_empty() {
+            // 即使没有新 embedding,也跑一次去重(可能有之前导入的近似重复)
+            let deduped = self.dedup_embeddings(0.85);
+            if deduped > 0 {
+                log::info!("enrich_all: dedup removed {} near-duplicates (no new embeddings)", deduped);
+            }
             return Ok((0, 0));
         }
         log::info!("enrich_all: {} nodes pending embedding", pending.len());
@@ -415,8 +420,84 @@ impl GraphEngine {
                 edges += es.len();
             }
         }
-        log::info!("enrich_all done: {} embeddings, {} edges", pending.len(), edges);
+
+        // 补完 embedding 后:跑 embedding 相似度去重
+        // 修复两阶段导入的设计缺口:导入时跳过 embedding 去重(raw 入库),
+        // 模型就绪后这里补上——三源导入的近似重复(sim>=0.85)被自动合并
+        let deduped = self.dedup_embeddings(0.85);
+        if deduped > 0 {
+            log::info!("enrich_all: dedup removed {} near-duplicates (sim>=0.85)", deduped);
+        }
+
+        log::info!("enrich_all done: {} embeddings, {} edges, {} deduped", pending.len(), edges, deduped);
         Ok((pending.len(), edges))
+    }
+
+    /// embedding 相似度去重:遍历所有 embedding 对,sim >= threshold 的合并
+    /// 保留 content 更长的节点,迁移边,删除另一个
+    /// 返回被删除(合并)的节点数
+    fn dedup_embeddings(&mut self, threshold: f32) -> usize {
+        // 收集所有 (id, embedding) 对,算相似度
+        let ids: Vec<String> = self.embeddings.keys().cloned().collect();
+        let mut to_merge: Vec<(String, String, f32)> = Vec::new(); // (keep, merge, sim)
+
+        for i in 0..ids.len() {
+            for j in (i+1)..ids.len() {
+                let a = &self.embeddings[&ids[i]];
+                let b = &self.embeddings[&ids[j]];
+                let sim = Self::cosine_sim(a, b);
+                if sim >= threshold {
+                    // 保留 content 更长的
+                    let ca = self.node_map.get(&ids[i]).map(|&idx| self.graph[idx].content.len()).unwrap_or(0);
+                    let cb = self.node_map.get(&ids[j]).map(|&idx| self.graph[idx].content.len()).unwrap_or(0);
+                    let (keep, merge) = if ca >= cb { (ids[i].clone(), ids[j].clone()) } else { (ids[j].clone(), ids[i].clone()) };
+                    to_merge.push((keep, merge, sim));
+                }
+            }
+        }
+
+        if to_merge.is_empty() { return 0; }
+
+        // 贪心合并:跳过已删的
+        let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut count = 0;
+        for (keep, merge, sim) in &to_merge {
+            if deleted_ids.contains(merge) || deleted_ids.contains(keep) { continue; }
+            // 迁移边
+            let edges: Vec<(String, String, String, f64, String, String)> = {
+                let mut stmt = match self.db.prepare(
+                    "SELECT source, target, relation, weight, metadata, created_at FROM edges WHERE source = ? OR target = ?"
+                ) { Ok(s) => s, Err(_) => continue };
+                let rows = stmt.query_map(params![merge, merge], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                        r.get::<_, f64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))
+                });
+                match rows { Ok(r) => r.filter_map(|x| x.ok()).collect(), Err(_) => continue }
+            };
+            for (src, tgt, rel, w, meta, cat) in edges {
+                let new_src = if src == *merge { keep.clone() } else { src };
+                let new_tgt = if tgt == *merge { keep.clone() } else { tgt };
+                if new_src != new_tgt {
+                    let _ = self.db.execute("INSERT OR REPLACE INTO edges VALUES (?,?,?,?,?,?)", params![new_src, new_tgt, rel, w, meta, cat]);
+                }
+            }
+            let _ = self.db.execute("DELETE FROM edges WHERE source = ? OR target = ?", params![merge, merge]);
+            let _ = self.db.execute("DELETE FROM nodes WHERE id = ?", params![merge]);
+            let _ = self.db.execute("DELETE FROM embeddings WHERE node_id = ?", params![merge]);
+            let _ = self.db.execute("DELETE FROM nodes_fts WHERE node_id = ?", params![merge]);
+            self.embeddings.remove(merge);
+            if let Some(&idx) = self.node_map.get(merge) {
+                self.graph.remove_node(idx);
+                self.node_map.clear();
+                for i in self.graph.node_indices() {
+                    self.node_map.insert(self.graph[i].id.clone(), i);
+                }
+            }
+            deleted_ids.insert(merge.clone());
+            count += 1;
+            log::info!("dedup: merged {} into {} (sim={:.3})", &merge[..merge.len().min(12)], &keep[..keep.len().min(12)], sim);
+        }
+        count
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
