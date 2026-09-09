@@ -12,6 +12,7 @@ use tauri::State;
 
 struct AppState {
     engine: Arc<Mutex<GraphEngine>>,
+    refine_in_progress: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 定位 frontend 目录:优先 exe 旁,其次开发路径
@@ -304,6 +305,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             engine: engine_arc.clone(),
+            refine_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
         .invoke_handler(tauri::generate_handler![
             stats, health, recent, retrieve, write_memory, update_memory,
@@ -555,13 +557,17 @@ pub fn run() {
                     drop(engine);
 
                     if !to_refine.is_empty() && crate::llm_extract::load_config().is_some() {
-                        log::info!("[maintenance] auto-refine: {} unrefined nodes, starting...", to_refine.len());
-                        let cfg = crate::llm_extract::load_config().unwrap();
-                        let mut refined = 0;
-                        let mut errors = 0;
-                        // P0 修复:LLM 调用不加锁,只在写回时短暂加锁
-                        for (id, title, content, source) in &to_refine {
-                            match crate::llm_extract::refine_node(content, source, &cfg) {
+                        // A5 修复:检查是否有手动 refine 在跑,避免并发双重写入
+                        let rip = app_handle.state::<AppState>().refine_in_progress.clone();
+                        if rip.load(std::sync::atomic::Ordering::Relaxed) {
+                            log::info!("[maintenance] auto-refine skipped: manual refine in progress");
+                        } else {
+                            log::info!("[maintenance] auto-refine: {} unrefined nodes, starting...", to_refine.len());
+                            let cfg = crate::llm_extract::load_config().unwrap();
+                            let mut refined = 0;
+                            let mut errors = 0;
+                            for (id, title, content, source) in &to_refine {
+                                match crate::llm_extract::refine_node(content, source, &cfg) {
                                 Ok((new_title, new_content)) => {
                                     // 短暂加锁写回
                                     let state = app_handle.state::<AppState>();
@@ -576,6 +582,7 @@ pub fn run() {
                             }
                         }
                         log::info!("[maintenance] auto-refine done: {} refined, {} errors", refined, errors);
+                        } // end else (not in progress)
                     } else if to_refine.is_empty() {
                         log::info!("[maintenance] auto-refine: all nodes already refined, skipping");
                     } else {

@@ -295,6 +295,7 @@ fn html_escape(s: &str) -> String {
 
 /// /api/refine 独立处理:LLM 调用不全程持有 Mutex
 /// 只在读取候选列表和写回结果时短暂加锁
+/// A5 修复:用 refine_in_progress 标志防止手动 refine 和 auto-refine 并发
 fn handle_refine(stream: &mut TcpStream, eng: &EngineHandle) -> bool {
     let cfg = crate::llm_extract::load_config();
     if cfg.is_none() {
@@ -399,8 +400,14 @@ fn handle_engine_api(
         send_json(stream, e.stats());
         return true;
     }
+    // A4 修复:/api/graph 快照序列化(200KB+)不持锁
+    // 先 clone 数据再释放锁,序列化在锁外做
     if clean == "/api/graph" && method == "GET" {
-        send_json(stream, e.graph_snapshot());
+        let snapshot = {
+            let e = eng.engine.lock().unwrap();
+            e.graph_snapshot()
+        }; // 锁释放
+        send_json(stream, snapshot);
         return true;
     }
     if clean == "/api/recent" && method == "GET" {

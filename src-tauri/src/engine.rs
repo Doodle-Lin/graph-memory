@@ -778,16 +778,23 @@ impl GraphEngine {
         // 种子分:非种子=0,种子=其 RRF 归一化分
         let seed_map: HashMap<String, f32> = seeds.iter().cloned().collect();
 
-        // 初始化 PPR
+        // A2 修复:PPR 初始化必须覆盖所有候选(BM25-only 节点不在 sem_sims 里)
+        // 否则关键词命中的节点 PPR=0,永远拿不到传播分
         let mut ppr: HashMap<String, f64> = HashMap::new();
+        // 语义候选
         for (id, _) in &sem_sims {
             ppr.insert(id.clone(), seed_map.get(id).copied().unwrap_or(0.0) as f64);
+        }
+        // BM25-only 候选(不在 sem_sims 里的 BM25 命中节点)
+        for (id, _) in &bm25_results {
+            ppr.entry(id.clone()).or_insert(seed_map.get(id).copied().unwrap_or(0.0) as f64);
         }
 
         // PPR 迭代
         for _iter in 0..iterations {
             let mut new_ppr: HashMap<String, f64> = HashMap::new();
-            for (id, _) in &sem_sims {
+            // A2 修复:遍历所有 ppr 节点(不只是 sem_sims)
+            for (id, _) in &ppr {
                 let idx = match self.node_map.get(id) { Some(&i) => i, None => continue };
                 // 从邻居收集分数(双向 B3:Outgoing + Incoming)
                 let mut incoming: f64 = 0.0;
@@ -811,6 +818,10 @@ impl GraphEngine {
                 let teleport = seed_map.get(id).copied().unwrap_or(0.0) as f64;
                 let propagated = incoming / degree.max(1) as f64;
                 new_ppr.insert(id.clone(), damping * teleport + (1.0 - damping) * propagated);
+            }
+            // A2 修复:保留上一轮有分数但本轮无邻居的节点(不被丢弃)
+            for (id, score) in &ppr {
+                new_ppr.entry(id.clone()).or_insert(damping * score);
             }
             ppr = new_ppr;
         }
@@ -875,18 +886,21 @@ impl GraphEngine {
 
         // H2:MMR 多样性——去重近似结果,避免 top_k 被同主题碎片占满
         // 贪心选:每次选分数最高的,但惩罚与已选结果 embedding 太近的(>0.85)
+        // A3 修复:无 embedding 的节点不参与 MMR 判定(和谁都不"太相似")
         let mut selected: Vec<(RetrieveResult, f64)> = Vec::new();
         let mut remaining = results;
         while selected.len() < top_k && !remaining.is_empty() {
-            // 选分数最高的
             remaining.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let (best, best_key) = remaining.remove(0);
-            // 检查与已选的相似度
-            let best_emb = self.embeddings.get(&best.id).cloned().unwrap_or_default();
+            // 只在两边都有 embedding 时才判 MMR
+            let best_emb = match self.embeddings.get(&best.id) {
+                Some(e) => e,
+                None => { selected.push((best, best_key)); continue; }  // 无 embedding,直接选
+            };
             let mut too_similar = false;
             for s in &selected {
                 if let Some(s_emb) = self.embeddings.get(&s.0.id) {
-                    let sim = Self::cosine_sim(&best_emb, s_emb);
+                    let sim = Self::cosine_sim(best_emb, s_emb);
                     if sim >= 0.85 { too_similar = true; break; }
                 }
             }
@@ -896,12 +910,20 @@ impl GraphEngine {
             // 如果太相似,跳过(不加入 selected,也不放回 remaining)
         }
 
-        // C1:更新命中节点的 access_count + last_accessed(异步写回)
-        for (r, _) in &selected {
-            let _ = self.db.execute(
-                "UPDATE nodes SET access_count = COALESCE(CAST(access_count AS INTEGER), 0) + 1, last_accessed = ? WHERE id = ?",
-                params![now_ts.to_rfc3339(), &r.id],
+        // C1:更新命中节点的 access_count + last_accessed
+        // A1 修复:合并为单条 SQL(WAL 模式下比逐条写快,减少锁持有时间)
+        let now_str = now_ts.to_rfc3339();
+        let hit_ids: Vec<&str> = selected.iter().map(|(r, _)| r.id.as_str()).collect();
+        if !hit_ids.is_empty() {
+            let placeholders = hit_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE nodes SET access_count = COALESCE(CAST(access_count AS INTEGER), 0) + 1, last_accessed = ? WHERE id IN ({})",
+                placeholders
             );
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now_str)];
+            for id in &hit_ids { params_vec.push(Box::new(id.to_string())); }
+            let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            let _ = self.db.execute(&sql, params_ref.as_slice());
         }
 
         Ok(selected.into_iter().map(|(r, _)| r).collect())

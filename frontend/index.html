@@ -929,9 +929,19 @@ async function saveEdit() {
     if (d.action === 'updated' || d.action === 'created') {
       showToast(d.action === 'updated' ? '已保存' : '已创建新节点');
       cancelEdit();
-      // 刷新详情
+      // C1 修复:保存后刷新图谱 + 检索列表 + 重显详情
       if (cyInited) loadGraph();
-      loadRecent();
+      // 重新加载结果列表(保持筛选器状态)
+      reloadResults();
+      // 重新显示更新后的详情(用新内容)
+      if (d.node_id) {
+        selectedNode = { id: d.node_id, title: newTitle, content: newContent, node_type: 'knowledge', source: 'manual' };
+        showNodeDetail(selectedNode);
+      } else if (d.node) {
+        selectedNode = d.node;
+        showNodeDetail(d.node);
+      }
+      switchView('detail');
     } else {
       showToast('保存失败: ' + (d.error || '未知错误'));
     }
