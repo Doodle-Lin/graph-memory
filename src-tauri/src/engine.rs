@@ -472,12 +472,38 @@ impl GraphEngine {
         let chash = Self::content_hash(content);
         let now = Self::now();
 
-        // 跳过已存在(content_hash 精确去重,不再依赖 id=hash)
+        // 第一层:content_hash 精确去重
         if self.db.query_row::<i64, _, _>(
             "SELECT COUNT(*) FROM nodes WHERE content_hash = ?", params![chash],
             |r| r.get(0)
         ).unwrap_or(0) > 0 {
             return Ok(());
+        }
+
+        // 第二层:FTS5 模糊去重(防止提炼后重新导入产生重复)
+        // 提炼改了 content → content_hash 变 → 精确去重失效
+        // 用前 100 字符搜 FTS5,如果 BM25 高分命中 → 已被提炼覆盖,跳过
+        let check_text: String = content.chars().take(100).collect();
+        let terms = Self::split_query_terms(&check_text);
+        if !terms.is_empty() {
+            // 用双引号包裹每个 term,避免 FTS5 把大写词当列名(如 "Image")
+            let quoted: Vec<String> = terms.iter().map(|t| format!("\"{}\"", t.replace('"', "\"\""))).collect();
+            let fts_query = quoted.join(" OR ");
+            if let Ok(mut stmt) = self.db.prepare(
+                "SELECT node_id, bm25(nodes_fts) as rank FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY rank LIMIT 1"
+            ) {
+                if let Ok(rows) = stmt.query_map(params![fts_query], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+                }) {
+                    for row in rows.filter_map(|r| r.ok()) {
+                        let bm25_score = -row.1;
+                        // BM25 > 8.0 表示内容高度相似(已被提炼覆盖或已导入)
+                        if bm25_score > 8.0 {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
 
         let nt = if is_valid_type(node_type) { node_type.to_string() } else { "knowledge".to_string() };
