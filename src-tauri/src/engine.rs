@@ -399,7 +399,7 @@ impl GraphEngine {
             .collect();
         if pending.is_empty() {
             // 即使没有新 embedding,也跑一次去重(可能有之前导入的近似重复)
-            let deduped = self.dedup_embeddings(0.85);
+            let deduped = self.dedup_embeddings(0.90);
             if deduped > 0 {
                 log::info!("enrich_all: dedup removed {} near-duplicates (no new embeddings)", deduped);
             }
@@ -482,6 +482,14 @@ impl GraphEngine {
                 }
             }
             let _ = self.db.execute("DELETE FROM edges WHERE source = ? OR target = ?", params![merge, merge]);
+            // 存历史:被合并节点的标题+内容(可追溯/恢复)
+            if let Some(&idx) = self.node_map.get(merge) {
+                let m_node = &self.graph[idx];
+                let _ = self.db.execute(
+                    "INSERT INTO node_history (node_id, old_title, old_content, changed_at) VALUES (?,?,?,?)",
+                    params![merge, &m_node.title, &m_node.content, &Self::now()],
+                );
+            }
             let _ = self.db.execute("DELETE FROM nodes WHERE id = ?", params![merge]);
             let _ = self.db.execute("DELETE FROM embeddings WHERE node_id = ?", params![merge]);
             let _ = self.db.execute("DELETE FROM nodes_fts WHERE node_id = ?", params![merge]);

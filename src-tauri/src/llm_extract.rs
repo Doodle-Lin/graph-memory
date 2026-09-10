@@ -97,13 +97,12 @@ const REFINE_PROMPT: &str = r#"你是一个知识提炼专家。将下面的原�
 ## 规则
 1. title: 用 5-20 字概括核心知识点(不是截断原文,是提炼!)
    - 例如:"vLLM 部署偏好" 而非 "用户说要用vLLM来部署..."
-2. content: 保留所有有用信息!具体规则:
-   - 保留所有技术细节:服务器地址、端口、命令、路径、配置参数、版本号
-   - 保留所有因果关系和前提条件("因为X所以Y"、"如果A则B")
-   - 保留所有数字、阈值、性能指标
-   - 去掉对话噪音:寒暄、确认、碎片化指令、重复的上下文引用
-   - 去掉会话痕迹:"用户说"、"我问了"、"然后我"等
-   - 如果原文本身就是结构化知识(无对话噪音),content 可与原文基本一致
+2. content: 只做清理,不改写!具体规则:
+   - 保留原文中的所有关键词!特别是型号(8397)、端口(9000)、路径、版本号
+   - 只去掉对话噪音:寒暄、确认、碎片化指令
+   - 只去掉会话痕迹:"用户说"、"我问了"、"然后我"等
+   - 如果原文本身就是结构化知识,content 必须与原文完全一致
+   - 不要把"8397板"改成"SA8797P"——保留原始表述,用户用"8397"搜索
 3. 不要用会话名/文件名作为标题,要从内容本身提炼
 4. 只输出两行,严格格式:
    TITLE: 标题
@@ -187,10 +186,12 @@ pub fn refine_node(content: &str, source: &str, cfg: &LlmConfig) -> Result<(Stri
     if title.is_empty() {
         anyhow::bail!("no TITLE in response: {}", trunc(text, 100));
     }
-    // 信息保留守卫:如果提炼后 content 比原文短太多(<30% 且 <50 字),
-    // 说明 LLM 可能丢信息,保留原文 content
-    if content_out.is_empty() || (content_out.chars().count() < 50 && content.len() > 100) {
-        log::warn!("refine produced thin content, keeping original ({} chars)", content.chars().count());
+    // 信息保留守卫:如果提炼后 content 比原文短太多(<50%),
+    // 说明 LLM 可能改写/丢信息,保留原文 content
+    let orig_len = content.chars().count();
+    let new_len = content_out.chars().count();
+    if content_out.is_empty() || (new_len < orig_len / 2 && orig_len > 50) {
+        log::warn!("refine produced thin content ({}→{} chars), keeping original", orig_len, new_len);
         content_out = content.to_string();
     }
 
