@@ -419,7 +419,8 @@ fn handle_engine_api(
     if clean == "/api/search" && method == "GET" {
         let q = parse_query_str(raw_query, "q", "").to_string();
         let top_k = parse_query_int(raw_query, "top_k", 15);
-        match e.retrieve(&q, Some(top_k), false) {
+        let min_score = parse_query_str(raw_query, "min_score", "0.0").parse::<f32>().unwrap_or(0.0);
+        match e.retrieve(&q, Some(top_k), false, min_score) {
             Ok(r) => send_json(stream, serde_json::to_value(r).unwrap()),
             Err(err) => send_err(stream, 500, &err.to_string()),
         }
@@ -446,7 +447,8 @@ fn handle_engine_api(
         let query = body.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let top_k = body.get("top_k").and_then(|v| v.as_u64()).map(|x| x as usize);
         let spread = body.get("spread").and_then(|v| v.as_bool());
-        match e.retrieve(&query, top_k, spread.unwrap_or(true)) {
+        let min_score = body.get("min_score").and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(0.0);
+        match e.retrieve(&query, top_k, spread.unwrap_or(true), min_score) {
             Ok(r) => send_json(stream, serde_json::to_value(r).unwrap()),
             Err(e) => send_err(stream, 500, &e.to_string()),
         }
@@ -496,7 +498,7 @@ fn handle_engine_api(
             else { None }
         } else {
             // 模糊:retrieve top-1
-            match e.retrieve(&query, Some(1), false) {
+            match e.retrieve(&query, Some(1), false, 0.0) {
                 Ok(results) => results.first().map(|r| r.id.clone()),
                 Err(_) => None,
             }

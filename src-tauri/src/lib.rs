@@ -80,7 +80,7 @@ fn recent(state: State<AppState>, limit: Option<usize>) -> Vec<Node> {
 #[tauri::command]
 fn retrieve(state: State<AppState>, query: String, top_k: Option<usize>, spread: Option<bool>) -> Result<Vec<RetrieveResult>, String> {
     let mut engine = state.engine.lock().unwrap();
-    engine.retrieve(&query, top_k, spread.unwrap_or(true))
+    engine.retrieve(&query, top_k, spread.unwrap_or(true), 0.0)
         .map_err(|e| e.to_string())
 }
 
@@ -103,7 +103,7 @@ fn write_memory(state: State<AppState>, content: String, title: String, node_typ
 #[tauri::command]
 fn update_memory(state: State<AppState>, query: String, new_content: String, new_title: Option<String>, node_type: Option<String>) -> Result<serde_json::Value, String> {
     let mut engine = state.engine.lock().unwrap();
-    let results = engine.retrieve(&query, Some(1), Some(false).unwrap_or(false))
+    let results = engine.retrieve(&query, Some(1), false, 0.0)
         .map_err(|e| e.to_string())?;
     if let Some(result) = results.first() {
         let title = new_title.clone().unwrap_or_else(|| result.title.clone());
@@ -541,7 +541,9 @@ pub fn run() {
             {
                 let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    // 等 30s 让模型加载 + 首次 enrich 完成
+                    // 等 30s 让模型加载 + 首次 enrich 完成。
+                    // 注意:harness 的导入测试在启动后 ~10s 触发,这个 30s 等待让 harness 的
+                    // 第二次 import 先拿到锁,避免 auto-refine 与 import 抢锁互相饿死。
                     std::thread::sleep(std::time::Duration::from_secs(30));
 
                     // 首次:自动提炼未提炼过的节点(只跑一次,花 token 但标记后不重复)
@@ -562,26 +564,32 @@ pub fn run() {
                         if rip.load(std::sync::atomic::Ordering::Relaxed) {
                             log::info!("[maintenance] auto-refine skipped: manual refine in progress");
                         } else {
+                            // 占位标记,阻止手动 refine 与本后台循环并发
+                            rip.store(true, std::sync::atomic::Ordering::Relaxed);
                             log::info!("[maintenance] auto-refine: {} unrefined nodes, starting...", to_refine.len());
                             let cfg = crate::llm_extract::load_config().unwrap();
                             let mut refined = 0;
                             let mut errors = 0;
                             for (id, title, content, source) in &to_refine {
+                                // 关键:LLM 调用(refine_node)是同步 HTTP 往返,绝不能持有引擎锁。
+                                // 否则单线程 Mutex 期间所有 agent API(/api/retrieve /write /health)全阻塞。
+                                // 先无锁算出新标题+新内容,再短暂加锁写回。
                                 match crate::llm_extract::refine_node(content, source, &cfg) {
-                                Ok((new_title, new_content)) => {
-                                    // 短暂加锁写回
-                                    let state = app_handle.state::<AppState>();
-                                    let mut engine = state.engine.lock().unwrap();
-                                    if engine.update_node_text(id, &new_title, &new_content).is_ok() {
-                                        engine.mark_refined(id);
-                                        refined += 1;
-                                    } else { errors += 1; }
-                                    drop(engine);
+                                    Ok((new_title, new_content)) => {
+                                        // 短暂加锁写回(只在 update+mark 期间持锁,毫秒级)
+                                        let state = app_handle.state::<AppState>();
+                                        let mut engine = state.engine.lock().unwrap();
+                                        if engine.update_node_text(id, &new_title, &new_content).is_ok() {
+                                            engine.mark_refined(id);
+                                            refined += 1;
+                                        } else { errors += 1; }
+                                        drop(engine);
+                                    }
+                                    Err(e) => { log::warn!("[maintenance] refine failed for {}: {}", id, e); errors += 1; }
                                 }
-                                Err(e) => { log::warn!("[maintenance] refine failed for {}: {}", id, e); errors += 1; }
                             }
-                        }
-                        log::info!("[maintenance] auto-refine done: {} refined, {} errors", refined, errors);
+                            rip.store(false, std::sync::atomic::Ordering::Relaxed);
+                            log::info!("[maintenance] auto-refine done: {} refined, {} errors", refined, errors);
                         } // end else (not in progress)
                     } else if to_refine.is_empty() {
                         log::info!("[maintenance] auto-refine: all nodes already refined, skipping");

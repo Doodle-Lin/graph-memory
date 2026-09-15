@@ -86,7 +86,8 @@ fn tools_list() -> serde_json::Value {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "检索关键词或用户问题"},
-                "top_k": {"type": "integer", "description": "返回结果数(默认5)", "default": 5}
+                "top_k": {"type": "integer", "description": "返回结果数(默认5)", "default": 5},
+                "min_score": {"type": "number", "description": "最低分数阈值,只返回 score ≥ min_score 的结果(默认0.0,不过滤)", "default": 0.0}
             },
             "required": ["query"]
         }
@@ -167,8 +168,9 @@ fn handle_tool_call(name: &str, args: &serde_json::Value) -> Result<Vec<serde_js
         "retrieve" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5);
+            let min_score = args.get("min_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let result = http_post_json("/api/retrieve", &serde_json::json!({
-                "query": query, "top_k": top_k, "spread": true
+                "query": query, "top_k": top_k, "spread": true, "min_score": min_score
             }))?;
             let arr = result.as_array().cloned().unwrap_or_default();
             let mut lines = vec![format!("检索 '{}' 返回 {} 条关联知识:\n", query, arr.len())];

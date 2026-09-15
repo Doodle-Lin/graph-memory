@@ -770,8 +770,10 @@ impl GraphEngine {
         Ok(())
     }
 
-    pub fn retrieve(&mut self, query: &str, top_k: Option<usize>, spread: bool) -> Result<Vec<RetrieveResult>> {
+    pub fn retrieve(&mut self, query: &str, top_k: Option<usize>, spread: bool, min_score: f32) -> Result<Vec<RetrieveResult>> {
         let top_k = top_k.unwrap_or(RETRIEVAL_TOP_K);
+        // 负数阈值视为不过滤(对齐 Python: < 0 → 0.0)
+        let min_score = if min_score < 0.0 { 0.0 } else { min_score };
 
         // ── 混合检索:BM25(关键词) + Embedding(语义) → RRF 融合 ──
         // BM25:精确匹配型号/端口/路径(FTS5 trigram,中文友好)
@@ -814,6 +816,8 @@ impl GraphEngine {
                         }
                     })
                 })
+                // min_score 过滤(BM25-only 分支:score = BM25 score)
+                .filter(|r| (r.score as f32) >= min_score)
                 .collect());
         }
 
@@ -878,6 +882,8 @@ impl GraphEngine {
                         }
                     })
                 })
+                // min_score 过滤(语义分支:score = RRF 归一化分)
+                .filter(|r| (r.score as f32) >= min_score)
                 .collect());
         }
 
@@ -974,6 +980,11 @@ impl GraphEngine {
             })
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // min_score 过滤(spread 分支:score = RRF+PPR fused 分,不含时间衰减/访问加成)
+        // 先过滤再进 MMR —— 阈值外的节点不参与多样性选择,避免用低分节点凑满 top_k。
+        // 结果可能少于 top_k,这是正确的(不拿噪声凑数)。
+        results.retain(|(r, _)| (r.score as f32) >= min_score);
 
         // C1:时间衰减 + 访问频次加成
         // 常用的节点(被检索命中过)和近期更新的节点获得加成

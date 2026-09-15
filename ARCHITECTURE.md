@@ -155,6 +155,8 @@ nodes_fts(node_id, title, content)  -- FTS5 trigram虚拟表
 | 4 查询理解 | 实体抽取分路检索 + extract跨批次边解析 + 批次内去重 | ✅ |
 | 自动化 | 后台维护(每60min) + refine标记防重复 + SKILL自动部署 | ✅ |
 | UI | 检索优先布局 + 编辑 + SSE提炼进度 + 正式图标 | ✅ |
+| 并发 | auto-refine 不在 Mutex 内调 LLM(锁释放后再写回) + 占位标记防并发 | ✅ |
+| 检索参数 | retrieve min_score 过滤(engine/HTTP/MCP 三层贯通,Rust 对齐 Python 语义) | ✅ |
 
 ## 6. 待完成
 
@@ -164,8 +166,9 @@ nodes_fts(node_id, title, content)  -- FTS5 trigram虚拟表
 | 开机自启 | P1 | Tauri autostart 或注册表 |
 | 崩溃恢复 | P1 | watchdog 或守护进程 |
 | ANN 索引 | P2 | 1000+节点时需要(HNSW / sqlite-vec) |
-| RwLock | P2 | retrieve读锁/write写锁，refine释放锁 |
+| RwLock | P2 | retrieve读锁/write写锁,refine释放锁 |
 | 事务 | P2 | nodes+fts写入包事务 |
+| E2E harness | P2 | `scripts/harness.ps1` + `docs/HARNESS.md` — 全链路断言(后端/前端/导入/写入/检索 min_score/enrich/托盘/接入器/维护工具)。冷启动与 LLM 提炼路径未覆盖 |
 
 ## 7. 约束与红线
 
