@@ -126,7 +126,11 @@ impl MemoryStore {
                 .transpose()
         }
         let scope = string(body, "scope", "current")?;
-        let project = string(body, "project_id", "")?;
+        let project = if body["project_id"].is_null() {
+            ""
+        } else {
+            string(body, "project_id", "")?
+        };
         if !matches!(scope, "current" | "project" | "personal" | "all")
             || (scope == "project" && project.is_empty())
             || (matches!(scope, "personal" | "all") && !project.is_empty())
@@ -531,6 +535,7 @@ mod tests {
         }
         let search = |body| store.search(&body).unwrap();
         assert_eq!(search(json!({}))["total"], 1);
+        assert_eq!(search(json!({"project_id":null,"query":""}))["total"], 1);
         assert_eq!(search(json!({"project_id":alpha}))["total"], 2);
         assert_eq!(
             search(json!({"scope":"project","project_id":alpha}))["memories"][0]["id"],

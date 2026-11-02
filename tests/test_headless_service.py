@@ -141,6 +141,10 @@ class HeadlessServiceTest(unittest.TestCase):
                 self.assertIsNone(page['next_offset'])
                 invalid, _=call_tool('memory_search',{'from':'2026-11-01'})
                 self.assertTrue(invalid.get('isError'),invalid)
+                # The Avalonia personal view serializes an optional project as JSON null.
+                personal_page=api(info,'/api/v1/search',{'project_id':None,'query':''})
+                self.assertEqual(personal_page['total'],2)
+                self.assertTrue(all(x['memory_scope']=='personal' for x in personal_page['memories']))
                 reply, corrected=call_tool('memory_update',{'id':experience['id'],'expected_version':3,'content':'PowerShell correction verified through MCP'})
                 self.assertFalse(reply.get('isError'),reply)
                 self.assertEqual(corrected['memory']['version'],4)

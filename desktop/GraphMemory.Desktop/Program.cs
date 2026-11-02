@@ -17,6 +17,8 @@ internal static class Program {
             var project=await client.PostAsync("api/v1/projects",new {name="Desktop smoke project"});
             var id=project["id"]!.GetValue<string>();
             await client.PostAsync("api/v1/memories",new {memory_scope="personal",event_id=Guid.NewGuid().ToString(),content="Desktop smoke experience",title="Smoke",conditions="test only"});
+            var personal=await client.PostAsync("api/v1/search",new {project_id=(string?)null,query="smoke"});
+            if(personal["memories"]!.AsArray().Count!=1)throw new Exception("Personal memory list failed");
             var context=await client.PostAsync("api/v1/context",new {project_id=id,query="smoke"});
             if(!context["text"]!.GetValue<string>().Contains("Desktop smoke experience")) throw new Exception("Personal experience missing from context");
             Console.WriteLine("PASS desktop client: start service, create project, save personal experience, assemble context");return 0;
