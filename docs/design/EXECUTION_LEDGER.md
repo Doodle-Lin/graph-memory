@@ -9,7 +9,7 @@
 | L1-03 未知类型兼容 | 验收通过 | 本地 Claude CLI / sonnet | Codex | 7986925 | 41项真实控件+隔离HTTP检查通过，基线同用例失败 |
 | L1-04 草稿退出保护 | 验收通过 | 本地 Claude CLI，Codex 补充验证 | Codex | c3e3d47 | 73项编辑/关闭检查，原生取消/保存退出与截图通过 |
 | L1-05 新版入口统一 | 验收通过 | Claude 文案初稿 / Codex 集成 | Codex | eedb26d | 新版首页/技能/架构入口，旧版归档；18 个本地链接及五工具契约核对通过 |
-| L1-06 Windows 契约 CI | 本地通过，待远端验收 | Claude 初稿 / Codex 修正验证 | Codex | de76d9a | Windows workflow + 共用脚本；远端干净构建及必需检查待核对 |
+| L1-06 Windows 契约 CI | 验收通过 | Claude 初稿 / Codex 修正验证 | Codex | 44130cd | 远端Windows全流程通过；main必需检查规则26353094已生效 |
 | L1-07 宿主矩阵 | 待开始 | Codex 主验收，Claude 辅助样例 | Codex | L1-06 后 | 不把本地组件测试当作宿主调用 |
 | L2–L5 | 未进入 | 按计划拆分委派 | Codex | 满足阶段依赖后 | 不提前标完成 |
 
@@ -96,3 +96,11 @@
 - Codex以空HERMES_HOME/CLAUDE_HOME/CODEX_HOME运行旧测试二进制，复现exit101。随后保持公开导入API及默认目录规则，抽出显式目录的内部实现；Claude CLI 48秒提供固定样本测试（无工具权限），Codex审查应用并补充重新打开数据库核验数量及来源。
 - 新6个样本用例覆盖Hermes MEMORY/USER/技能及跳过自身技能、Claude frontmatter/噪声、Codex JSONL噪声/坏行、三源汇总、缺失源；每个UUID临时目录，释放数据库后清理，不改全局环境、不跳过、不读取真实宿主目录。
 - 修改后本地完整脚本通过：13项Rust、102项配置、73项编辑/关闭、stdio/HTTP及自包含客户端smoke。最后新增持久化断言再跑13项Rust通过。等待第二轮远端干净验证。
+
+### L1-06 最终验收
+
+- 代码提交44130cdc5a74c943e12929bcfccf7ff39665fd8b的[远端运行41414448415](https://github.com/Doodle-Lin/graph-memory/actions/runs/41414448415)结论success。Windows-2022新checkout、不复用构建缓存：服务/MCP构建、13项Rust、102项配置、73项编辑与退出、真实stdio/HTTP集成、自包含客户端隔离smoke全部通过；Codex读取作业日志逐项核对，非仅看绿色徽标。
+- 依据L1-06“失败阻断合入”验收要求，为main启用规则Require Windows v1 contract（ruleset 26353094），限定检查名Windows v1 contract及GitHub Actions app 15368，严格要求与最新目标分支验证，无绕过者。读取rules/branches/main确认生效。不修改其他分支规则，也没有合并到main。
+- 新规则意味着main更新必须已有该检查通过；旧分支若没有工作流，需要带入新工作流后再验收。规则配置在GitHub，仓库文件本身不能替代服务器设置。
+- 本台账更新仅记录上述已验证代码与服务器状态；后续文档提交产生的运行是另一条记录，不能混称为44130cd的运行。
+- L1-06完成。下一项L1-07：真实宿主验收矩阵，区分配置、工具发现、实际调用与结果采用。用户正在运行的artifacts/desktop仍未被本轮CI产物替换。
