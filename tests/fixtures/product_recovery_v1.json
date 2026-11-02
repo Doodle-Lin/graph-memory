@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "description": "Synthetic task recovery acceptance examples. No personal data.",
+  "cases": [
+    {
+      "id": "exact-identifier",
+      "query": "How do I connect to board ZX-8397?",
+      "expected_ids": [
+        "board-zx-8397"
+      ],
+      "forbidden_ids": [
+        "board-zx-8797"
+      ],
+      "required_terms": [
+        "ZX-8397"
+      ]
+    },
+    {
+      "id": "resume-task",
+      "query": "Resume project alpha after yesterday's session",
+      "expected_ids": [
+        "alpha-decision",
+        "alpha-blocker",
+        "alpha-next"
+      ],
+      "forbidden_ids": [],
+      "required_terms": [
+        "benchmark",
+        "blocked",
+        "retry"
+      ]
+    },
+    {
+      "id": "contradiction",
+      "query": "Which runtime version is deployed for project beta?",
+      "expected_ids": [
+        "beta-version-current"
+      ],
+      "forbidden_ids": [
+        "beta-version-obsolete"
+      ],
+      "required_terms": [
+        "2.1"
+      ]
+    },
+    {
+      "id": "no-evidence",
+      "query": "What is the production secret token?",
+      "expected_ids": [],
+      "forbidden_ids": [],
+      "required_terms": [],
+      "must_abstain": true
+    }
+  ]
+}
