@@ -405,7 +405,11 @@ impl GraphEngine {
             }
             return Ok((0, 0));
         }
+        let t_start = std::time::Instant::now();
         log::info!("enrich_all: {} nodes pending embedding", pending.len());
+
+        // 阶段1:算 embedding + 持久化
+        let t_emb = std::time::Instant::now();
         for id in &pending {
             if let Some(&idx) = self.node_map.get(id) {
                 let content = self.graph[idx].content.clone();
@@ -414,22 +418,31 @@ impl GraphEngine {
                 self.embeddings.insert(id.clone(), emb);
             }
         }
+        log::info!("enrich_all[perf] embed+persist: {} nodes in {:?}", pending.len(), t_emb.elapsed());
+
+        // 阶段2:auto_link 建边
+        let t_link = std::time::Instant::now();
         let mut edges = 0;
         for id in &pending {
             if let Ok(es) = self.auto_link(id, 5) {
                 edges += es.len();
             }
         }
+        log::info!("enrich_all[perf] auto_link: {} edges in {:?}", edges, t_link.elapsed());
 
+        // 阶段3:embedding 相似度去重
         // 补完 embedding 后:跑 embedding 相似度去重
         // 修复两阶段导入的设计缺口:导入时跳过 embedding 去重(raw 入库),
         // 模型就绪后这里补上——三源导入的近似重复(sim>=0.85)被自动合并
+        let t_dedup = std::time::Instant::now();
+        let total_emb = self.embeddings.len();
         let deduped = self.dedup_embeddings(0.85);
+        log::info!("enrich_all[perf] dedup_embeddings: removed {} / {} embeddings in {:?}", deduped, total_emb, t_dedup.elapsed());
         if deduped > 0 {
             log::info!("enrich_all: dedup removed {} near-duplicates (sim>=0.85)", deduped);
         }
 
-        log::info!("enrich_all done: {} embeddings, {} edges, {} deduped", pending.len(), edges, deduped);
+        log::info!("enrich_all done: {} embeddings, {} edges, {} deduped in {:?}", pending.len(), edges, deduped, t_start.elapsed());
         Ok((pending.len(), edges))
     }
 
@@ -439,10 +452,13 @@ impl GraphEngine {
     fn dedup_embeddings(&mut self, threshold: f32) -> usize {
         // 收集所有 (id, embedding) 对,算相似度
         let ids: Vec<String> = self.embeddings.keys().cloned().collect();
+        let t_pairs = std::time::Instant::now();
         let mut to_merge: Vec<(String, String, f32)> = Vec::new(); // (keep, merge, sim)
+        let mut pairs_checked = 0u64;
 
         for i in 0..ids.len() {
             for j in (i+1)..ids.len() {
+                pairs_checked += 1;
                 let a = &self.embeddings[&ids[i]];
                 let b = &self.embeddings[&ids[j]];
                 let sim = Self::cosine_sim(a, b);
@@ -455,10 +471,12 @@ impl GraphEngine {
                 }
             }
         }
+        log::info!("dedup_embeddings[perf] pairs: {} checked, {} to_merge in {:?}", pairs_checked, to_merge.len(), t_pairs.elapsed());
 
         if to_merge.is_empty() { return 0; }
 
         // 贪心合并:跳过已删的
+        let t_merge = std::time::Instant::now();
         let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut count = 0;
         for (keep, merge, sim) in &to_merge {
@@ -505,6 +523,7 @@ impl GraphEngine {
             count += 1;
             log::info!("dedup: merged {} into {} (sim={:.3})", &merge[..merge.len().min(12)], &keep[..keep.len().min(12)], sim);
         }
+        log::info!("dedup_embeddings[perf] merge phase: {} merged in {:?}", count, t_merge.elapsed());
         count
     }
 

@@ -308,26 +308,45 @@ pub fn import_all(engine: &mut GraphEngine) -> serde_json::Value {
 /// 导入所有来源。enrich=true 时,导入后立即补 embedding + auto_link 建边。
 /// (模型未就绪时 enrich 无效,节点先 raw 入库,待模型就绪后由 enrich_all 补全)
 pub fn import_all_with_opts(engine: &mut GraphEngine, enrich: bool) -> serde_json::Value {
+    let t_start = std::time::Instant::now();
     let mut grand_total = 0;
     let mut all_errors: Vec<String> = Vec::new();
     let mut sources = serde_json::json!({});
 
-    for r in [import_hermes(engine), import_claude(engine), import_codex(engine)] {
-        grand_total += r.total;
-        all_errors.extend(r.errors.into_iter().take(20).map(|e| format!("{}: {}", r.source, e)));
-        sources[r.source] = serde_json::json!({ "nodes": r.total });
-    }
+    let t_hermes = std::time::Instant::now();
+    let r_h = import_hermes(engine);
+    log::info!("import_all[perf] hermes: {} nodes, {} errors in {:?}", r_h.total, r_h.errors.len(), t_hermes.elapsed());
+    grand_total += r_h.total;
+    all_errors.extend(r_h.errors.into_iter().take(20).map(|e| format!("hermes: {}", e)));
+    sources["hermes"] = serde_json::json!({ "nodes": r_h.total });
+
+    let t_claude = std::time::Instant::now();
+    let r_c = import_claude(engine);
+    log::info!("import_all[perf] claude: {} nodes, {} errors in {:?}", r_c.total, r_c.errors.len(), t_claude.elapsed());
+    grand_total += r_c.total;
+    all_errors.extend(r_c.errors.into_iter().take(20).map(|e| format!("claude: {}", e)));
+    sources["claude"] = serde_json::json!({ "nodes": r_c.total });
+
+    let t_codex = std::time::Instant::now();
+    let r_x = import_codex(engine);
+    log::info!("import_all[perf] codex: {} nodes, {} errors in {:?}", r_x.total, r_x.errors.len(), t_codex.elapsed());
+    grand_total += r_x.total;
+    all_errors.extend(r_x.errors.into_iter().take(20).map(|e| format!("codex: {}", e)));
+    sources["codex"] = serde_json::json!({ "nodes": r_x.total });
 
     let mut enriched = serde_json::json!({"embeddings": 0, "edges": 0});
     if enrich {
+        let t_enrich = std::time::Instant::now();
         match engine.enrich_all() {
             Ok((embs, edges)) => {
                 enriched = serde_json::json!({"embeddings": embs, "edges": edges});
+                log::info!("import_all[perf] enrich_all: {} embs, {} edges in {:?}", embs, edges, t_enrich.elapsed());
             }
             Err(e) => all_errors.push(format!("enrich: {}", e)),
         }
     }
 
+    log::info!("import_all[perf] total: {} nodes in {:?}", grand_total, t_start.elapsed());
     serde_json::json!({
         "total_nodes": grand_total,
         "sources": sources,
