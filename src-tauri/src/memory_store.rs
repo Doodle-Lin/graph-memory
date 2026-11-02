@@ -85,11 +85,14 @@ impl MemoryStore {
         Ok(serde_json::from_str(&text)?)
     }
     fn list(&self, project: Option<&str>, query: &str) -> ApiResult<Vec<Memory>> {
+        self.list_scoped(project, query, false)
+    }
+    fn list_scoped(&self, project: Option<&str>, query: &str, all: bool) -> ApiResult<Vec<Memory>> {
         if let Some(p) = project {
             self.project_exists(p)?;
         }
-        let mut st=self.db.prepare("SELECT body FROM work_memories WHERE memory_scope='personal' OR (memory_scope='project' AND project_id=?1)")?;
-        let rows = st.query_map([project], |r| r.get::<_, String>(0))?;
+        let mut st=self.db.prepare("SELECT body FROM work_memories WHERE ?2 OR memory_scope='personal' OR (memory_scope='project' AND project_id=?1)")?;
+        let rows = st.query_map(params![project, all], |r| r.get::<_, String>(0))?;
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let mut result = Vec::new();
         for row in rows {
@@ -102,6 +105,103 @@ impl MemoryStore {
         }
         result.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
         Ok(result)
+    }
+    fn search(&self, body: &Value) -> ApiResult<Value> {
+        fn string<'a>(body: &'a Value, key: &str, default: &'a str) -> ApiResult<&'a str> {
+            match body.get(key) {
+                None => Ok(default),
+                Some(Value::String(s)) => Ok(s),
+                _ => Err(ApiError(400, format!("{key} must be a string"))),
+            }
+        }
+        fn number(body: &Value, key: &str) -> ApiResult<Option<usize>> {
+            body.get(key)
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|v| usize::try_from(v).ok())
+                        .ok_or_else(|| {
+                            ApiError(400, format!("{key} must be a nonnegative integer"))
+                        })
+                })
+                .transpose()
+        }
+        let scope = string(body, "scope", "current")?;
+        let project = string(body, "project_id", "")?;
+        if !matches!(scope, "current" | "project" | "personal" | "all")
+            || (scope == "project" && project.is_empty())
+            || (matches!(scope, "personal" | "all") && !project.is_empty())
+        {
+            return Err(ApiError(400, "scope must be current, project (requires project_id), personal or all (without project_id)".into()));
+        }
+        let field = string(body, "date_field", "updated_at")?;
+        if !matches!(field, "created_at" | "updated_at") {
+            return Err(ApiError(
+                400,
+                "date_field must be created_at or updated_at".into(),
+            ));
+        }
+        let parse_bound = |key: &str| -> ApiResult<Option<chrono::DateTime<chrono::FixedOffset>>> {
+            if body.get(key).is_none() {
+                return Ok(None);
+            }
+            chrono::DateTime::parse_from_rfc3339(string(body, key, "")?)
+                .map(Some)
+                .map_err(|_| ApiError(400, format!("{key} must be RFC3339 with timezone")))
+        };
+        let from = parse_bound("from")?;
+        let to = parse_bound("to")?;
+        if from.zip(to).is_some_and(|(a, b)| a >= b) {
+            return Err(ApiError(400, "from must be earlier than to".into()));
+        }
+        let limit = number(body, "limit")?;
+        if limit.is_some_and(|n| n == 0 || n > 500) {
+            return Err(ApiError(400, "limit must be between 1 and 500".into()));
+        }
+        let offset = number(body, "offset")?.unwrap_or(0);
+        let kind = string(body, "kind", "")?;
+        let query = string(body, "query", "")?;
+        let mut dated = Vec::new();
+        for memory in self.list_scoped(
+            if project.is_empty() {
+                None
+            } else {
+                Some(project)
+            },
+            query,
+            scope == "all",
+        )? {
+            if (scope == "project" && memory.memory_scope != "project")
+                || (scope == "personal" && memory.memory_scope != "personal")
+                || (!kind.is_empty() && memory.kind != kind)
+            {
+                continue;
+            }
+            let date = chrono::DateTime::parse_from_rfc3339(if field == "created_at" {
+                &memory.created_at
+            } else {
+                &memory.updated_at
+            })
+            .map_err(|_| ApiError(500, "stored memory timestamp is invalid".into()))?;
+            if from.is_some_and(|f| date < f) || to.is_some_and(|t| date >= t) {
+                continue;
+            }
+            dated.push((date, memory));
+        }
+        dated.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+        let total = dated.len();
+        let memories: Vec<_> = dated
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|(_, m)| m)
+            .collect();
+        let end = offset.saturating_add(memories.len());
+        let next = if end < total { Some(end) } else { None };
+        Ok(
+            json!({"memories":memories,"total":total,"offset":offset,"next_offset":next,"truncated":next.is_some(),
+            "filters":{"scope":scope,"project_id":if project.is_empty(){None}else{Some(project)},"query":query,"kind":kind,"date_field":field,"from":from,"to":to},
+            "time_semantics":"record timestamps, not occurrence dates; from inclusive, to exclusive; latest versions only"}),
+        )
     }
     pub fn route(&mut self, method: &str, path: &str, body: Value) -> ApiResult<Value> {
         match (method, path) {
@@ -166,11 +266,7 @@ impl MemoryStore {
                 Ok(json!({"id":id,"name":name,"directory":directory,"existing":false}))
             }
             ("POST", "/api/v1/memories") => self.create(body),
-            ("POST", "/api/v1/search") => {
-                let project = body["project_id"].as_str();
-                let query = body["query"].as_str().unwrap_or("");
-                Ok(json!({"memories":self.list(project,query)?}))
-            }
+            ("POST", "/api/v1/search") => self.search(&body),
             ("POST", "/api/v1/context") => {
                 let project = body["project_id"].as_str();
                 let all = self.list(project, "")?;
@@ -372,6 +468,127 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_filters_dates_scopes_and_pages() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = store
+            .route("POST", "/api/v1/projects", json!({"name":"Alpha"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let beta = store
+            .route("POST", "/api/v1/projects", json!({"name":"Beta"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (id, scope, project, created, updated) in [
+            (
+                "a",
+                "project",
+                Some(alpha.as_str()),
+                "2026-10-01T00:00:00+08:00",
+                "2026-11-01T00:00:00+08:00",
+            ),
+            (
+                "b",
+                "project",
+                Some(beta.as_str()),
+                "2026-10-31T16:00:00Z",
+                "2026-10-31T16:00:00Z",
+            ),
+            (
+                "p",
+                "personal",
+                None,
+                "2026-10-30T00:00:00Z",
+                "2026-10-30T00:00:00Z",
+            ),
+        ] {
+            let record = Memory {
+                id: id.into(),
+                version: 1,
+                memory_scope: scope.into(),
+                project_id: project.map(str::to_owned),
+                title: "Review".into(),
+                content: "release lesson".into(),
+                kind: if id == "p" { "note" } else { "decision" }.into(),
+                source: "fixture".into(),
+                conditions: "test".into(),
+                evidence_type: "statement".into(),
+                origin_memory_id: None,
+                created_at: created.into(),
+                updated_at: updated.into(),
+            };
+            store
+                .db
+                .execute(
+                    "INSERT INTO work_memories VALUES(?,?,?,?)",
+                    params![id, scope, project, serde_json::to_string(&record).unwrap()],
+                )
+                .unwrap();
+        }
+        let search = |body| store.search(&body).unwrap();
+        assert_eq!(search(json!({}))["total"], 1);
+        assert_eq!(search(json!({"project_id":alpha}))["total"], 2);
+        assert_eq!(
+            search(json!({"scope":"project","project_id":alpha}))["memories"][0]["id"],
+            "a"
+        );
+        let october = search(
+            json!({"scope":"all","date_field":"created_at","from":"2026-10-01T00:00:00+08:00","to":"2026-11-01T00:00:00+08:00"}),
+        );
+        assert_eq!(october["total"], 2); // inclusive start, exclusive end, offset-aware
+        assert_eq!(
+            search(
+                json!({"scope":"all","date_field":"updated_at","from":"2026-10-01T00:00:00+08:00","to":"2026-11-01T00:00:00+08:00"})
+            )["total"],
+            1
+        );
+        let first = search(json!({"scope":"all","limit":1}));
+        assert_eq!(first["total"], 3);
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(first["memories"][0]["id"], "a"); // same instant, deterministic id tie break
+        let second = search(json!({"scope":"all","limit":1,"offset":1}));
+        assert_eq!(second["memories"][0]["id"], "b");
+        assert_eq!(
+            search(json!({"scope":"all","limit":1,"offset":2}))["next_offset"],
+            Value::Null
+        );
+        assert_eq!(
+            search(json!({"scope":"all","offset":999}))["memories"],
+            json!([])
+        );
+        assert_eq!(
+            search(json!({"scope":"all","kind":"decision","query":"release"}))["total"],
+            2
+        );
+        assert_eq!(search(json!({"scope":"all","query":"missing"}))["total"], 0);
+        for bad in [
+            json!({"scope":"project"}),
+            json!({"scope":"all","project_id":alpha}),
+            json!({"scope":"personal","project_id":alpha}),
+            json!({"scope":"oops"}),
+            json!({"from":"2026-10-01"}),
+            json!({"from":"2026-11-01T00:00:00Z","to":"2026-10-01T00:00:00Z"}),
+            json!({"limit":0}),
+            json!({"limit":501}),
+            json!({"offset":-1}),
+            json!({"date_field":"occurred_at"}),
+            json!({"query":3}),
+            json!({"from":null}),
+        ] {
+            assert_eq!(store.search(&bad).unwrap_err().0, 400, "{bad}");
+        }
+        assert_eq!(
+            store
+                .search(&json!({"scope":"project","project_id":"missing"}))
+                .unwrap_err()
+                .0,
+            404
+        );
+    }
     #[test]
     fn context_reports_truncation_instead_of_silently_returning_entire_corpus() {
         let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
