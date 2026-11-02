@@ -35,3 +35,9 @@ src-tauri/Cargo.lock
 src-tauri/*.log
 src-tauri/app_stderr.txt
 src-tauri/app_stdout.txt
+
+# Avalonia build output
+desktop/**/bin/
+desktop/**/obj/
+
+artifacts/

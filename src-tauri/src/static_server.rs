@@ -9,6 +9,8 @@ use crate::engine::GraphEngine;
 
 #[derive(Clone)]
 pub struct ModelState {
+    pub memory_store: Option<Arc<Mutex<crate::memory_store::MemoryStore>>>,
+    pub service_info: Option<Arc<serde_json::Value>>,
     pub downloading: Arc<AtomicBool>,
     pub done: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
@@ -21,6 +23,8 @@ pub struct ModelState {
 impl ModelState {
     pub fn new() -> Self {
         Self {
+            service_info: None,
+            memory_store: None,
             downloading: Arc::new(AtomicBool::new(false)),
             done: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
@@ -375,6 +379,68 @@ fn handle_refine(stream: &mut TcpStream, eng: &EngineHandle) -> bool {
     true
 }
 
+/// /api/import:只做 raw 入库(毫秒级),enrich 异步触发。
+/// 修前:import 在 HTTP handler 内同步 enrich_all,大图上持单 Mutex 10 分钟,
+/// 饿死所有 agent API(/api/health /write /retrieve 全超时)。
+/// 修后:import 只持锁跑三个 importer(写 SQLite+FTS5,实测 ~250ms),
+/// 释放锁后立即返回;若 embedder 就绪,后台线程异步 enrich_all 补边+去重。
+/// 不撤销 cb5b7a5 的去重意图 —— 去重仍在 enrich_all 里跑,只是不在 import 请求内同步跑。
+/// 这也回到 ARCHITECTURE §2.3 的两阶段导入本意:导入立刻可见,模型就绪后后台补全。
+fn handle_import(
+    stream: &mut TcpStream, raw_query: &str, _body: serde_json::Value, eng: &EngineHandle,
+) -> bool {
+    let source = parse_query_str(raw_query, "source", "all").to_string();
+    let enrich_ready;
+    let result = {
+        let mut e = eng.engine.lock().unwrap();
+        enrich_ready = e.embedder_ready();
+        match source.as_str() {
+            "all" => crate::importer::import_all_with_opts(&mut e, false),
+            "hermes" => {
+                let r = crate::importer::import_hermes(&mut e);
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "sources": serde_json::json!({"hermes": r.total}),
+                    "message": format!("导入 {} 个节点", r.total)})
+            }
+            "claude" => {
+                let r = crate::importer::import_claude(&mut e);
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "sources": serde_json::json!({"claude": r.total}),
+                    "message": format!("导入 {} 个节点", r.total)})
+            }
+            "codex" => {
+                let r = crate::importer::import_codex(&mut e);
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "sources": serde_json::json!({"codex": r.total}),
+                    "message": format!("导入 {} 个节点", r.total)})
+            }
+            other => {
+                send_err(stream, 400, &format!("unknown source: {} (支持 all/hermes/claude/codex)", other));
+                return true;
+            }
+        }
+    }; // 锁释放 —— import 请求毫秒级返回
+
+    // embedder 就绪:后台异步 enrich(不持请求锁,不阻塞 agent API)。
+    // 失败只记日志,enrich 结果前端可通过 /api/stats 轮询 edge_count 观察。
+    if enrich_ready {
+        let eng = eng.clone();
+        std::thread::spawn(move || {
+            log::info!("[import] async enrich started after import");
+            let mut e = eng.engine.lock().unwrap();
+            match e.enrich_all() {
+                Ok((embs, edges)) => log::info!("[import] async enrich done: {} embs, {} edges", embs, edges),
+                Err(e) => log::warn!("[import] async enrich failed: {}", e),
+            }
+        });
+    } else {
+        log::info!("[import] embedder not ready, enrich deferred to model-load");
+    }
+
+    send_json(stream, result);
+    true
+}
+
 /// 处理引擎 API。返回 true 表示命中并已响应,false 表示不是引擎 API(走静态文件)。
 fn handle_engine_api(
     stream: &mut TcpStream, method: &str, clean: &str, raw_query: &str,
@@ -385,6 +451,15 @@ fn handle_engine_api(
     // 提前返回,在函数体内自行管理锁的获取/释放
     if clean == "/api/refine" && method == "POST" {
         return handle_refine(stream, eng);
+    }
+
+    // /api/import 特殊处理:import 本身(三个 importer 写 SQLite+FTS5)是毫秒级,
+    // 但紧随其后的 enrich_all(embed+auto_link+O(N²) dedup)在大图上是分钟级,
+    // 全程持有单 Mutex 会饿死所有 agent API(实测一次 import 持锁 10 分钟,
+    // /api/health /write /retrieve 全部超时)。所以 import 只在锁内做 raw 入库,
+    // 锁释放后异步触发 enrich,请求立刻返回。
+    if clean == "/api/import" && method == "POST" {
+        return handle_import(stream, raw_query, body, eng);
     }
 
     let mut e = eng.engine.lock().unwrap();
@@ -403,10 +478,8 @@ fn handle_engine_api(
     // A4 修复:/api/graph 快照序列化(200KB+)不持锁
     // 先 clone 数据再释放锁,序列化在锁外做
     if clean == "/api/graph" && method == "GET" {
-        let snapshot = {
-            let e = eng.engine.lock().unwrap();
-            e.graph_snapshot()
-        }; // 锁释放
+        let snapshot = e.graph_snapshot();
+        drop(e);
         send_json(stream, snapshot);
         return true;
     }
@@ -532,42 +605,25 @@ fn handle_engine_api(
         return true;
     }
     if clean == "/api/import" && method == "POST" {
+        // 现由 handle_import 提前处理(见函数入口),这里不会到达。
+        // 保留分支以防逻辑改动后回到这里 —— 但 enrich 不再在请求内同步跑。
         let source = parse_query_str(raw_query, "source", "all").to_string();
-        let enrich = e.embedder_ready();
         let result = match source.as_str() {
-            "all" => crate::importer::import_all_with_opts(&mut e, enrich),
+            "all" => crate::importer::import_all_with_opts(&mut e, false),
             "hermes" => {
                 let r = crate::importer::import_hermes(&mut e);
-                let mut j = serde_json::json!({"total_nodes": r.total, "errors": r.errors,
-                    "message": format!("导入 {} 个节点", r.total)});
-                if enrich {
-                    if let Ok((embs, edges)) = e.enrich_all() {
-                        j["enrich"] = serde_json::json!({"embeddings": embs, "edges": edges});
-                    }
-                }
-                j
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "message": format!("导入 {} 个节点", r.total)})
             }
             "claude" => {
                 let r = crate::importer::import_claude(&mut e);
-                let mut j = serde_json::json!({"total_nodes": r.total, "errors": r.errors,
-                    "message": format!("导入 {} 个节点", r.total)});
-                if enrich {
-                    if let Ok((embs, edges)) = e.enrich_all() {
-                        j["enrich"] = serde_json::json!({"embeddings": embs, "edges": edges});
-                    }
-                }
-                j
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "message": format!("导入 {} 个节点", r.total)})
             }
             "codex" => {
                 let r = crate::importer::import_codex(&mut e);
-                let mut j = serde_json::json!({"total_nodes": r.total, "errors": r.errors,
-                    "message": format!("导入 {} 个节点", r.total)});
-                if enrich {
-                    if let Ok((embs, edges)) = e.enrich_all() {
-                        j["enrich"] = serde_json::json!({"embeddings": embs, "edges": edges});
-                    }
-                }
-                j
+                serde_json::json!({"total_nodes": r.total, "errors": r.errors,
+                    "message": format!("导入 {} 个节点", r.total)})
             }
             other => {
                 send_err(stream, 400, &format!("unknown source: {}", other));
@@ -643,11 +699,17 @@ fn handle_engine_api(
     false
 }
 
-fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&EngineHandle>) {
+fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: Option<&EngineHandle>) {
     let req = match read_full_request(&mut stream) {
         Some(r) => r,
         None => return,
     };
+    // Native-only service: browsers must not mutate the local database via cross-origin forms.
+    if root.is_none() && req.lines().take_while(|line| !line.is_empty())
+        .any(|line| line.to_ascii_lowercase().starts_with("origin:")) {
+        send_err(&mut stream, 403, "browser origins are not accepted by the native service");
+        return;
+    }
     let first_line = req.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
@@ -656,6 +718,27 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         Some((c, q)) => (c, q),
         None => (raw_path, ""),
     };
+    if clean == "/api/service" && method == "GET" {
+        if let Some(info) = &state.service_info {
+            send_json(&mut stream, (**info).clone());
+            return;
+        }
+    }
+    if clean.starts_with("/api/v1/") {
+        if let Some(store) = &state.memory_store {
+            match store.lock().unwrap().route(method, clean, parse_json_body(&req)) {
+                Ok(value) => send_json(&mut stream, value),
+                Err(error) => send_err(&mut stream, error.0, &error.1),
+            }
+            return;
+        }
+    }
+    if root.is_none() && !matches!((method, clean),
+        ("GET", "/api/health" | "/api/stats" | "/api/graph" | "/api/recent" | "/api/model_status") |
+        ("POST", "/api/write" | "/api/retrieve")) {
+        send_err(&mut stream, 404, "endpoint not enabled in experimental service");
+        return;
+    }
     log::info!("HTTP {} {}", method, raw_path);
 
     // ── 前端日志上报(诊断用) ──
@@ -801,6 +884,10 @@ fn handle(mut stream: TcpStream, root: &Path, state: &ModelState, eng: Option<&E
         let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         return;
     }
+    let Some(root) = root else {
+        send_err(&mut stream, 404, "API-only service has no frontend");
+        return;
+    };
     let full: PathBuf = root.join(rel);
     match std::fs::read(&full) {
         Ok(body) => {
@@ -903,11 +990,25 @@ pub fn start_with_engine(root: PathBuf, state: ModelState, engine: Option<Engine
                     let r = root.clone();
                     let st = state.clone();
                     let eng = engine.clone();
-                    std::thread::spawn(move || handle(s, &r, &st, eng.as_ref()));
+                    std::thread::spawn(move || handle(s, Some(&r), &st, eng.as_ref()));
                 }
                 Err(e) => log::warn!("accept error: {}", e),
             }
         }
     });
     Some(port)
+}
+
+
+/// API-only listener. Caller retains the data-directory lock.
+pub fn serve_api(listener: TcpListener, state: ModelState, engine: EngineHandle) -> std::io::Result<()> {
+    for connection in listener.incoming() {
+        let stream = connection?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let state = state.clone();
+        let engine = engine.clone();
+        std::thread::spawn(move || handle(stream, None, &state, Some(&engine)));
+    }
+    Ok(())
 }

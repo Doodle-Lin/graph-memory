@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.3.22" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.22" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.22" />
+  </ItemGroup>
+  <Target Name="CopyMemoryService" AfterTargets="Build" Condition="Exists('../../src-tauri/target/debug/graph-memory-service.exe')">
+    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="PublishMemoryService" AfterTargets="Publish">
+    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

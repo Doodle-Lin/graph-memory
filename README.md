@@ -1,5 +1,7 @@
 # Graph Memory
 
+> **Avalonia 开发版**：新桌面以 MCP 自动检索/沉淀为主流程，支持项目隔离、独立个人经验与版本纠正。见 [构建及接入说明](desktop/README.md)。新工作库暂不迁移旧数据，仅关键词检索；以下介绍仍适用于旧图谱桌面版。
+
 > 本地知识图谱记忆系统 — 一个桌面常驻的记忆网关，让 AI agent（Claude Code / Codex / Hermes）跨会话检索和写入同一张知识图谱，不用从头交代。
 
 **English:** Graph Memory is a local knowledge-graph memory gateway. Agents read/write a shared graph via MCP tools, so knowledge captured in one session is reachable in every other. Runs locally — embeddings are a local BGE-Small-ZH model, the graph is SQLite + FTS5, and the LLM is only used (optionally) for knowledge extraction.

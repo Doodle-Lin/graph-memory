@@ -1,0 +1,30 @@
+{
+  "observed_date": "2026-11-02",
+  "scope": "actual working tree, including existing uncommitted changes",
+  "files": [
+    {
+      "path": "src-tauri/src/lib.rs",
+      "sha256": "58435dcd52de3d1bd62dbb5bd9e994c4e3141b44d1d746e55dc3d7a7eccebac2"
+    },
+    {
+      "path": "src-tauri/src/static_server.rs",
+      "sha256": "f491adbbd607e74b210d01d83d2a80b4ce5bf3c292411a2ac73d61f1efdc43e6"
+    },
+    {
+      "path": "src-tauri/src/engine.rs",
+      "sha256": "128462104e5d567c085aeaa72ecb9e534248e3636c9b56e7d6b440f229493145"
+    },
+    {
+      "path": "src-tauri/src/importer.rs",
+      "sha256": "8e5551436b94760bd9ef571e02963bca11c238ceca937fd366b95abe81021066"
+    },
+    {
+      "path": "src-tauri/src/bin/mcp_server.rs",
+      "sha256": "738dd2dda38e6350eab5466e9352e41b1a90466f7e5c4be0fa3613356eaef7bc"
+    },
+    {
+      "path": "src-tauri/Cargo.toml",
+      "sha256": "990de2e7a44b67a6371cbd1bcff22a760427b87a17c0ff9ce6dcf4b6becc24c9"
+    }
+  ]
+}

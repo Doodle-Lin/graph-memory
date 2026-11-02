@@ -12,12 +12,25 @@ default-run = "graph-memory"
 name = "graph_memory_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = ["desktop"]
+desktop = ["dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-build"]
+
+[[bin]]
+name = "graph-memory"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "graph-memory-service"
+path = "src/bin/service.rs"
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-shell = "2"
+tauri = { version = "2", features = ["tray-icon"], optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

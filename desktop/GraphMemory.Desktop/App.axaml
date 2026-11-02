@@ -1,0 +1,106 @@
+<Application xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Class="GraphMemory.Desktop.App" RequestedThemeVariant="Light">
+  <Application.Resources>
+    <Thickness x:Key="ExpanderHeaderBorderThickness">0</Thickness>
+    <Thickness x:Key="ExpanderContentDownBorderThickness">0</Thickness>
+    <Thickness x:Key="ExpanderContentUpBorderThickness">0</Thickness>
+    <Thickness x:Key="ExpanderContentLeftBorderThickness">0</Thickness>
+    <Thickness x:Key="ExpanderContentRightBorderThickness">0</Thickness>
+    <Thickness x:Key="ExpanderHeaderPadding">10,0,0,0</Thickness>
+    <Thickness x:Key="ExpanderContentPadding">0,10,0,0</Thickness>
+    <SolidColorBrush x:Key="ExpanderHeaderBackground">Transparent</SolidColorBrush>
+    <SolidColorBrush x:Key="CanvasBrush">#f5f5f3</SolidColorBrush>
+    <SolidColorBrush x:Key="SurfaceBrush">#fcfcfb</SolidColorBrush>
+    <SolidColorBrush x:Key="SubtleBrush">#efefed</SolidColorBrush>
+    <SolidColorBrush x:Key="InkBrush">#292b29</SolidColorBrush>
+    <SolidColorBrush x:Key="MutedBrush">#686c68</SolidColorBrush>
+    <SolidColorBrush x:Key="AccentBrush">#27634a</SolidColorBrush>
+  </Application.Resources>
+  <Application.Styles>
+    <FluentTheme />
+    <Style Selector="Window">
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI" />
+      <Setter Property="FontSize" Value="14" />
+      <Setter Property="Foreground" Value="{DynamicResource InkBrush}" />
+    </Style>
+    <Style Selector="TextBox">
+      <Setter Property="Padding" Value="12,10" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="FocusAdorner" Value="{x:Null}" />
+      <Setter Property="Foreground" Value="{DynamicResource InkBrush}" />
+    </Style>
+    <Style Selector="TextBox /template/ Border#PART_BorderElement">
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Background" Value="{DynamicResource SubtleBrush}" />
+    </Style>
+    <Style Selector="TextBox:pointerover /template/ Border#PART_BorderElement">
+      <Setter Property="Background" Value="#e9e9e7" />
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+      <Setter Property="BoxShadow" Value="inset 0 0 0 1 #8027634a, inset 0 0 0 3 #2027634a" />
+    </Style>
+    <Style Selector="Button">
+      <Setter Property="Padding" Value="14,9" />
+      <Setter Property="MinHeight" Value="38" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Background" Value="{DynamicResource SubtleBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource InkBrush}" />
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#e5e5e2" />
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#dcded9" />
+    </Style>
+    <Style Selector="Button.scopeSelected">
+      <Setter Property="Background" Value="#e0e8e1" />
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource SurfaceBrush}" />
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#21573f" />
+      <Setter Property="Foreground" Value="{DynamicResource SurfaceBrush}" />
+    </Style>
+    <Style Selector="Button.primary:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#1d4d38" />
+      <Setter Property="Foreground" Value="{DynamicResource SurfaceBrush}" />
+    </Style>
+    <Style Selector="ComboBox">
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Background" Value="{DynamicResource SubtleBrush}" />
+      <Setter Property="Padding" Value="12,9" />
+    </Style>
+    <Style Selector="Expander">
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+      <Setter Property="MinHeight" Value="38" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="Expander /template/ ToggleButton#ExpanderHeader">
+      <Setter Property="FocusAdorner" Value="{x:Null}" />
+    </Style>
+    <Style Selector="Expander /template/ ToggleButton#ExpanderHeader:focus-visible /template/ Border#ToggleButtonBackground">
+      <Setter Property="BoxShadow" Value="inset 0 0 0 1 #8027634a, inset 0 0 0 3 #2027634a" />
+    </Style>
+    <Style Selector="ListBox">
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="ListBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Padding" Value="12,10" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+    <Style Selector="ListBoxItem:selected /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#e0e8e1" />
+      <Setter Property="Foreground" Value="{DynamicResource InkBrush}" />
+    </Style>
+  </Application.Styles>
+</Application>

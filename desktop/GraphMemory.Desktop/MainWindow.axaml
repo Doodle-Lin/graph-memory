@@ -1,0 +1,63 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Class="GraphMemory.Desktop.MainWindow" Title="Graph Memory" Width="1160" Height="780" MinWidth="900" MinHeight="620" Background="{DynamicResource CanvasBrush}">
+<Grid RowDefinitions="Auto,*">
+ <Border Background="{DynamicResource CanvasBrush}" Padding="24,16"><Grid ColumnDefinitions="*,Auto"><TextBlock Text="Graph Memory" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource InkBrush}"/></Grid></Border>
+ <Grid Grid.Row="1" ColumnDefinitions="210,*">
+  <Border Background="{DynamicResource SubtleBrush}" Padding="18"><ScrollViewer HorizontalScrollBarVisibility="Disabled"><StackPanel Spacing="12">
+   <Button x:Name="PersonalButton" Classes="scopeSelected" Content="个人经验" Click="PersonalClick" HorizontalAlignment="Stretch"/>
+   <TextBlock x:Name="ProjectHeading" IsVisible="False" Text="项目" FontWeight="SemiBold" Margin="0,16,0,0"/>
+   <ListBox x:Name="Projects" SelectionChanged="ProjectChanged" MaxHeight="220" IsVisible="False" Background="Transparent"/>
+   <Expander Header="添加项目"><StackPanel Spacing="8"><TextBox x:Name="ProjectName" Watermark="项目名称"/><Button Content="创建" Click="CreateProjectClick"/></StackPanel></Expander>
+   <Expander x:Name="AgentSetup" Header="Agent 接入"><StackPanel Spacing="8"><TextBlock Text="首次复制配置到 Agent。之后工具可自动启动服务，无需先打开此窗口。" TextWrapping="Wrap" FontSize="12"/><ComboBox x:Name="ConfigFormat" SelectedIndex="0"><ComboBoxItem Content="通用 JSON"/><ComboBoxItem Content="Codex TOML"/></ComboBox><Button x:Name="CopyConfigButton" Content="复制接入配置" Click="CopyConfigClick"/><Button x:Name="CopyInstructionsButton" Content="复制记忆使用说明" Click="CopyInstructionsClick"/></StackPanel></Expander>
+   <Expander Header="手动备用"><StackPanel Spacing="8"><TextBlock Text="仅用于不支持 MCP 的工具。" TextWrapping="Wrap" FontSize="12"/><Button Content="准备复制背景" Click="ContextClick"/></StackPanel></Expander>
+  </StackPanel></ScrollViewer></Border>
+  <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="26,22">
+   <StackPanel Spacing="6"><TextBlock x:Name="ScopeTitle" Text="个人经验" FontSize="26" Foreground="{DynamicResource InkBrush}"/><TextBlock x:Name="ScopeHint" Text="踩过的坑、学到的方法，不必属于某个项目。" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/></StackPanel>
+   <Border Grid.Row="1" Background="{DynamicResource SurfaceBrush}" CornerRadius="8" Padding="16" Margin="0,18,0,0"><Grid ColumnDefinitions="*,Auto"><StackPanel Spacing="6"><TextBlock x:Name="AgentStatus" Text="正在检查记忆服务…" FontWeight="SemiBold"/><TextBlock x:Name="AgentDetail" Text="Agent 负责检索与记录，这里查看和纠正记忆。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel><Button Grid.Column="1" Content="接入 Agent" Click="AgentSetupClick" Classes="primary" Margin="16,0,0,0" VerticalAlignment="Center"/></Grid></Border>
+   <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,22,0,18">
+    <TextBox x:Name="Query" Watermark="搜索记忆"/>
+    <Button Grid.Column="1" Content="搜索" Click="SearchClick" Margin="8,0,0,0"/>
+    <Button x:Name="NewMemoryButton" Grid.Column="2" Content="记一条" Click="NewClick" Margin="8,0,0,0"/>
+    <Button Grid.Column="3" Content="刷新记忆" Click="RefreshClick" Margin="8,0,0,0"/>
+   </Grid>
+   <Grid Grid.Row="3">
+    <Grid x:Name="HomePanel" RowDefinitions="Auto,Auto,*">
+     <Border x:Name="ContextPanel" IsVisible="False" Background="{DynamicResource SurfaceBrush}" CornerRadius="8" Padding="20" Margin="0,0,0,20">
+      <StackPanel Spacing="12">
+       <Grid ColumnDefinitions="*,Auto"><TextBlock Text="背景已准备好" FontSize="18" VerticalAlignment="Center"/><Button Grid.Column="1" x:Name="CopyContextButton" Content="复制并用于新会话" Click="CopyClick" Classes="primary" MinWidth="180"/></Grid>
+       <Expander Header="查看背景"><TextBox x:Name="ContextText" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="180"/></Expander>
+      </StackPanel>
+     </Border>
+     <TextBlock Grid.Row="1" x:Name="ListHeading" Text="最近记忆" FontSize="18" Margin="0,0,0,14"/>
+     <Grid Grid.Row="3">
+      <ListBox x:Name="Memories" SelectionChanged="MemoryChanged" Background="Transparent">
+       <ListBox.ItemTemplate><DataTemplate><StackPanel Spacing="8" Margin="0,8"><TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"/><TextBlock Text="{Binding Preview}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding ScopeLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel></DataTemplate></ListBox.ItemTemplate>
+      </ListBox>
+      <StackPanel x:Name="EmptyState" IsVisible="False" Spacing="10" Margin="12,24" IsHitTestVisible="False"><TextBlock x:Name="EmptyHeading" Text="还没有记忆" FontSize="18"/><TextBlock x:Name="EmptyHint" Text="接入 Agent 后，记忆会在工具调用时沉淀；也可以手动记一条。" Foreground="{DynamicResource MutedBrush}"/></StackPanel>
+     </Grid>
+    </Grid>
+    <Border x:Name="EditorPanel" IsVisible="False" Background="{DynamicResource SurfaceBrush}" CornerRadius="10" Padding="24">
+     <Grid RowDefinitions="Auto,*,Auto">
+      <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,18"><TextBlock x:Name="EditorHeading" Text="记一条个人经验" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/><Button Grid.Column="1" Content="返回列表" Click="CloseEditorClick"/></Grid>
+      <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+       <StackPanel Spacing="14" Margin="0,0,12,16">
+        <TextBox x:Name="TitleInput" Watermark="标题（可选）"/>
+        <TextBox x:Name="ContentInput" Watermark="发生了什么？怎么解决的？" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="140" MaxHeight="260"/>
+        <Expander Header="补充详情"><StackPanel Spacing="12" Margin="0,10,0,0">
+         <TextBlock Text="记录类型" FontSize="12" Foreground="{DynamicResource MutedBrush}"/>
+         <ComboBox x:Name="Kind" SelectedIndex="0" HorizontalAlignment="Stretch"><ComboBoxItem Content="经验 / 笔记"/><ComboBoxItem Content="当前状态"/><ComboBoxItem Content="决策"/><ComboBoxItem Content="阻塞"/><ComboBoxItem Content="下一步"/></ComboBox>
+         <TextBox x:Name="SourceInput" Watermark="来源：会话、文档或测试记录"/>
+         <TextBox x:Name="ConditionsInput" Watermark="适用条件，例如 Windows / PowerShell" AcceptsReturn="True" TextWrapping="Wrap"/>
+         <TextBlock x:Name="EvidenceLabel" Text="陈述，尚未核实" Foreground="{DynamicResource MutedBrush}" FontSize="12" TextWrapping="Wrap"/>
+         <Expander Header="版本历史"><StackPanel Spacing="8"><Button Content="加载历史" Click="HistoryClick"/><TextBlock x:Name="HistoryText" TextWrapping="Wrap"/></StackPanel></Expander>
+        </StackPanel></Expander>
+       </StackPanel>
+      </ScrollViewer>
+      <WrapPanel Grid.Row="2" Margin="0,16,0,0"><Button Content="保存" Click="SaveClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="PromoteButton" Content="沉淀为个人经验" Click="PromoteClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="UndoButton" Content="撤销上次修改" Click="UndoClick" IsVisible="False"/></WrapPanel>
+     </Grid>
+    </Border>
+   </Grid>
+   <Grid Grid.Row="4" ColumnDefinitions="*,Auto" Margin="0,14,0,0"><TextBlock FontFeatures="tnum" x:Name="Status" Text="正在连接本地记忆服务…" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/><Button x:Name="ReconnectButton" IsVisible="False" Grid.Column="1" Content="重试连接" Click="ReconnectClick"/></Grid>
+  </Grid>
+ </Grid>
+</Grid>
+</Window>
