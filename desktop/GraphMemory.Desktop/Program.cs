@@ -9,6 +9,8 @@ internal static class Program {
     }
     public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>().UsePlatformDetect().LogToTrace();
     static async Task<int> SmokeTest() {
+        var dataIndex=Array.IndexOf(Arguments,"--data-dir");
+        if(dataIndex<0 || dataIndex+1>=Arguments.Length || Arguments[dataIndex+1].StartsWith("--") || Arguments.Contains("--service-url")) {Console.Error.WriteLine("Smoke tests require an explicit isolated --data-dir and cannot use --service-url.");return 1;}
         var host=new ServiceHost();
         try {
             using var client=new ServiceClient(await host.EnsureAsync(Arguments));

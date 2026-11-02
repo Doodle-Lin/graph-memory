@@ -28,7 +28,7 @@
       </StackPanel>
      </Border>
      <TextBlock Grid.Row="1" x:Name="ListHeading" Text="最近记忆" FontSize="18" Margin="0,0,0,14"/>
-     <Grid Grid.Row="3">
+     <Grid Grid.Row="2">
       <ListBox x:Name="Memories" SelectionChanged="MemoryChanged" Background="Transparent">
        <ListBox.ItemTemplate><DataTemplate><StackPanel Spacing="8" Margin="0,8"><TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"/><TextBlock Text="{Binding Preview}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding ScopeLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel></DataTemplate></ListBox.ItemTemplate>
       </ListBox>
@@ -52,7 +52,7 @@
         </StackPanel></Expander>
        </StackPanel>
       </ScrollViewer>
-      <WrapPanel Grid.Row="2" Margin="0,16,0,0"><Button Content="保存" Click="SaveClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="PromoteButton" Content="沉淀为个人经验" Click="PromoteClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="UndoButton" Content="撤销上次修改" Click="UndoClick" IsVisible="False"/></WrapPanel>
+      <WrapPanel Grid.Row="2" Margin="0,16,0,0"><Button Content="保存" Click="SaveClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="PromoteButton" Content="沉淀为个人经验" Click="PromoteClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="ReloadButton" Content="放弃草稿并加载最新" Click="ReloadClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="UndoButton" Content="撤销上次修改" Click="UndoClick" IsVisible="False"/></WrapPanel>
      </Grid>
     </Border>
    </Grid>

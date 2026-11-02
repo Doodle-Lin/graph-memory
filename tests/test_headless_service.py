@@ -121,6 +121,28 @@ class HeadlessServiceTest(unittest.TestCase):
                 write_activity=next(x for x in api(info,'/api/v1/agent/status')['activity'] if x['tool']=='memory_write')
                 self.assertEqual((write_activity['calls'],write_activity['successes'],write_activity['last_ok']),(2,1,False))
                 self.assertFalse(api(info,'/api/v1/context',{'project_id':beta})['truncated'])
+                # Real MCP round trips, including a stale correction from another client.
+                def call_tool(name, arguments):
+                    request={'jsonrpc':'2.0','id':20,'method':'tools/call','params':{'name':name,'arguments':arguments}}
+                    result=subprocess.run([str(BIN/('mcp_server'+SUFFIX))],input=json.dumps(request)+'\n',text=True,encoding='utf8',capture_output=True,timeout=10,cwd=cwd,env={**env,'GM_API_URL':info['api_url'],'GM_MEMORY_V1':'1'},creationflags=FLAGS)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    reply=json.loads(result.stdout)['result']
+                    return reply, json.loads(reply['content'][0]['text']) if not reply.get('isError') else None
+                reply, projects=call_tool('memory_projects',{})
+                self.assertEqual({x['id'] for x in projects['projects']},{alpha,beta})
+                reply, results=call_tool('memory_search',{'project_id':alpha,'query':'deployment'})
+                self.assertEqual([x['id'] for x in results['memories']],[a['id']])
+                reply, corrected=call_tool('memory_update',{'id':experience['id'],'expected_version':3,'content':'PowerShell correction verified through MCP'})
+                self.assertFalse(reply.get('isError'),reply)
+                self.assertEqual(corrected['memory']['version'],4)
+                stale, _=call_tool('memory_update',{'id':experience['id'],'expected_version':3,'content':'must not overwrite'})
+                self.assertTrue(stale.get('isError'),stale)
+                reply, result=call_tool('memory_context',{'query':'PowerShell'})
+                self.assertIn('PowerShell correction verified through MCP',result['text'])
+                self.assertNotIn('must not overwrite',result['text'])
+                counters={x['tool']:x for x in api(info,'/api/v1/agent/status')['activity']}
+                self.assertEqual(counters['memory_update']['calls'],2)
+                self.assertEqual(counters['memory_update']['successes'],1)
                 # Abrupt termination releases the directory lock; stale discovery is replaced.
                 first.kill(); first.communicate(timeout=5)
                 restarted=start(); fresh=discover(restarted,info['instance_id'])
