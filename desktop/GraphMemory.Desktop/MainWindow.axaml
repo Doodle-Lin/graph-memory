@@ -1,7 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Class="GraphMemory.Desktop.MainWindow" Title="Graph Memory" Width="1160" Height="780" MinWidth="900" MinHeight="620" Background="{DynamicResource CanvasBrush}">
 <Grid RowDefinitions="Auto,*">
- <Border Background="{DynamicResource CanvasBrush}" Padding="24,16"><Grid ColumnDefinitions="*,Auto"><TextBlock Text="Graph Memory" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource InkBrush}"/></Grid></Border>
- <Grid Grid.Row="1" ColumnDefinitions="210,*">
+ <Border x:Name="HeaderBar" Background="{DynamicResource CanvasBrush}" Padding="24,16"><Grid ColumnDefinitions="*,Auto"><TextBlock Text="Graph Memory" FontSize="18" FontWeight="SemiBold" Foreground="{DynamicResource InkBrush}"/></Grid></Border>
+ <Grid x:Name="MainContent" Grid.Row="1" ColumnDefinitions="210,*">
   <Border Background="{DynamicResource SubtleBrush}" Padding="18"><ScrollViewer HorizontalScrollBarVisibility="Disabled"><StackPanel Spacing="12">
    <Button x:Name="PersonalButton" Classes="scopeSelected" Content="个人经验" Click="PersonalClick" HorizontalAlignment="Stretch"/>
    <TextBlock x:Name="ProjectHeading" IsVisible="False" Text="项目" FontWeight="SemiBold" Margin="0,16,0,0"/>
@@ -78,5 +78,15 @@
    <Grid Grid.Row="4" ColumnDefinitions="*,Auto" Margin="0,14,0,0"><TextBlock FontFeatures="tnum" x:Name="Status" Text="正在连接本地记忆服务…" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/><Button x:Name="ReconnectButton" IsVisible="False" Grid.Column="1" Content="重试连接" Click="ReconnectClick"/></Grid>
   </Grid>
  </Grid>
+ <Border x:Name="ClosePrompt" Grid.Row="0" Grid.RowSpan="2" IsVisible="False" Background="#B0292b29">
+  <Border Width="540" Background="{DynamicResource SurfaceBrush}" CornerRadius="10" Padding="24" HorizontalAlignment="Center" VerticalAlignment="Center">
+   <StackPanel Spacing="14">
+    <TextBlock Text="关闭前确认" FontSize="18" FontWeight="SemiBold"/>
+    <TextBlock x:Name="ClosePromptMessage" TextWrapping="Wrap"/>
+    <TextBlock Text="关闭窗口不会停止已在运行的本地记忆服务；未保存的草稿不会自动保存，也不会被后台静默写入。" TextWrapping="Wrap" FontSize="12" Foreground="{DynamicResource MutedBrush}"/>
+    <WrapPanel HorizontalAlignment="Right"><Button x:Name="SaveAndCloseButton" Content="保存全部并关闭" Click="SaveAndCloseClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="DiscardAndCloseButton" Content="放弃草稿并关闭" Click="DiscardAndCloseClick" Margin="0,0,12,0"/><Button x:Name="CancelCloseButton" Content="取消关闭" Click="CancelCloseClick"/></WrapPanel>
+   </StackPanel>
+  </Border>
+ </Border>
 </Grid>
 </Window>
