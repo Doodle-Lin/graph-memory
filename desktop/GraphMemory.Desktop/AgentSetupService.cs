@@ -17,6 +17,8 @@ public sealed record SetupReceipt(string Path, string Backup, bool Existed, stri
 
 /// <summary>Local user-scope setup. Never edits credentials or unrelated server values.</summary>
 public static class AgentSetupService {
+    // Only constant, application-owned messages may bypass parser-error sanitization.
+    sealed class SetupPolicyException(string message) : InvalidOperationException(message);
     const string ServerName = "graph_memory_v1";
     static readonly string[] KnownNames = ["graph-memory", "graph_memory", ServerName];
     public static AgentTarget[] Targets() {
@@ -40,17 +42,25 @@ public static class AgentSetupService {
         };
         var replaced = new List<string>(); bool changed = false;
         void Update(Dictionary<string,JsonNode?> entries) {
-            foreach (var name in KnownNames.Where(entries.ContainsKey)) {
+            var recognized=KnownNames.Where(entries.ContainsKey).ToArray();
+            // Combining several recognized entries would silently merge unrelated policies.
+            if(recognized.Length>1)
+                throw new SetupPolicyException("检测到多个记忆配置入口，未自动迁移。请在宿主配置中核对并保留一个入口后重试。");
+            JsonObject? legacy=null;
+            if(recognized.Length==1) {
+                var name=recognized[0];
                 var old=entries[name] as JsonObject ?? throw new InvalidOperationException("记忆配置结构异常，请先检查宿主配置。");
                 var executable=old["command"]?.GetValue<string>() ?? "";
                 var args=old["args"]?.ToJsonString() ?? "";
-                if (!Path.GetFileName(executable).Equals("mcp_server.exe",StringComparison.OrdinalIgnoreCase)
-                    && !Path.GetFileName(executable).Equals("mcp_server",StringComparison.OrdinalIgnoreCase)
-                    && !args.Contains("graph_memory.mcp_server",StringComparison.Ordinal))
+                if (!IsGraphMemory(executable,args))
                     throw new InvalidOperationException($"{name} 被无法识别的服务占用，未覆盖。请检查配置路径。");
-                if (name!=ServerName) { entries.Remove(name); replaced.Add(name); changed=true; }
+                // Validate before any alias is dropped; never translate old tool policies to v1.
+                if (name!=ServerName) { EnsureLegacyMigratable(name,old); legacy=old; }
             }
-            var merged=entries.GetValueOrDefault(ServerName)?.DeepClone() as JsonObject ?? new JsonObject();
+            // Migrate by cloning the legacy entry (or the existing v1 entry) so that
+            // unrelated properties and environment variables survive the rename.
+            var merged=legacy!=null?(JsonObject)legacy.DeepClone()
+                :entries.GetValueOrDefault(ServerName)?.DeepClone() as JsonObject ?? new JsonObject();
             // Retain host-side tool restrictions and unrelated environment variables.
             var environment=merged["env"]?.DeepClone() as JsonObject ?? new JsonObject();
             environment.Remove("GM_API_URL");
@@ -59,6 +69,7 @@ public static class AgentSetupService {
             if(target.Format==AgentFormat.ClaudeJson) merged["type"]="stdio";
             else merged["enabled"]=true;
             if(merged.ContainsKey("url"))throw new InvalidOperationException("同名配置同时含远程地址，未覆盖，请先核对。");
+            foreach(var name in recognized.Where(x=>x!=ServerName)){entries.Remove(name);replaced.Add(name);changed=true;}
             if(!JsonNode.DeepEquals(entries.GetValueOrDefault(ServerName),merged))changed=true;
             entries[ServerName]=merged;
         }
@@ -95,11 +106,32 @@ public static class AgentSetupService {
                 servers.Add(ServerName,managed.Documents[0].RootNode);root.Children[key]=servers;
                 using var writer=new StringWriter();stream.Save(writer,false);after=writer.ToString();
             }
-        } catch(Exception e) when(e is not IOException && e is not UnauthorizedAccessException) {
+        } catch(Exception e) when(e is not IOException && e is not UnauthorizedAccessException && e is not SetupPolicyException) {
             // Parser errors can contain secrets from the input; never surface their text.
             throw new InvalidOperationException("配置无法安全合并：格式错误、同名入口不匹配或结构不受支持。原文件未改动。");
         }
         return new(path,before,after,replaced.ToArray(),changed);
+    }
+    static bool IsGraphMemory(string executable,string args) =>
+        Path.GetFileName(executable).Equals("mcp_server.exe",StringComparison.OrdinalIgnoreCase)
+        || Path.GetFileName(executable).Equals("mcp_server",StringComparison.OrdinalIgnoreCase)
+        || args.Contains("graph_memory.mcp_server",StringComparison.Ordinal);
+    static readonly string[] LegacyAllowlistKeys=["enabled_tools","allowed_tools","include_tools"];
+    static readonly string[] LegacyRestrictionKeys=["enabled_tools","disabled_tools","allowed_tools","denied_tools","tools","include_tools","exclude_tools"];
+    /// <summary>Old tool policies cannot be translated to the v1 names; refuse instead of widening access.</summary>
+    static void EnsureLegacyMigratable(string name,JsonObject legacy) {
+        foreach(var key in LegacyAllowlistKeys)
+            if(legacy.TryGetPropertyValue(key,out var value)&&value is not null)
+                throw new SetupPolicyException("旧入口含工具限制，不能自动换成新版工具。请手动核对权限并迁移，原配置未改动。");
+        foreach(var key in LegacyRestrictionKeys)
+            if(legacy.TryGetPropertyValue(key,out var value)&&value is not null&&(value is not JsonArray array||array.Count>0))
+                throw new SetupPolicyException("旧入口含工具限制，不能自动换成新版工具。请手动核对权限并迁移，原配置未改动。");
+        foreach(var pair in legacy)
+            if(pair.Key!="env"&&!LegacyRestrictionKeys.Contains(pair.Key)
+               &&(pair.Key.Contains("tool",StringComparison.OrdinalIgnoreCase)
+                  ||pair.Key.Contains("permission",StringComparison.OrdinalIgnoreCase)
+                  ||pair.Key.Contains("approval",StringComparison.OrdinalIgnoreCase)))
+                throw new SetupPolicyException("旧入口含无法识别的权限设置，请手动核对迁移，原配置未改动。");
     }
     static object ToToml(JsonNode node) => node switch {
         JsonObject obj => MakeTable(obj),
