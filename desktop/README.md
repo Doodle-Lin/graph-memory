@@ -37,7 +37,8 @@ python tests/test_headless_service.py
 dotnet run --project tests/Desktop.Setup.Tests
 dotnet run --project tests/Desktop.Editor.Tests
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
-./artifacts/desktop/GraphMemory.Desktop.exe --smoke-test --data-dir "$env:TEMP/gm-desktop-smoke-unique"
+$smokeDir = Join-Path $env:TEMP ("gm-desktop-smoke-" + [guid]::NewGuid().ToString())
+./artifacts/desktop/GraphMemory.Desktop.exe --smoke-test --data-dir $smokeDir
 ```
 烟雾测试会写入示例，必须显式指定新的临时目录；缺少目录或使用 `--service-url` 时拒绝执行，避免默认写入日常工作库。集成测试自动隔离数据。
 

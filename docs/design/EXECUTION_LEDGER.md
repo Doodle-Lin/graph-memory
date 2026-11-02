@@ -8,7 +8,7 @@
 | L1-02 YAML 类型保真 | 验收通过 | Claude 初稿 / Codex 修复 | Codex | 待 L1-01 集成 | 102 项配置检查通过；原节点保真；受管 env/type 校正；详见本轮验收 |
 | L1-03 未知类型兼容 | 验收通过 | 本地 Claude CLI / sonnet | Codex | 7986925 | 41项真实控件+隔离HTTP检查通过，基线同用例失败 |
 | L1-04 草稿退出保护 | 验收通过 | 本地 Claude CLI，Codex 补充验证 | Codex | c3e3d47 | 73项编辑/关闭检查，原生取消/保存退出与截图通过 |
-| L1-05 新版入口统一 | 待开始 | 本地 Claude CLI | Codex | 首批完成后 | 根 README/SKILL 与旧版归档 |
+| L1-05 新版入口统一 | 验收通过 | Claude 文案初稿 / Codex 集成 | Codex | eedb26d | 新版首页/技能/架构入口，旧版归档；18 个本地链接及五工具契约核对通过 |
 | L1-06 Windows 契约 CI | 待开始 | 本地 Claude CLI | Codex | L1-01..05 后 | 干净 checkout 构建与隔离回归 |
 | L1-07 宿主矩阵 | 待开始 | Codex 主验收，Claude 辅助样例 | Codex | L1-06 后 | 不把本地组件测试当作宿主调用 |
 | L2–L5 | 未进入 | 按计划拆分委派 | Codex | 满足阶段依赖后 | 不提前标完成 |
@@ -68,3 +68,13 @@
 - 实际截图artifacts/desktop-closing-review.png通过Alt+Print及画图保存，1162×812下确认层文字和三按钮完整。没有声称多DPI/最小窗口/所有异常路径均做了原生像素测试，异常路径由真实控件+隔离HTTP测试覆盖。
 - 草稿仍只在内存。此任务保护正常关窗，不承诺崩溃/强制终止恢复；持久化恢复属于L2-06。
 - 下一项L1-05：统一新版入口及旧版归档，随后L1-06主流程CI。尚未启动后台自动任务。
+
+## L1-05 验收（2026-11-02）
+
+- 本地 Claude CLI 33 秒正常结束。本轮直接调用 CLI 可执行文件，通过参数数组传入空 tools、空 MCP 配置；仅给有限的新版文档内容，要求返回文本，不授予编辑工具。没有委派配置、记忆库、提交或推送。
+- 返回 JSON 缺少开头左花括号，Codex检查全文后修复格式再解析，未把格式错误当作可直接应用的补丁。Codex补齐时间/分页边界、默认数据目录、个人范围不传项目ID和发布边界。
+- 根 README 以 Avalonia Windows x64 开发版和 MCP 自动记忆为入口；根 SKILL 仅指导五个 v1 工具，不要求逐轮写入，缺少工具时不回退旧版。根 ARCHITECTURE 改为新版导航；旧 README、架构和行为指令分别移入 docs/legacy，旧指令去掉技能 frontmatter 并避免使用 SKILL.md 文件名，连接示例匿名化。
+- 旧 Tauri 接入器仍属于旧代码，可能寻找根 SKILL；归档明确禁止用旧接入器部署新版技能，不声称旧链路继续兼容。新版桌面不自动改写宿主指令。
+- Codex独立核对源代码 scoped_tools_list：README/SKILL与全部五工具一致；18个相对文档链接可解析；PowerShell构建脚本语法有效；git diff --check通过。技能校验器最初因Windows默认GBK读取UTF-8失败，以python -X utf8重跑通过。
+- 核对build-desktop.ps1及csproj的实际构建/复制目标；桌面文档的smoke目录改为GUID，避免重复使用固定测试库。这是文档批次，没有重建或覆盖运行中的用户安装，也没有宣称在全新机器完成构建或真实宿主调用。此前代码验收记录继续有效。
+- 下一项L1-06：Windows干净checkout契约CI；随后L1-07真实宿主矩阵。两项尚未完成。
