@@ -193,6 +193,112 @@ try {
     var vyenv=(YamlMappingNode)vyv.Children[new YamlScalarNode("env")];
     Check(((YamlScalarNode)vyenv.Children[new YamlScalarNode("EXTRA")]).Value=="keep" && !vyenv.Children.ContainsKey(new YamlScalarNode("GM_API_URL")),"v1 YAML env merge failed");
 
+    // YAML type corruption guard: unmanaged scalars must keep their original type and style,
+    // both on legacy migration and on repeated v1 updates. Types are asserted through a schema
+    // aware deserialization (not substring checks) so a flattened "42"/"null" cannot pass.
+    bool IsNumber(object? value,long expected)=>value is sbyte or byte or short or ushort or int or uint or long or ulong or float or double or decimal && Convert.ToDecimal(value)==expected;
+    var typed=new YamlDotNet.Serialization.DeserializerBuilder().WithAttemptingUnquotedStringTypeDeserialization().Build();
+    Dictionary<object,object> DeserializeEntry(string text,string entry) {
+        var document=(Dictionary<object,object>)typed.Deserialize<object>(new StringReader(text))!;
+        var servers=(Dictionary<object,object>)document["mcp_servers"];
+        return (Dictionary<object,object>)servers[entry];
+    }
+    var yamlTypes=Path.Combine(folder,"yaml-types.yaml");
+    File.WriteAllText(yamlTypes,"""
+    mcp_servers:
+      unrelated:
+        command: other.exe
+        retries: 7
+      graph-memory:
+        command: mcp_server.exe
+        timeout: 42
+        auto_approve: false
+        cleared: null
+        quoted_number: '123'
+        quoted_bool: "true"
+        nested:
+          depth: 2
+          flags: [true, false]
+        env:
+          GM_API_URL: 'http://old'
+          KEEP_INT: 7
+          KEEP_QUOTED: '007'
+    """);
+    var yamlTypesOriginal=File.ReadAllBytes(yamlTypes);
+    var yamlTypesPlan=Inspect(yamlTypes,AgentFormat.HermesYaml);
+    Check(yamlTypesPlan.Changed,"yaml types migration not detected");
+    var yamlTypesReceipt=AgentSetupService.Apply(yamlTypesPlan)!;
+    Check(File.ReadAllBytes(yamlTypesReceipt.Backup).SequenceEqual(yamlTypesOriginal),"yaml types backup differs");
+    var yamlTypesInstalled=File.ReadAllText(yamlTypes);
+    Check(!Inspect(yamlTypes,AgentFormat.HermesYaml).Changed,"yaml types install not idempotent");
+    Check(Inspect(yamlTypes,AgentFormat.HermesYaml).Changed==false && File.ReadAllText(yamlTypes)==yamlTypesInstalled,"second yaml inspect Changed not stable");
+    var migrated=DeserializeEntry(yamlTypesInstalled,"graph_memory_v1");
+    Check(IsNumber(migrated["timeout"],42),"legacy YAML numeric timeout corrupted");
+    Check(migrated["auto_approve"] is bool approve && !approve,"legacy YAML boolean flag corrupted");
+    Check(migrated["cleared"] is null,"legacy YAML explicit null corrupted");
+    Check(migrated["quoted_number"] is string quotedNumber && quotedNumber=="123","legacy YAML quoted number lost");
+    Check(migrated["quoted_bool"] is string quotedBool && quotedBool=="true","legacy YAML quoted bool lost");
+    var nested=(Dictionary<object,object>)migrated["nested"];
+    Check(IsNumber(nested["depth"],2),"legacy YAML nested number corrupted");
+    var flags=(List<object>)nested["flags"];
+    Check(flags.Count==2 && (bool)flags[0] && !(bool)flags[1],"legacy YAML nested array corrupted");
+    var migratedEnv=(Dictionary<object,object>)migrated["env"];
+    Check(IsNumber(migratedEnv["KEEP_INT"],7),"legacy YAML extra env int corrupted");
+    Check(migratedEnv["KEEP_QUOTED"] is string keepQuoted && keepQuoted=="007","legacy YAML extra env quoted string lost");
+    Check(!migratedEnv.ContainsKey("GM_API_URL") && migratedEnv.ContainsKey("GM_SERVICE_EXE") && migratedEnv.ContainsKey("GM_MEMORY_V1"),"legacy YAML managed env not applied");
+    var migratedNodes=(YamlMappingNode)((YamlMappingNode)ParseYaml(yamlTypesInstalled).Children[new YamlScalarNode("mcp_servers")]).Children[new YamlScalarNode("graph_memory_v1")];
+    Check(((YamlScalarNode)migratedNodes.Children[new YamlScalarNode("quoted_number")]).Style==YamlDotNet.Core.ScalarStyle.SingleQuoted,"legacy YAML single-quoted style lost");
+    Check(((YamlScalarNode)migratedNodes.Children[new YamlScalarNode("quoted_bool")]).Style==YamlDotNet.Core.ScalarStyle.DoubleQuoted,"legacy YAML double-quoted style lost");
+    var unrelated=DeserializeEntry(yamlTypesInstalled,"unrelated");
+    Check(IsNumber(unrelated["retries"],7),"unrelated YAML numeric type changed");
+    AgentSetupService.Restore(yamlTypesReceipt);
+    Check(File.ReadAllBytes(yamlTypes).SequenceEqual(yamlTypesOriginal),"yaml types restore differs");
+
+    var yamlV1Types=Path.Combine(folder,"yaml-v1-types.yaml");
+    File.WriteAllText(yamlV1Types,"""
+    mcp_servers:
+      graph_memory_v1:
+        command: mcp_server.exe
+        timeout: 30
+        cleared: null
+        quoted_number: '456'
+        disabled_tools:
+          - memory_write
+        env:
+          EXTRA: keep
+          GM_API_URL: old
+    """);
+    AgentSetupService.Apply(Inspect(yamlV1Types,AgentFormat.HermesYaml));
+    var v1Installed=File.ReadAllText(yamlV1Types);
+    var v1=DeserializeEntry(v1Installed,"graph_memory_v1");
+    Check(IsNumber(v1["timeout"],30),"v1 YAML numeric timeout corrupted");
+    Check(v1["cleared"] is null,"v1 YAML explicit null corrupted");
+    Check(v1["quoted_number"] is string v1Quoted && v1Quoted=="456","v1 YAML quoted number lost");
+    var v1Env=(Dictionary<object,object>)v1["env"];
+    Check((string)v1Env["EXTRA"]=="keep" && !v1Env.ContainsKey("GM_API_URL") && v1Env.ContainsKey("GM_SERVICE_DIR"),"v1 YAML env merge failed");
+    Check(((List<object>)v1["disabled_tools"])[0]?.ToString()=="memory_write","v1 YAML restriction lost");
+    var v1Nodes=(YamlMappingNode)((YamlMappingNode)ParseYaml(v1Installed).Children[new YamlScalarNode("mcp_servers")]).Children[new YamlScalarNode("graph_memory_v1")];
+    Check(((YamlScalarNode)v1Nodes.Children[new YamlScalarNode("quoted_number")]).Style==YamlDotNet.Core.ScalarStyle.SingleQuoted,"v1 YAML quoted style lost");
+    Check(!Inspect(yamlV1Types,AgentFormat.HermesYaml).Changed,"v1 YAML second inspect not idempotent");
+    Check(File.ReadAllText(yamlV1Types)==v1Installed,"v1 YAML second inspect rewrote file");
+
+    Check(migratedEnv["GM_MEMORY_V1"] is string managedVersion && managedVersion=="1","managed env must be a string");
+    Check(v1["enabled"] is bool enabled && enabled,"enabled must be boolean true");
+    var normalizedNode=ParseYaml(v1Installed);
+    var normalizedServer=(YamlMappingNode)((YamlMappingNode)normalizedNode.Children[new YamlScalarNode("mcp_servers")]).Children[new YamlScalarNode("graph_memory_v1")];
+    var normalizedEnv=(YamlMappingNode)normalizedServer.Children[new YamlScalarNode("env")];
+    normalizedEnv.Children[new YamlScalarNode("GM_MEMORY_V1")]=new YamlScalarNode("1"){Style=YamlDotNet.Core.ScalarStyle.Plain};
+    normalizedServer.Children[new YamlScalarNode("enabled")]=new YamlScalarNode("true"){Style=YamlDotNet.Core.ScalarStyle.DoubleQuoted};
+    using(var w=new StringWriter()){new YamlStream(new YamlDocument(normalizedNode)).Save(w,false);File.WriteAllText(yamlV1Types,w.ToString());}
+    var normalizePlan=Inspect(yamlV1Types,AgentFormat.HermesYaml);
+    Check(normalizePlan.Changed,"managed type-only change not detected");
+    AgentSetupService.Apply(normalizePlan);
+    var normalized=DeserializeEntry(File.ReadAllText(yamlV1Types),"graph_memory_v1");
+    Check(((Dictionary<object,object>)normalized["env"])["GM_MEMORY_V1"] is string,"managed numeric env not normalized");
+    Check(normalized["enabled"] is bool normalizedEnabled && normalizedEnabled,"quoted enabled not normalized");
+    Check(!Inspect(yamlV1Types,AgentFormat.HermesYaml).Changed,"normalization not idempotent");
+    File.WriteAllText(rl,"""{"mcpServers":{"graph-memory":{"command":"mcp_server.exe","tools":[]}}}""");
+    RejectUnchanged(rl,AgentFormat.ClaudeJson,"ambiguous empty tool policy accepted");
     Console.WriteLine($"PASS {checks} setup checks: merge, legacy, preservation, migration policy, no-op, backup, restore, concurrent edits, invalid config, collisions");
 } finally {
     var resolved=Path.GetFullPath(folder);

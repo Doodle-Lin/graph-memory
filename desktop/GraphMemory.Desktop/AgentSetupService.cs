@@ -98,12 +98,60 @@ public static class AgentSetupService {
                 var stream=new YamlStream();stream.Load(new StringReader(string.IsNullOrWhiteSpace(text)?"{}":text));
                 if(stream.Documents.Count!=1 || stream.Documents[0].RootNode is not YamlMappingNode root)throw new InvalidOperationException("只支持单文档 YAML 配置。");
                 var key=new YamlScalarNode("mcp_servers");
-                var servers=root.Children.TryGetValue(key,out var value)?(YamlMappingNode)value:new YamlMappingNode();
-                var entries=servers.Children.ToDictionary(x=>((YamlScalarNode)x.Key).Value!,x=>FromYaml(x.Value));Update(entries);
-                // Preserve unrelated YAML nodes and scalar styles; replace only managed entries.
-                foreach(var name in KnownNames)servers.Children.Remove(new YamlScalarNode(name));
-                var managed=new YamlStream();managed.Load(new StringReader(entries[ServerName]!.ToJsonString()));
-                servers.Add(ServerName,managed.Documents[0].RootNode);root.Children[key]=servers;
+                YamlMappingNode servers;
+                if(root.Children.TryGetValue(key,out var value))servers=value as YamlMappingNode ?? throw new InvalidOperationException("记忆配置结构异常，请先检查宿主配置。");
+                else servers=new YamlMappingNode();
+                var recognized=KnownNames.Where(n=>servers.Children.ContainsKey(new YamlScalarNode(n))).ToArray();
+                // Combining several recognized entries would silently merge unrelated policies.
+                if(recognized.Length>1)
+                    throw new SetupPolicyException("检测到多个记忆配置入口，未自动迁移。请在宿主配置中核对并保留一个入口后重试。");
+                YamlMappingNode? legacy=null;
+                if(recognized.Length==1) {
+                    var name=recognized[0];
+                    if(servers.Children[new YamlScalarNode(name)] is not YamlMappingNode old)
+                        throw new InvalidOperationException("记忆配置结构异常，请先检查宿主配置。");
+                    // The JSON projection is only used to reuse the existing policy checks; the
+                    // merged document is built from the untouched YAML node tree below.
+                    var oldJson=(JsonObject)FromYaml(old)!;
+                    var executable=oldJson["command"]?.GetValue<string>() ?? "";
+                    var args=oldJson["args"]?.ToJsonString() ?? "";
+                    if(!IsGraphMemory(executable,args))
+                        throw new InvalidOperationException($"{name} 被无法识别的服务占用，未覆盖。请检查配置路径。");
+                    // Validate before any alias is dropped; never translate old tool policies to v1.
+                    if(name!=ServerName){EnsureLegacyMigratable(name,oldJson);legacy=old;}
+                }
+                var serverKey=new YamlScalarNode(ServerName);
+                YamlMappingNode? existingV1=servers.Children.TryGetValue(serverKey,out var current)&&current is YamlMappingNode mapping?mapping:null;
+                var beforeNode=existingV1 is null?(JsonNode)new JsonObject():FromYaml(existingV1)!;
+                bool managedTypeChanged=false;
+                // Mutate only application-owned keys on the original node tree so that every
+                // unmanaged scalar keeps its style/tag/number-vs-string meaning, and nested
+                // objects, arrays and extra environment entries keep their YAML semantics.
+                var merged=legacy ?? existingV1 ?? new YamlMappingNode();
+                if(merged.Children.ContainsKey(new YamlScalarNode("url")))
+                    throw new InvalidOperationException("同名配置同时含远程地址，未覆盖，请先核对。");
+                merged.Children[new YamlScalarNode("command")]=new YamlScalarNode(desired["command"]!.GetValue<string>());
+                merged.Children[new YamlScalarNode("args")]=new YamlSequenceNode{Style=YamlDotNet.Core.Events.SequenceStyle.Flow};
+                var environment=merged.Children.TryGetValue(new YamlScalarNode("env"),out var envNode)&&envNode is YamlMappingNode existingEnv?existingEnv:new YamlMappingNode();
+                environment.Children.Remove(new YamlScalarNode("GM_API_URL"));
+                foreach(var pair in desired["env"]!.AsObject()) {
+                    var envKey=new YamlScalarNode(pair.Key);
+                    if(environment.Children.TryGetValue(envKey,out var oldEnv)
+                        && oldEnv is YamlScalarNode scalar && (scalar.Style is not (YamlDotNet.Core.ScalarStyle.SingleQuoted or YamlDotNet.Core.ScalarStyle.DoubleQuoted)
+                            || (!scalar.Tag.IsEmpty && scalar.Tag.Value!="tag:yaml.org,2002:str")))
+                        managedTypeChanged=true;
+                    environment.Children[envKey]=new YamlScalarNode(pair.Value!.GetValue<string>()){Style=YamlDotNet.Core.ScalarStyle.DoubleQuoted};
+                }
+                merged.Children[new YamlScalarNode("env")]=environment;
+                var enabledKey=new YamlScalarNode("enabled");
+                if(merged.Children.TryGetValue(enabledKey,out var enabledNode)
+                    && enabledNode is YamlScalarNode enabledScalar
+                    && (enabledScalar.Style!=YamlDotNet.Core.ScalarStyle.Plain || (!enabledScalar.Tag.IsEmpty && enabledScalar.Tag.Value!="tag:yaml.org,2002:bool")))
+                    managedTypeChanged=true;
+                merged.Children[enabledKey]=new YamlScalarNode("true"){Style=YamlDotNet.Core.ScalarStyle.Plain};
+                foreach(var name in recognized.Where(x=>x!=ServerName)){servers.Children.Remove(new YamlScalarNode(name));replaced.Add(name);}
+                changed=managedTypeChanged||recognized.Any(x=>x!=ServerName)||existingV1 is null||!JsonNode.DeepEquals(beforeNode,FromYaml(merged)!);
+                servers.Children[serverKey]=merged;root.Children[key]=servers;
                 using var writer=new StringWriter();stream.Save(writer,false);after=writer.ToString();
             }
         } catch(Exception e) when(e is not IOException && e is not UnauthorizedAccessException && e is not SetupPolicyException) {
@@ -116,7 +164,7 @@ public static class AgentSetupService {
         Path.GetFileName(executable).Equals("mcp_server.exe",StringComparison.OrdinalIgnoreCase)
         || Path.GetFileName(executable).Equals("mcp_server",StringComparison.OrdinalIgnoreCase)
         || args.Contains("graph_memory.mcp_server",StringComparison.Ordinal);
-    static readonly string[] LegacyAllowlistKeys=["enabled_tools","allowed_tools","include_tools"];
+    static readonly string[] LegacyAllowlistKeys=["enabled_tools","allowed_tools","include_tools","tools"];
     static readonly string[] LegacyRestrictionKeys=["enabled_tools","disabled_tools","allowed_tools","denied_tools","tools","include_tools","exclude_tools"];
     /// <summary>Old tool policies cannot be translated to the v1 names; refuse instead of widening access.</summary>
     static void EnsureLegacyMigratable(string name,JsonObject legacy) {
