@@ -8,6 +8,8 @@
     <PackageReference Include="Avalonia" Version="11.3.22" />
     <PackageReference Include="Avalonia.Desktop" Version="11.3.22" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.22" />
+    <PackageReference Include="Tomlyn" Version="0.19.0" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
   <Target Name="CopyMemoryService" AfterTargets="Build" Condition="Exists('../../src-tauri/target/debug/graph-memory-service.exe')">
     <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />

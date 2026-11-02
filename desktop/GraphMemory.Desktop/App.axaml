@@ -42,12 +42,16 @@
       <Setter Property="BoxShadow" Value="inset 0 0 0 1 #8027634a, inset 0 0 0 3 #2027634a" />
     </Style>
     <Style Selector="Button">
+      <Setter Property="FocusAdorner" Value="{x:Null}" />
       <Setter Property="Padding" Value="14,9" />
       <Setter Property="MinHeight" Value="38" />
       <Setter Property="CornerRadius" Value="6" />
       <Setter Property="BorderThickness" Value="0" />
       <Setter Property="Background" Value="{DynamicResource SubtleBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource InkBrush}" />
+    </Style>
+    <Style Selector="Button:focus-visible /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="BoxShadow" Value="inset 0 0 0 1 #8027634a, inset 0 0 0 3 #2027634a" />
     </Style>
     <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
       <Setter Property="Background" Value="#e5e5e2" />

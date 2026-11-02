@@ -7,7 +7,7 @@
    <TextBlock x:Name="ProjectHeading" IsVisible="False" Text="项目" FontWeight="SemiBold" Margin="0,16,0,0"/>
    <ListBox x:Name="Projects" SelectionChanged="ProjectChanged" MaxHeight="220" IsVisible="False" Background="Transparent"/>
    <Expander Header="添加项目"><StackPanel Spacing="8"><TextBox x:Name="ProjectName" Watermark="项目名称"/><Button Content="创建" Click="CreateProjectClick"/></StackPanel></Expander>
-   <Expander x:Name="AgentSetup" Header="Agent 接入"><StackPanel Spacing="8"><TextBlock Text="首次复制配置到 Agent。之后工具可自动启动服务，无需先打开此窗口。" TextWrapping="Wrap" FontSize="12"/><ComboBox x:Name="ConfigFormat" SelectedIndex="0"><ComboBoxItem Content="通用 JSON"/><ComboBoxItem Content="Codex TOML"/></ComboBox><Button x:Name="CopyConfigButton" Content="复制接入配置" Click="CopyConfigClick"/><Button x:Name="CopyInstructionsButton" Content="复制记忆使用说明" Click="CopyInstructionsClick"/></StackPanel></Expander>
+   <Button Content="Agent 接入" Click="AgentSetupClick" HorizontalAlignment="Stretch"/>
    <Expander Header="手动备用"><StackPanel Spacing="8"><TextBlock Text="仅用于不支持 MCP 的工具。" TextWrapping="Wrap" FontSize="12"/><Button Content="准备复制背景" Click="ContextClick"/></StackPanel></Expander>
   </StackPanel></ScrollViewer></Border>
   <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="26,22">
@@ -35,6 +35,25 @@
       <StackPanel x:Name="EmptyState" IsVisible="False" Spacing="10" Margin="12,24" IsHitTestVisible="False"><TextBlock x:Name="EmptyHeading" Text="还没有记忆" FontSize="18"/><TextBlock x:Name="EmptyHint" Text="接入 Agent 后，记忆会在工具调用时沉淀；也可以手动记一条。" Foreground="{DynamicResource MutedBrush}"/></StackPanel>
      </Grid>
     </Grid>
+    <Border x:Name="SetupPanel" IsVisible="False" Background="{DynamicResource SurfaceBrush}" CornerRadius="10" Padding="24">
+     <Grid RowDefinitions="Auto,*,Auto">
+      <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,16"><TextBlock Text="接入你的 Agent" FontSize="20" FontWeight="SemiBold"/><Button Grid.Column="1" Content="返回记忆" Click="CloseSetupClick"/></Grid>
+      <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled"><StackPanel Spacing="14" Margin="0,0,12,12">
+       <TextBlock Text="选好宿主，一次接入。之后由 Agent 检索和记录，桌面负责查看与纠正。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/>
+       <ComboBox x:Name="SetupTarget" HorizontalAlignment="Stretch" SelectionChanged="SetupTargetChanged"/>
+       <TextBlock Text="接入位置（用户配置）" Foreground="{DynamicResource MutedBrush}" FontSize="12"/>
+       <TextBox x:Name="SetupPath" TextChanged="SetupPathChanged"/>
+       <TextBlock x:Name="SetupStatus" TextWrapping="Wrap"/>
+       <TextBlock Text="会自动备份，并保留其他服务和设置。Hermes 桌面版与命令行版分别配置；自定义目录可在上方修改。" TextWrapping="Wrap" FontSize="12" Foreground="{DynamicResource MutedBrush}"/>
+       <Expander Header="高级与手动接入"><StackPanel Spacing="10" Margin="0,10,0,0">
+        <TextBlock Text="项目配置、其他设备或特殊安装可使用复制配置。已有项目级设置可能覆盖这里的用户配置。" TextWrapping="Wrap" FontSize="12"/>
+        <ComboBox x:Name="ConfigFormat" SelectedIndex="0"><ComboBoxItem Content="通用 JSON"/><ComboBoxItem Content="Codex TOML"/></ComboBox>
+        <WrapPanel><Button x:Name="CopyConfigButton" Content="复制配置" Click="CopyConfigClick" Margin="0,0,12,0"/><Button x:Name="CopyInstructionsButton" Content="复制记忆使用说明" Click="CopyInstructionsClick"/></WrapPanel>
+       </StackPanel></Expander>
+      </StackPanel></ScrollViewer>
+      <WrapPanel Grid.Row="2" Margin="0,14,0,0"><Button x:Name="InstallAgentButton" Content="一键接入" Classes="primary" Click="InstallAgentClick" IsEnabled="False" Margin="0,0,12,8"/><Button Content="检测配置" Click="DetectSetupClick" Margin="0,0,12,8"/><Button Content="测试本地组件" Click="VerifyAgentClick" Margin="0,0,12,8"/><Button x:Name="UndoSetupButton" Content="撤销上次接入" Click="UndoSetupClick" IsEnabled="False" Margin="0,0,0,8"/></WrapPanel>
+     </Grid>
+    </Border>
     <Border x:Name="EditorPanel" IsVisible="False" Background="{DynamicResource SurfaceBrush}" CornerRadius="10" Padding="24">
      <Grid RowDefinitions="Auto,*,Auto">
       <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,18"><TextBlock x:Name="EditorHeading" Text="记一条个人经验" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/><Button Grid.Column="1" Content="返回列表" Click="CloseEditorClick"/></Grid>

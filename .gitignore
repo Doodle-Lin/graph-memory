@@ -39,5 +39,7 @@ src-tauri/app_stdout.txt
 # Avalonia build output
 desktop/**/bin/
 desktop/**/obj/
+tests/Desktop.Setup.Tests/bin/
+tests/Desktop.Setup.Tests/obj/
 
 artifacts/

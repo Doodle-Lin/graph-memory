@@ -36,7 +36,6 @@ public partial class MainWindow : Window {
         }catch{Find<TextBlock>("AgentStatus").Text="接入状态暂不可用";Find<TextBlock>("AgentDetail").Text="请刷新或重试连接；未将服务可用推断为 Agent 已接入。";}
         finally{checkingActivity=false;}
     }
-    void AgentSetupClick(object? s,RoutedEventArgs e){Find<Expander>("AgentSetup").IsExpanded=true;Find<ComboBox>("ConfigFormat").Focus();}
     async void RefreshClick(object? s,RoutedEventArgs e)=>await Run(async()=>{await LoadProjects();await LoadMemories();await LoadAgentStatus();});
     readonly Dictionary<string,(DispatcherTimer timer,object? label)> copyFeedback=new();
     // Restart the acknowledgement on repeat clicks; timers never hold the busy gate.
@@ -68,7 +67,7 @@ public partial class MainWindow : Window {
     bool HasDraft()=>selected==null
         ? !string.IsNullOrWhiteSpace(Text("TitleInput")+Text("ContentInput")+Text("SourceInput")+Text("ConditionsInput"))
         : Text("TitleInput")!=selected.Title || Text("ContentInput")!=selected.Text("content") || Text("SourceInput")!=selected.Text("source") || Text("ConditionsInput")!=selected.Text("conditions") || kinds[Math.Max(0,Find<ComboBox>("Kind").SelectedIndex)]!=selected.Text("kind");
-    void ShowEditor(bool show){if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
+    void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
     void CloseEditorClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(false);Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";}
     void StatusMessage(string text)=>Find<TextBlock>("Status").Text=text;
     public MainWindow(){AvaloniaXamlLoader.Load(this);Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}

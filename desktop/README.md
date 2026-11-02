@@ -6,7 +6,7 @@ Windows x64 可运行开发版：双击 `artifacts/desktop/GraphMemory.Desktop.e
 
 主流程是 **Agent 经 MCP 检索、写入和纠正记忆**。桌面负责接入状态、最近记忆与人工纠正，不要求每轮复制上下文。
 
-1. 在“接入 Agent”中复制对应宿主配置，合并到该宿主的 MCP 配置并重启宿主；不要覆盖已有其他服务。
+1. 打开“接入 Agent”，选择 Claude Code、Codex、Hermes 命令行或 Hermes 桌面版。核对用户配置位置，点击“检测配置”及“一键接入”，再在宿主中重载 MCP 或重启宿主。初次打开默认宿主会自动检测。
 2. 将 [Agent 使用约定](AGENT_INSTRUCTIONS.md) 加入宿主指令。MCP initialize 也提供 instructions，但宿主是否采纳由宿主决定。
 3. Agent 开始任务时调用 memory_context / memory_search；重要经验和决策完成后调用 memory_write，纠正时调用 memory_update。
 4. 桌面每 10 秒更新 MCP 路由调用统计；“刷新记忆”读取最新列表。首次无调用时明确显示未观察到调用。统计不证明宿主已经正确配置，也不证明 Agent 使用了返回内容。
@@ -16,7 +16,14 @@ Windows x64 可运行开发版：双击 `artifacts/desktop/GraphMemory.Desktop.e
 - 手动备用 → 准备复制背景：只供不支持 MCP 的工具，复制前读取最新记忆。
 - 选择记录可纠正、查看版本历史、恢复上一版；并发版本冲突时保留当前草稿，可加载历史核对，再明确选择“放弃草稿并加载最新”。恢复上一版、提炼经验前须先保存当前编辑；提炼不会覆盖个人经验中已有的草稿。
 - 项目记录可以提炼为个人经验草稿，保留原案例引用，核对适用条件后保存。
-- Agent 接入可复制通用 JSON 或 Codex TOML 配置及使用说明。应用不会改写宿主配置，宿主实际调用后才会积累记忆。
+- 一键接入会合并用户级配置，备份原文件，替换可识别的旧 Graph Memory 入口，保留其他设置、其他 MCP 服务和现有工具限制。配置格式和注释可能被序列化器规范化；原始字节保存在配置旁的 `.graph-memory-*.bak` 中。
+- “撤销上次接入”恢复原始配置；若原文件不存在，则撤销创建。若配置之后已被其他程序修改，拒绝覆盖，需手动比较备份。配置写入采用原子替换并在写入前进行乐观冲突检查。
+- “测试本地组件”实际启动 MCP 并核对五个工具，不写入测试记忆，也不把测试结果当成所选宿主已连接的证据。
+- 高级选项仍可复制 JSON / TOML 和使用说明；不会自动改写宿主全局指令或重启运行中的 Agent。项目级配置、权限审批及管理策略仍由宿主处理。
+
+Claude Code 默认读取 `~/.claude.json`（支持 `CLAUDE_CONFIG_DIR`），Codex 使用 `CODEX_HOME/config.toml` 或 `~/.codex/config.toml`，Hermes CLI 使用 `HERMES_HOME/config.yaml` 或 `~/.hermes/config.yaml`。Hermes CN 桌面版单列本机常用路径；其他发行版、Profile 或远程宿主请自行选择正确路径或使用手动配置。含 YAML 锚点/别名、多文档或无法识别同名入口的配置会拒绝自动合并。
+
+格式依据：[Claude Code MCP](https://code.claude.com/docs/en/mcp)、[Codex MCP 配置示例](https://developers.openai.com/learn/docs-mcp)、[Hermes MCP](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)。
 
 默认目录 `%LOCALAPPDATA%/GraphMemory/workspace-v1`，新模型保存在 `work-memory.db`。可用 `--data-dir <目录>` 指定独立目录。窗口关闭后服务继续运行；MCP 通过发现文件握手，按需启动服务。旧图谱未迁移或改写。
 
@@ -25,6 +32,7 @@ Windows x64 可运行开发版：双击 `artifacts/desktop/GraphMemory.Desktop.e
 ```powershell
 ./scripts/build-desktop.ps1
 python tests/test_headless_service.py
+dotnet run --project tests/Desktop.Setup.Tests
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
 ./artifacts/desktop/GraphMemory.Desktop.exe --smoke-test --data-dir "$env:TEMP/gm-desktop-smoke-unique"
 ```
