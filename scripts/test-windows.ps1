@@ -64,7 +64,8 @@ try {
         '--locked',
         '--no-default-features',
         '--bin', 'graph-memory-service',
-        '--bin', 'mcp_server'
+        '--bin', 'mcp_server',
+        '--bin', 'graph-memory-backup'
     )
 
     Invoke-Native -Label 'Rust: library tests' -FilePath 'cargo' -CommandArgs @(
@@ -86,6 +87,10 @@ try {
 
     Invoke-Native -Label 'Python: headless service tests' -FilePath $Python -CommandArgs @(
         '-X', 'utf8', 'tests/test_headless_service.py'
+    )
+
+    Invoke-Native -Label 'Python: live backup CLI tests' -FilePath $Python -CommandArgs @(
+        '-X', 'utf8', 'tests/test_backup_cli.py'
     )
 
     Invoke-Native -Label 'Setup console tests' -FilePath $Dotnet -CommandArgs @(

@@ -12,9 +12,9 @@
     <PackageReference Include="YamlDotNet" Version="16.3.0" />
   </ItemGroup>
   <Target Name="CopyMemoryService" AfterTargets="Build" Condition="Exists('../../src-tauri/target/debug/graph-memory-service.exe')">
-    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe;../../src-tauri/target/debug/graph-memory-backup.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
   </Target>
   <Target Name="PublishMemoryService" AfterTargets="Publish">
-    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="../../src-tauri/target/debug/graph-memory-service.exe;../../src-tauri/target/debug/mcp_server.exe;../../src-tauri/target/debug/graph-memory-backup.exe" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

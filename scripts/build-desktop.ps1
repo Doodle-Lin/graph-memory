@@ -12,7 +12,7 @@ try {
         if (Test-Path $localSdk) { $Dotnet = $localSdk }
         else { throw '.NET 10 SDK is required.' }
     }
-    cargo build --locked --manifest-path src-tauri/Cargo.toml --no-default-features --bin graph-memory-service --bin mcp_server
+    cargo build --locked --manifest-path src-tauri/Cargo.toml --no-default-features --bin graph-memory-service --bin mcp_server --bin graph-memory-backup
     if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
     & $Dotnet publish desktop/GraphMemory.Desktop/GraphMemory.Desktop.csproj -r win-x64 --self-contained true -o artifacts/desktop --nologo
     if ($LASTEXITCODE -ne 0) { throw 'Desktop publish failed' }

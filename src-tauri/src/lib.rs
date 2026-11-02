@@ -6,6 +6,7 @@ pub mod static_server;
 pub mod service;
 pub mod memory_store;
 pub mod backup_format;
+pub mod backup_io;
 
 #[cfg(feature = "desktop")]
 mod desktop;
