@@ -119,9 +119,13 @@ fn parse_hermes_md(content: &str) -> Vec<(String, String)> {
 }
 
 pub fn import_hermes(engine: &mut GraphEngine) -> ImportResult {
+    import_hermes_from(engine, &hermes_home())
+}
+
+fn import_hermes_from(engine: &mut GraphEngine, root: &std::path::Path) -> ImportResult {
     let mut total = 0;
     let mut errors = Vec::new();
-    let mem_dir = hermes_home().join("memories");
+    let mem_dir = root.join("memories");
 
     if mem_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&mem_dir) {
@@ -154,7 +158,7 @@ pub fn import_hermes(engine: &mut GraphEngine) -> ImportResult {
     }
 
     // skills 目录
-    let skills_dir = hermes_home().join("skills");
+    let skills_dir = root.join("skills");
     if skills_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&skills_dir) {
             for entry in entries.flatten() {
@@ -222,9 +226,13 @@ fn parse_claude_md(content: &str) -> Option<(String, String, String)> {
 }
 
 pub fn import_claude(engine: &mut GraphEngine) -> ImportResult {
+    import_claude_from(engine, &claude_home())
+}
+
+fn import_claude_from(engine: &mut GraphEngine, root: &std::path::Path) -> ImportResult {
     let mut total = 0;
     let mut errors = Vec::new();
-    let projects_dir = claude_home().join("projects");
+    let projects_dir = root.join("projects");
     if !projects_dir.exists() {
         return ImportResult { source: "claude".into(), total, errors: vec![format!("not found: {}", projects_dir.display())] };
     }
@@ -269,9 +277,13 @@ fn collect_md_recursive(dir: &PathBuf, out: &mut Vec<PathBuf>) {
 // ── Codex ─────────────────────────────────────────────────
 
 pub fn import_codex(engine: &mut GraphEngine) -> ImportResult {
+    import_codex_from(engine, &codex_home())
+}
+
+fn import_codex_from(engine: &mut GraphEngine, root: &std::path::Path) -> ImportResult {
     let mut total = 0;
     let mut errors = Vec::new();
-    let hist_file = codex_home().join("history.jsonl");
+    let hist_file = root.join("history.jsonl");
     if !hist_file.exists() {
         return ImportResult { source: "codex".into(), total, errors: vec![format!("not found: {}", hist_file.display())] };
     }
@@ -308,27 +320,31 @@ pub fn import_all(engine: &mut GraphEngine) -> serde_json::Value {
 /// 导入所有来源。enrich=true 时,导入后立即补 embedding + auto_link 建边。
 /// (模型未就绪时 enrich 无效,节点先 raw 入库,待模型就绪后由 enrich_all 补全)
 pub fn import_all_with_opts(engine: &mut GraphEngine, enrich: bool) -> serde_json::Value {
+    import_all_from(engine, enrich, &hermes_home(), &claude_home(), &codex_home())
+}
+
+fn import_all_from(engine: &mut GraphEngine, enrich: bool, hermes: &std::path::Path, claude: &std::path::Path, codex: &std::path::Path) -> serde_json::Value {
     let t_start = std::time::Instant::now();
     let mut grand_total = 0;
     let mut all_errors: Vec<String> = Vec::new();
     let mut sources = serde_json::json!({});
 
     let t_hermes = std::time::Instant::now();
-    let r_h = import_hermes(engine);
+    let r_h = import_hermes_from(engine, hermes);
     log::info!("import_all[perf] hermes: {} nodes, {} errors in {:?}", r_h.total, r_h.errors.len(), t_hermes.elapsed());
     grand_total += r_h.total;
     all_errors.extend(r_h.errors.into_iter().take(20).map(|e| format!("hermes: {}", e)));
     sources["hermes"] = serde_json::json!({ "nodes": r_h.total });
 
     let t_claude = std::time::Instant::now();
-    let r_c = import_claude(engine);
+    let r_c = import_claude_from(engine, claude);
     log::info!("import_all[perf] claude: {} nodes, {} errors in {:?}", r_c.total, r_c.errors.len(), t_claude.elapsed());
     grand_total += r_c.total;
     all_errors.extend(r_c.errors.into_iter().take(20).map(|e| format!("claude: {}", e)));
     sources["claude"] = serde_json::json!({ "nodes": r_c.total });
 
     let t_codex = std::time::Instant::now();
-    let r_x = import_codex(engine);
+    let r_x = import_codex_from(engine, codex);
     log::info!("import_all[perf] codex: {} nodes, {} errors in {:?}", r_x.total, r_x.errors.len(), t_codex.elapsed());
     grand_total += r_x.total;
     all_errors.extend(r_x.errors.into_iter().take(20).map(|e| format!("codex: {}", e)));
@@ -363,7 +379,6 @@ fn is_valid_type(t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn parse_hermes_md_splits_on_section() {
@@ -406,65 +421,247 @@ mod tests {
         assert!(!is_noise("这是一段足够长的有意义技术内容描述", 15));
     }
 
-    #[test]
-    fn import_hermes_reads_real_memory_md() {
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        let mem = std::path::PathBuf::from(&local).join("Hermes Agent CN Desktop/data/hermes-home/memories/MEMORY.md");
-        if !mem.exists() { eprintln!("skip: no MEMORY.md"); return; }
-        let content = fs::read_to_string(&mem).unwrap();
-        let entries = parse_hermes_md(&content);
-        assert!(!entries.is_empty());
-        eprintln!("MEMORY.md -> {} entries", entries.len());
-    }
 }
 
 #[cfg(test)]
 mod integration {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    fn tmp_db(tag: &str) -> (PathBuf, crate::engine::GraphEngine) {
-        let p = std::env::temp_dir().join(format!("gm_e2e_{}_{}.db", tag, std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(format!("{}-wal", p.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", p.display()));
-        let eng = crate::engine::GraphEngine::new(p.to_str().unwrap()).unwrap();
-        (p, eng)
+    /// 每个测试独立的临时夹具:唯一目录 + 自动清理。
+    /// 注意:engine 必须是测试里的局部变量(不要放进 Fixture),
+    /// 这样它会先于 Fixture::drop 释放,Windows 上才能删掉 sqlite 文件。
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "gm_fixture_{}_{}_{}",
+                tag,
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).expect("create fixture root");
+            Fixture { root }
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.root.join(rel)
+        }
+
+        fn write(&self, rel: &str, body: &str) {
+            let p = self.path(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture subdir");
+            }
+            std::fs::write(&p, body).expect("write fixture file");
+        }
+
+        fn engine(&self) -> crate::engine::GraphEngine {
+            let db = self.path("graph.db");
+            crate::engine::GraphEngine::new(db.to_str().expect("db path utf8")).expect("open engine")
+        }
+
+        fn root(&self) -> &Path {
+            self.root.as_path()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // engine 此时应当已被释放(局部变量逆序析构 + 显式 drop)
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn errors_of(result: &serde_json::Value) -> Vec<String> {
+        result["errors"]
+            .as_array()
+            .expect("errors array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect()
     }
 
     #[test]
-    fn import_all_writes_real_data() {
-        let (db, mut eng) = tmp_db("all");
-        let result = import_all(&mut eng);
-        let total = result["total_nodes"].as_u64().unwrap_or(0);
-        eprintln!("import_all total={} sources={}", total, result["sources"]);
-        // 本机三个源都在,至少应导入若干节点。宽松断言 > 0,避免无记忆机器上 CI 失败
-        // 但本机确实有数据,这里若 0 就是 bug。
-        assert!(total > 0, "import_all 应导入 >0 个节点,实际 {}", total);
-        let _ = std::fs::remove_file(&db);
+    fn parse_hermes_reads_memory_md_from_fixture_disk() {
+        let fx = Fixture::new("hermes_disk");
+        fx.write(
+            "memories/MEMORY.md",
+            "Disk entry one: read back from the fixture directory\n\u{a7}\nDisk entry two: also read back from disk",
+        );
+
+        let content = std::fs::read_to_string(fx.path("memories/MEMORY.md")).expect("read MEMORY.md");
+        let entries = parse_hermes_md(&content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "Disk entry one");
+        assert_eq!(entries[1].0, "Disk entry two");
+        assert!(entries[1].1.contains("Disk entry two"));
+
+        let mut eng = fx.engine();
+        let r = import_hermes_from(&mut eng, fx.root());
+        drop(eng);
+
+        assert_eq!(r.total, 2, "fixture MEMORY.md 应产出 2 个节点");
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
     }
 
     #[test]
-    fn import_hermes_writes_real_memory_md() {
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        let mem = PathBuf::from(&local).join("Hermes Agent CN Desktop/data/hermes-home/memories/MEMORY.md");
-        if !mem.exists() { eprintln!("skip"); return; }
-        let (db, mut eng) = tmp_db("hermes");
-        let r = import_hermes(&mut eng);
-        eprintln!("hermes total={} errors={}", r.total, r.errors.len());
-        assert!(r.total > 0, "hermes 应导入 MEMORY.md 条目");
-        let _ = std::fs::remove_file(&db);
+    fn hermes_fixture_imports_memory_user_and_skips_self_skills() {
+        let fx = Fixture::new("hermes");
+        fx.write(
+            "memories/MEMORY.md",
+            "Memory one: deterministic hermes body alpha\n\u{a7}\nMemory two: deterministic hermes body beta",
+        );
+        fx.write(
+            "memories/USER.md",
+            "User preference: prefers deterministic fixtures over machine state",
+        );
+        fx.write(
+            "skills/good-skill/SKILL.md",
+            "# Good Skill\n\nA deterministic skill body long enough to be imported.",
+        );
+        // 自身 skill 必须跳过(两种命名都要覆盖)
+        fx.write(
+            "skills/graph-memory/SKILL.md",
+            "# Graph Memory\n\nSelf skill that must be skipped by the importer.",
+        );
+        fx.write(
+            "skills/graph_memory/SKILL.md",
+            "# Graph Memory Underscore\n\nAlso skipped because of the name match.",
+        );
+
+        let mut eng = fx.engine();
+        let r = import_hermes_from(&mut eng, fx.root());
+        drop(eng);
+
+        // 2 (MEMORY.md) + 1 (USER.md) + 1 (good-skill),自身 skill 不计入
+        assert_eq!(r.total, 4, "hermes 夹具应产出 4 个节点");
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
     }
 
     #[test]
-    fn import_claude_writes_real_md() {
-        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
-        let cp = PathBuf::from(&home).join(".claude/projects");
-        if !cp.exists() { eprintln!("skip"); return; }
-        let (db, mut eng) = tmp_db("claude");
-        let r = import_claude(&mut eng);
-        eprintln!("claude total={} errors={}", r.total, r.errors.len());
-        assert!(r.total > 0, "claude 应导入 memory/*.md");
-        let _ = std::fs::remove_file(&db);
+    fn claude_fixture_imports_valid_frontmatter_and_skips_noise() {
+        let fx = Fixture::new("claude");
+        fx.write(
+            "projects/demo/memory/one.md",
+            "---\nname: claude-node-one\ntype: knowledge\n---\nDeterministic claude body that is comfortably long enough.",
+        );
+        fx.write(
+            "projects/demo/memory/two.md",
+            "---\nname: claude-node-two\ntype: reference\n---\nAnother deterministic claude body that is long enough to import.",
+        );
+        // 正文过短 → 噪声,跳过
+        fx.write(
+            "projects/demo/memory/noise.md",
+            "---\nname: claude-noise\ntype: knowledge\n---\nshort",
+        );
+        // 无 frontmatter → parse_claude_md 直接返回 None,既不入库也不报错
+        fx.write(
+            "projects/demo/memory/no-frontmatter.md",
+            "Just plain markdown without frontmatter, long enough though.",
+        );
+
+        let mut eng = fx.engine();
+        let r = import_claude_from(&mut eng, fx.root());
+        drop(eng);
+
+        assert_eq!(r.total, 2, "claude 夹具应产出 2 个节点");
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn codex_fixture_imports_long_text_and_skips_noise_and_invalid_json() {
+        let long_one =
+            "Deterministic codex entry number one with enough characters to pass the fifty char filter";
+        let long_two =
+            "Deterministic codex entry number two with enough characters to pass the fifty char filter";
+        let lines = [
+            format!("{{\"text\":\"{}\"}}", long_one),
+            "{}".to_string(),
+            "{\"text\":\"ok\"}".to_string(),
+            "not-json-at-all".to_string(),
+            "{\"text\":\"\"}".to_string(),
+            format!("{{\"text\":\"{}\"}}", long_two),
+        ];
+
+        let fx = Fixture::new("codex");
+        fx.write("history.jsonl", &lines.join("\n"));
+
+        let mut eng = fx.engine();
+        let r = import_codex_from(&mut eng, fx.root());
+        drop(eng);
+
+        assert_eq!(r.total, 2, "codex 夹具应产出 2 个节点");
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+    }
+
+    #[test]
+    fn import_all_from_fixture_totals_and_sources() {
+        let fx = Fixture::new("all");
+        fx.write(
+            "memories/MEMORY.md",
+            "Single hermes entry: deterministic body long enough to import",
+        );
+        fx.write(
+            "projects/demo/memory/only.md",
+            "---\nname: claude-only\ntype: knowledge\n---\nDeterministic claude body that is long enough to import.",
+        );
+        fx.write(
+            "history.jsonl",
+            "{\"text\":\"Deterministic codex entry with enough characters to pass the fifty char filter\"}",
+        );
+
+        let mut eng = fx.engine();
+        let result = import_all_from(&mut eng, false, fx.root(), fx.root(), fx.root());
+        drop(eng);
+        let reopened = fx.engine();
+        let persisted = reopened.stats();
+        assert_eq!(persisted["node_count"].as_u64(), Some(3));
+        for source in ["hermes", "claude", "codex"] {
+            assert_eq!(persisted["source_counts"][source].as_u64(), Some(1));
+        }
+        drop(reopened);
+
+        assert_eq!(result["total_nodes"].as_u64(), Some(3));
+        assert_eq!(result["sources"]["hermes"]["nodes"].as_u64(), Some(1));
+        assert_eq!(result["sources"]["claude"]["nodes"].as_u64(), Some(1));
+        assert_eq!(result["sources"]["codex"]["nodes"].as_u64(), Some(1));
+        let errors = errors_of(&result);
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+    }
+
+    #[test]
+    fn import_all_from_missing_sources_reports_errors_and_zero_totals() {
+        let fx = Fixture::new("missing");
+
+        let mut eng = fx.engine();
+        let result = import_all_from(&mut eng, false, fx.root(), fx.root(), fx.root());
+        drop(eng);
+
+        assert_eq!(result["total_nodes"].as_u64(), Some(0));
+        assert_eq!(result["sources"]["hermes"]["nodes"].as_u64(), Some(0));
+        assert_eq!(result["sources"]["claude"]["nodes"].as_u64(), Some(0));
+        assert_eq!(result["sources"]["codex"]["nodes"].as_u64(), Some(0));
+
+        let errors = errors_of(&result);
+        assert_eq!(errors.len(), 3, "errors: {:?}", errors);
+        assert!(
+            errors.iter().any(|e| e.starts_with("hermes:") && e.contains("memories dir not found")),
+            "errors: {:?}",
+            errors
+        );
+        assert!(
+            errors.iter().any(|e| e.starts_with("claude:") && e.contains("not found")),
+            "errors: {:?}",
+            errors
+        );
+        assert!(
+            errors.iter().any(|e| e.starts_with("codex:") && e.contains("not found")),
+            "errors: {:?}",
+            errors
+        );
     }
 }

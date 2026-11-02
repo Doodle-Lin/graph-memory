@@ -87,3 +87,12 @@
 - 本地完整脚本通过：11项Rust、102项配置、73项真实控件+隔离HTTP、真实MCP服务生命周期集成及自包含客户端smoke。已有Rust警告保留，不声称零警告。
 - 独立注入首个cargo命令退出23，验证立即中止且恢复GM环境。首次测试发现.NET环境变量置null仍使PowerShell Env项可见，改用Env provider删除/恢复后通过。没有使用真实Agent配置和工作库。
 - 工作流YAML解析及事件/权限核对通过；Actions版本参数对照各官方action.yml。GitHub Actions已启用；main目前没有分支保护或ruleset。远端干净运行和必需检查设置尚未完成，不提前标验收通过。
+
+### L1-06 首轮远端失败与修复
+
+- HTTPS推送新增workflow被现有凭据缺少workflow scope拒绝。未扩权或修改凭据；使用已有SSH密钥和单命令代理成功推送58c774e，没有改全局Git配置。
+- 首轮远端run 41413688439在Rust库测试失败：旧import_all_writes_real_data依赖开发机真实记忆，干净Windows没有数据而断言total>0。失败后下游没有继续，证明脚本能传播测试失败。
+- 更正本地隔离结论：旧Rust导入测试曾读取本机现有记忆并导入临时测试库，不会改原文件，但不能称为纯合成隔离。本轮发现后移除这些依赖及无文件就跳过的行为；此前服务/桌面/配置测试仍使用隔离目录。
+- Codex以空HERMES_HOME/CLAUDE_HOME/CODEX_HOME运行旧测试二进制，复现exit101。随后保持公开导入API及默认目录规则，抽出显式目录的内部实现；Claude CLI 48秒提供固定样本测试（无工具权限），Codex审查应用并补充重新打开数据库核验数量及来源。
+- 新6个样本用例覆盖Hermes MEMORY/USER/技能及跳过自身技能、Claude frontmatter/噪声、Codex JSONL噪声/坏行、三源汇总、缺失源；每个UUID临时目录，释放数据库后清理，不改全局环境、不跳过、不读取真实宿主目录。
+- 修改后本地完整脚本通过：13项Rust、102项配置、73项编辑/关闭、stdio/HTTP及自包含客户端smoke。最后新增持久化断言再跑13项Rust通过。等待第二轮远端干净验证。
