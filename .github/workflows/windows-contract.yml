@@ -1,0 +1,52 @@
+name: Windows v1 contract
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-contract-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-contract:
+    name: Windows v1 contract
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust stable (minimal profile)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed ($LASTEXITCODE)" }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup default stable failed ($LASTEXITCODE)" }
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw "rustc --version failed ($LASTEXITCODE)" }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw "cargo --version failed ($LASTEXITCODE)" }
+
+      - name: Run Windows v1 contract
+        shell: pwsh
+        run: ./scripts/test-windows.ps1 -Dotnet dotnet -Python python

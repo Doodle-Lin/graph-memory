@@ -29,7 +29,6 @@ benchmark_report*.json
 # Rust/Tauri build output
 src-tauri/target/
 src-tauri/gen/
-src-tauri/Cargo.lock
 
 # Tauri 运行日志
 src-tauri/*.log

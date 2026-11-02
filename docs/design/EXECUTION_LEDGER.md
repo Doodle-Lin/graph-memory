@@ -9,7 +9,7 @@
 | L1-03 未知类型兼容 | 验收通过 | 本地 Claude CLI / sonnet | Codex | 7986925 | 41项真实控件+隔离HTTP检查通过，基线同用例失败 |
 | L1-04 草稿退出保护 | 验收通过 | 本地 Claude CLI，Codex 补充验证 | Codex | c3e3d47 | 73项编辑/关闭检查，原生取消/保存退出与截图通过 |
 | L1-05 新版入口统一 | 验收通过 | Claude 文案初稿 / Codex 集成 | Codex | eedb26d | 新版首页/技能/架构入口，旧版归档；18 个本地链接及五工具契约核对通过 |
-| L1-06 Windows 契约 CI | 待开始 | 本地 Claude CLI | Codex | L1-01..05 后 | 干净 checkout 构建与隔离回归 |
+| L1-06 Windows 契约 CI | 本地通过，待远端验收 | Claude 初稿 / Codex 修正验证 | Codex | de76d9a | Windows workflow + 共用脚本；远端干净构建及必需检查待核对 |
 | L1-07 宿主矩阵 | 待开始 | Codex 主验收，Claude 辅助样例 | Codex | L1-06 后 | 不把本地组件测试当作宿主调用 |
 | L2–L5 | 未进入 | 按计划拆分委派 | Codex | 满足阶段依赖后 | 不提前标完成 |
 
@@ -78,3 +78,12 @@
 - Codex独立核对源代码 scoped_tools_list：README/SKILL与全部五工具一致；18个相对文档链接可解析；PowerShell构建脚本语法有效；git diff --check通过。技能校验器最初因Windows默认GBK读取UTF-8失败，以python -X utf8重跑通过。
 - 核对build-desktop.ps1及csproj的实际构建/复制目标；桌面文档的smoke目录改为GUID，避免重复使用固定测试库。这是文档批次，没有重建或覆盖运行中的用户安装，也没有宣称在全新机器完成构建或真实宿主调用。此前代码验收记录继续有效。
 - 下一项L1-06：Windows干净checkout契约CI；随后L1-07真实宿主矩阵。两项尚未完成。
+
+## L1-06 本地验收（2026-11-02）
+
+- Claude CLI 71秒返回workflow和runner文本草案，无工具权限。返回带代码围栏及额外说明，Codex解析后审查；草稿错误猜测两个测试项目路径，已按仓库真实路径修正。路由stderr报告GLM-5.2映射，不把请求sonnet等同于底层模型身份。
+- 增加Windows push/PR/手动工作流，contents只读权限、并发取消与45分钟上限；不发布或修改宿主。共用test-windows.ps1检查每个命令退出码，WinExe显式等待并读取退出码与日志。
+- Cargo.lock从忽略改为跟踪，Rust构建/库测试使用--locked。原build-desktop脚本同步锁定依赖；CI使用独立artifacts/ci-desktop。
+- 本地完整脚本通过：11项Rust、102项配置、73项真实控件+隔离HTTP、真实MCP服务生命周期集成及自包含客户端smoke。已有Rust警告保留，不声称零警告。
+- 独立注入首个cargo命令退出23，验证立即中止且恢复GM环境。首次测试发现.NET环境变量置null仍使PowerShell Env项可见，改用Env provider删除/恢复后通过。没有使用真实Agent配置和工作库。
+- 工作流YAML解析及事件/权限核对通过；Actions版本参数对照各官方action.yml。GitHub Actions已启用；main目前没有分支保护或ruleset。远端干净运行和必需检查设置尚未完成，不提前标验收通过。

@@ -69,3 +69,11 @@ $smokeDir = Join-Path $env:TEMP ("gm-desktop-smoke-" + [guid]::NewGuid().ToStrin
 **时间含义：**创建/更新时间不是事件发生时间，历史导入的创建日期可能是导入日。返回的是最新版本，不是历史月末快照；某记录在期间内更新、之后再次更新时，不会出现在该期间的 updated_at 筛选中。当前接口不提供逐次变更日志或 occurred_at 筛选，不能用它证明某个时期全部发生过的工作。
 
 编辑回归使用 [Avalonia Headless](https://docs.avaloniaui.net/docs/testing/setting-up-the-headless-platform) 加载真实XAML控件并连接隔离HTTP服务，覆盖打开、保存、跨项目草稿和版本恢复；它不替代原生截图、多DPI或键盘可达性检查。运行前需构建Rust服务；可给Desktop.Editor.Tests传入服务可执行文件路径。
+
+## Windows 契约 CI
+
+本地与 GitHub Actions 共用 `pwsh -File scripts/test-windows.ps1`。需要 PowerShell 7、Rust MSVC、.NET 10 SDK 与 Python 3.12；本机 dotnet 不在 PATH 时可传 `-Dotnet <dotnet.exe路径>`。
+
+脚本以 Cargo.lock 锁定 Rust 依赖，构建无 Tauri 的服务及 MCP，运行 Rust 库测试、真实 stdio/HTTP 集成、配置与编辑/退出回归，再发布自包含客户端并运行隔离 smoke。输出为 `artifacts/ci-desktop`，不覆盖日常安装；测试使用临时目录，清除并恢复继承的 GM_* 环境变量。smoke 是客户端协议验收，不是像素截图验收。
+
+工作流 `.github/workflows/windows-contract.yml` 在 push、pull_request 和手动触发时运行；步骤失败即失败，无自动部署或发布。检查名为 `Windows v1 contract`。分支保护是否已启用及远端实际结果见[验收台账](../docs/design/EXECUTION_LEDGER.md)，单有工作流文件不代表已禁止失败合并。
