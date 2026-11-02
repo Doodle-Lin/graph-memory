@@ -57,3 +57,5 @@
 ## License
 
 MIT
+
+宿主实际验证范围与未完成项见[兼容验收矩阵](docs/HOST_COMPATIBILITY.md)；配置成功不等于Agent已经调用或采用记忆。

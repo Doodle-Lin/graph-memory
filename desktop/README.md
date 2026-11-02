@@ -77,3 +77,5 @@ $smokeDir = Join-Path $env:TEMP ("gm-desktop-smoke-" + [guid]::NewGuid().ToStrin
 脚本以 Cargo.lock 锁定 Rust 依赖，构建无 Tauri 的服务及 MCP，运行 Rust 库测试、真实 stdio/HTTP 集成、配置与编辑/退出回归，再发布自包含客户端并运行隔离 smoke。输出为 `artifacts/ci-desktop`，不覆盖日常安装；测试使用临时目录，清除并恢复继承的 GM_* 环境变量。smoke 是客户端协议验收，不是像素截图验收。
 
 工作流 `.github/workflows/windows-contract.yml` 在 push、pull_request 和手动触发时运行；步骤失败即失败，无自动部署或发布。检查名为 `Windows v1 contract`。分支保护是否已启用及远端实际结果见[验收台账](../docs/design/EXECUTION_LEDGER.md)，单有工作流文件不代表已禁止失败合并。
+
+宿主实际验证范围与未完成项见[兼容验收矩阵](../docs/HOST_COMPATIBILITY.md)；配置成功不等于Agent已经调用或采用记忆。
