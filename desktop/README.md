@@ -14,6 +14,7 @@ Windows x64 可运行开发版：双击 `artifacts/desktop/GraphMemory.Desktop.e
 - 个人经验 → 记一条 → 保存：无需项目，可记录踩坑、方法、来源和适用条件。
 - 新建项目后记录进展、决策、阻塞、下一步。项目视图同时显示个人经验，不混入其他项目事实。
 - 手动备用 → 准备复制背景：只供不支持 MCP 的工具，复制前读取最新记忆。
+- Agent写入的自定义记录类型会保留并显示为自定义选项，编辑正文和跨项目恢复草稿不会把它悄悄改成笔记；只有主动切换类型才会更改。
 - 选择记录可纠正、查看版本历史、恢复上一版；并发版本冲突时保留当前草稿，可加载历史核对，再明确选择“放弃草稿并加载最新”。恢复上一版、提炼经验前须先保存当前编辑；提炼不会覆盖个人经验中已有的草稿。
 - 项目记录可以提炼为个人经验草稿，保留原案例引用，核对适用条件后保存。
 - 一键接入会合并用户级配置，备份原文件，迁移单个可识别且无工具权限策略的旧 Graph Memory 入口，保留其他设置和其他 MCP 服务；现有 v1 工具限制保持不变。旧入口包含工具限制/未知权限策略，或检测到多个记忆入口时，拒绝自动迁移，需手动核对，避免扩大权限。Hermes 的非受管 YAML 节点保留数值、布尔、空值和字符串语义；配置格式和注释可能被序列化器规范化；原始字节保存在配置旁的 `.graph-memory-*.bak` 中。
@@ -33,6 +34,7 @@ Claude Code 默认读取 `~/.claude.json`（支持 `CLAUDE_CONFIG_DIR`），Code
 ./scripts/build-desktop.ps1
 python tests/test_headless_service.py
 dotnet run --project tests/Desktop.Setup.Tests
+dotnet run --project tests/Desktop.Editor.Tests
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
 ./artifacts/desktop/GraphMemory.Desktop.exe --smoke-test --data-dir "$env:TEMP/gm-desktop-smoke-unique"
 ```
@@ -63,3 +65,5 @@ cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
 项目复盘改为 `scope=project` 并传入 `memory_projects` 返回的真实项目 ID；只复盘决策时再加 `kind=decision`。Agent 可据素材组织成果、决策、问题、经验和后续行动，并标注记录 ID、版本、来源及适用条件；没有依据的进展不能补写。
 
 **时间含义：**创建/更新时间不是事件发生时间，历史导入的创建日期可能是导入日。返回的是最新版本，不是历史月末快照；某记录在期间内更新、之后再次更新时，不会出现在该期间的 updated_at 筛选中。当前接口不提供逐次变更日志或 occurred_at 筛选，不能用它证明某个时期全部发生过的工作。
+
+编辑回归使用 [Avalonia Headless](https://docs.avaloniaui.net/docs/testing/setting-up-the-headless-platform) 加载真实XAML控件并连接隔离HTTP服务，覆盖打开、保存、跨项目草稿和版本恢复；它不替代原生截图、多DPI或键盘可达性检查。运行前需构建Rust服务；可给Desktop.Editor.Tests传入服务可执行文件路径。

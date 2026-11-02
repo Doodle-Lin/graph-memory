@@ -6,7 +6,7 @@
 |---|---|---|---|---|---|
 | L1-01 接入迁移保护 | 已推送 | 本地 Claude CLI / sonnet | Codex | d69133c | Claude 交付后 Codex 审查；68 项检查通过；明确安全拒绝提示已补齐 |
 | L1-02 YAML 类型保真 | 验收通过 | Claude 初稿 / Codex 修复 | Codex | 待 L1-01 集成 | 102 项配置检查通过；原节点保真；受管 env/type 校正；详见本轮验收 |
-| L1-03 未知类型兼容 | 待开始 | 本地 Claude CLI | Codex | 待定 | API 与桌面真实交互契约 |
+| L1-03 未知类型兼容 | 验收通过 | 本地 Claude CLI / sonnet | Codex | 7986925 | 41项真实控件+隔离HTTP检查通过，基线同用例失败 |
 | L1-04 草稿退出保护 | 待开始 | 本地 Claude CLI | Codex | L1-03 后 | 保存/放弃/取消及并发冲突 |
 | L1-05 新版入口统一 | 待开始 | 本地 Claude CLI | Codex | 首批完成后 | 根 README/SKILL 与旧版归档 |
 | L1-06 Windows 契约 CI | 待开始 | 本地 Claude CLI | Codex | L1-01..05 后 | 干净 checkout 构建与隔离回归 |
@@ -47,3 +47,13 @@
 ## 下一批
 
 按LONG_TERM_PLAN.md执行L1-03 → L1-04：先使未知kind打开/保存不被误改，再处理当前和跨项目草稿退出保护。Claude运行器下一次必须以整个子进程树为超时边界，避免shell结束后子CLI悬挂；不把该启动器缺陷伪装成模型完成。
+
+## L1-03 验收（2026-11-02）
+
+- 本地Claude在隔离副本交付，97秒正常退出，只修改MainWindow.axaml及其代码；未使用真实MCP、配置或记忆库。
+- 实现以原始kind字符串作为选项值和草稿值，保留五个中文内置标签，未知值单独显示且不累积。HasDraft、创建签名、写入/纠正、草稿恢复使用同一值。
+- Codex独立建立Desktop.Editor.Tests：加载实际App/XAML/MainWindow控件，使用Avalonia.Headless运行事件处理逻辑，连接新临时目录中的真实Rust HTTP服务；没有复制一套假的保存逻辑。
+- 修改前第一条用例失败：opening kind creates false draft: lesson。修改后41项通过：lesson、中文、空类型、decision；未编辑关闭、内容保存、跨项目草稿恢复、显式改note、恢复前版、新记录默认note、选项不累积。
+- 本轮不是原生像素/多DPI验收，不将Headless控件验证称为Windows截图验证。后续L1-04原生关窗交互可一并复核动态类型显示。
+- 委派运行器改用文件收集输出及整棵子进程树超时终止，正常完成未触发超时。测试只使用隔离数据；候选包更新至artifacts/desktop-l1。
+- 下一项：L1-04草稿退出保护；仍待开始，不是后台自动运行状态。

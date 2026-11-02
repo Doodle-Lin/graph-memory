@@ -63,7 +63,7 @@
         <TextBox x:Name="ContentInput" Watermark="发生了什么？怎么解决的？" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="140" MaxHeight="260"/>
         <Expander Header="补充详情"><StackPanel Spacing="12" Margin="0,10,0,0">
          <TextBlock Text="记录类型" FontSize="12" Foreground="{DynamicResource MutedBrush}"/>
-         <ComboBox x:Name="Kind" SelectedIndex="0" HorizontalAlignment="Stretch"><ComboBoxItem Content="经验 / 笔记"/><ComboBoxItem Content="当前状态"/><ComboBoxItem Content="决策"/><ComboBoxItem Content="阻塞"/><ComboBoxItem Content="下一步"/></ComboBox>
+         <ComboBox x:Name="Kind" HorizontalAlignment="Stretch"/>
          <TextBox x:Name="SourceInput" Watermark="来源：会话、文档或测试记录"/>
          <TextBox x:Name="ConditionsInput" Watermark="适用条件，例如 Windows / PowerShell" AcceptsReturn="True" TextWrapping="Wrap"/>
          <TextBlock x:Name="EvidenceLabel" Text="陈述，尚未核实" Foreground="{DynamicResource MutedBrush}" FontSize="12" TextWrapping="Wrap"/>

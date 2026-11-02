@@ -43,3 +43,6 @@ tests/Desktop.Setup.Tests/bin/
 tests/Desktop.Setup.Tests/obj/
 
 artifacts/
+
+tests/Desktop.Editor.Tests/bin/
+tests/Desktop.Editor.Tests/obj/

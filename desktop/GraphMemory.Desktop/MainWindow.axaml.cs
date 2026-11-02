@@ -5,6 +5,7 @@ using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Collections.ObjectModel;
 namespace GraphMemory.Desktop;
 
 public sealed record ProjectItem(string Id,string Name) { public override string ToString()=>Name; }
@@ -19,6 +20,8 @@ public sealed record MemoryItem(JsonNode Data) {
     public string Preview { get { var text=Text("content").Replace("\r", " ").Replace("\n", " "); return text.Length>160?text[..160]+"…":text; } }
     public string Text(string key)=>Data[key]?.GetValue<string>()??"";
 }
+// ComboBox 选项：Value 是写回服务端的原始 kind 字符串，Label 是人类可读文案（含自定义 kind）。
+public sealed record KindOption(string Value,string Label) { public override string ToString()=>Label; }
 public partial class MainWindow : Window {
     readonly ServiceHost host=new();
     readonly DispatcherTimer activityTimer=new(){Interval=TimeSpan.FromSeconds(10)};
@@ -59,18 +62,30 @@ public partial class MainWindow : Window {
     string? origin;
     string eventId=Guid.NewGuid().ToString(),lastRequest="";
     bool switching,busy;
-    readonly string[] kinds=["note","status","decision","blocker","next"];
-    readonly Dictionary<string,(string title,string content,string source,string conditions,MemoryItem? memory,string? origin,int kind,string eventId,string request)> drafts=new();
+    // 固定 5 个已知类型；未知 kind 会临时追加一个自定义选项，且不累积。
+    readonly KindOption[] knownKinds=[new("note","经验 / 笔记"),new("status","当前状态"),new("decision","决策"),new("blocker","阻塞"),new("next","下一步")];
+    readonly ObservableCollection<KindOption> kindOptions=new();
+    readonly Dictionary<string,(string title,string content,string source,string conditions,MemoryItem? memory,string? origin,string kind,string eventId,string request)> drafts=new();
+    void InitializeKinds(){foreach(var option in knownKinds)kindOptions.Add(option);Find<ComboBox>("Kind").ItemsSource=kindOptions;SetKind("note");}
+    static string KindLabel(string kind)=>string.IsNullOrEmpty(kind)?"自定义：（未设置）":$"自定义：{kind}";
+    // 只保留一个自定义选项；未知/空 kind 原样保留，已知 kind 选中对应的固定选项。
+    void SetKind(string kind){
+        while(kindOptions.Count>knownKinds.Length)kindOptions.RemoveAt(kindOptions.Count-1);
+        var option=kindOptions.FirstOrDefault(x=>x.Value==kind);
+        if(option==null){option=new KindOption(kind,KindLabel(kind));kindOptions.Add(option);}
+        Find<ComboBox>("Kind").SelectedItem=option;
+    }
+    string SelectedKind()=>Find<ComboBox>("Kind").SelectedItem is KindOption option?option.Value:"note";
     T Find<T>(string name) where T:Control => this.FindControl<T>(name)!;
     string Text(string name)=>Find<TextBox>(name).Text??"";
     void Set(string name,string text)=>Find<TextBox>(name).Text=text;
     bool HasDraft()=>selected==null
         ? !string.IsNullOrWhiteSpace(Text("TitleInput")+Text("ContentInput")+Text("SourceInput")+Text("ConditionsInput"))
-        : Text("TitleInput")!=selected.Title || Text("ContentInput")!=selected.Text("content") || Text("SourceInput")!=selected.Text("source") || Text("ConditionsInput")!=selected.Text("conditions") || kinds[Math.Max(0,Find<ComboBox>("Kind").SelectedIndex)]!=selected.Text("kind");
+        : Text("TitleInput")!=selected.Title || Text("ContentInput")!=selected.Text("content") || Text("SourceInput")!=selected.Text("source") || Text("ConditionsInput")!=selected.Text("conditions") || SelectedKind()!=selected.Text("kind");
     void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
     void CloseEditorClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(false);Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";}
     void StatusMessage(string text)=>Find<TextBlock>("Status").Text=text;
-    public MainWindow(){AvaloniaXamlLoader.Load(this);Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
+    public MainWindow(){AvaloniaXamlLoader.Load(this);InitializeKinds();Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
     async Task Run(Func<Task> action){if(busy)return;busy=true;try{await action();}catch(Exception e){bool conflict=e.Message.Contains("HTTP 409");Find<Button>("ReloadButton").IsVisible=conflict&&selected!=null;Find<Button>("ReconnectButton").IsVisible=!conflict;StatusMessage(conflict?"记录已被其他会话修改，草稿仍保留。可加载历史核对；放弃草稿后再载入最新版本。":e.Message);}finally{busy=false;}}
     async Task Connect()=>await Run(async()=>{StatusMessage("正在连接本地服务…");var url=await host.EnsureAsync(Program.Arguments);client?.Dispose();client=new ServiceClient(url);await LoadProjects();await LoadMemories();await LoadAgentStatus();Find<Button>("ReconnectButton").IsVisible=false;StatusMessage("");});
     ServiceClient Api()=>client??throw new InvalidOperationException("服务尚未连接，请点击重新连接。");
@@ -81,20 +96,20 @@ public partial class MainWindow : Window {
         Find<TextBlock>("EmptyHeading").Text=searching?"没有找到相关记忆":"还没有记忆";
         Find<TextBlock>("EmptyHint").Text=searching?"试试更短的关键词，或清空搜索。":"接入 Agent 后，记忆会在工具调用时沉淀；也可以手动记一条。";
     }
-    void ClearEditor(){Find<Button>("ReloadButton").IsVisible=false;selected=null;origin=null;eventId=Guid.NewGuid().ToString();lastRequest="";Set("TitleInput","");Set("ContentInput","");Set("SourceInput","");Set("ConditionsInput","");Find<ComboBox>("Kind").SelectedIndex=0;Find<TextBlock>("EditorHeading").Text=project==null?"记一条个人经验":"记录项目进展";Find<TextBlock>("EvidenceLabel").Text="陈述不会自动变成已验证事实。";Find<Button>("UndoButton").IsVisible=false;Find<Button>("PromoteButton").IsVisible=false;Find<TextBlock>("HistoryText").Text="";}
-    async Task SwitchScope(ProjectItem? next){if(HasDraft())drafts[project?.Id??"personal"]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),selected,origin,Find<ComboBox>("Kind").SelectedIndex,eventId,lastRequest);else drafts.Remove(project?.Id??"personal");ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").SelectedItem=Find<ListBox>("Projects").Items.Cast<ProjectItem>().FirstOrDefault(x=>x.Id==next?.Id);switching=false;Find<Button>("PersonalButton").Classes.Set("scopeSelected",next==null);ClearEditor();Set("Query","");Find<Border>("ContextPanel").IsVisible=false;Find<TextBlock>("ScopeTitle").Text=next?.Name??"个人经验";Find<TextBlock>("ScopeHint").Text=next==null?"踩过的坑、学到的方法，不必属于某个项目。":"查看本项目记录与相关个人经验，其他项目事实不会混入。";if(drafts.TryGetValue(project?.Id??"personal",out var draft)){Set("TitleInput",draft.title);Set("ContentInput",draft.content);Set("SourceInput",draft.source);Set("ConditionsInput",draft.conditions);selected=draft.memory;origin=draft.origin;eventId=draft.eventId;lastRequest=draft.request;Find<ComboBox>("Kind").SelectedIndex=draft.kind;Find<Button>("UndoButton").IsVisible=selected?.Version>1;Find<Button>("PromoteButton").IsVisible=selected?.Scope=="project";Find<TextBlock>("EditorHeading").Text=selected==null?"继续草稿":"继续纠正（保存时校验版本）";}Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";await LoadMemories();}
+    void ClearEditor(){Find<Button>("ReloadButton").IsVisible=false;selected=null;origin=null;eventId=Guid.NewGuid().ToString();lastRequest="";Set("TitleInput","");Set("ContentInput","");Set("SourceInput","");Set("ConditionsInput","");SetKind("note");Find<TextBlock>("EditorHeading").Text=project==null?"记一条个人经验":"记录项目进展";Find<TextBlock>("EvidenceLabel").Text="陈述不会自动变成已验证事实。";Find<Button>("UndoButton").IsVisible=false;Find<Button>("PromoteButton").IsVisible=false;Find<TextBlock>("HistoryText").Text="";}
+    async Task SwitchScope(ProjectItem? next){if(HasDraft())drafts[project?.Id??"personal"]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),selected,origin,SelectedKind(),eventId,lastRequest);else drafts.Remove(project?.Id??"personal");ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").SelectedItem=Find<ListBox>("Projects").Items.Cast<ProjectItem>().FirstOrDefault(x=>x.Id==next?.Id);switching=false;Find<Button>("PersonalButton").Classes.Set("scopeSelected",next==null);ClearEditor();Set("Query","");Find<Border>("ContextPanel").IsVisible=false;Find<TextBlock>("ScopeTitle").Text=next?.Name??"个人经验";Find<TextBlock>("ScopeHint").Text=next==null?"踩过的坑、学到的方法，不必属于某个项目。":"查看本项目记录与相关个人经验，其他项目事实不会混入。";if(drafts.TryGetValue(project?.Id??"personal",out var draft)){Set("TitleInput",draft.title);Set("ContentInput",draft.content);Set("SourceInput",draft.source);Set("ConditionsInput",draft.conditions);selected=draft.memory;origin=draft.origin;eventId=draft.eventId;lastRequest=draft.request;SetKind(draft.kind);Find<Button>("UndoButton").IsVisible=selected?.Version>1;Find<Button>("PromoteButton").IsVisible=selected?.Scope=="project";Find<TextBlock>("EditorHeading").Text=selected==null?"继续草稿":"继续纠正（保存时校验版本）";}Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";await LoadMemories();}
     async void PersonalClick(object? s,RoutedEventArgs e)=>await Run(async()=>{switching=true;Find<ListBox>("Projects").SelectedItem=null;switching=false;await SwitchScope(null);});
     async void ProjectChanged(object? s,SelectionChangedEventArgs e){if(!switching&&Find<ListBox>("Projects").SelectedItem is ProjectItem item)await Run(()=>SwitchScope(item));}
     async void CreateProjectClick(object? s,RoutedEventArgs e)=>await Run(async()=>{var response=await Api().PostAsync("api/v1/projects",new{name=Text("ProjectName")});var next=new ProjectItem(response["id"]!.GetValue<string>(),Text("ProjectName"));Set("ProjectName","");await LoadProjects();await SwitchScope(next);StatusMessage("项目已创建，可以直接记录进展。");});
     async void SearchClick(object? s,RoutedEventArgs e)=>await Run(async()=>{ShowEditor(false);await LoadMemories();});
     void NewClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(true);Find<Border>("ContextPanel").IsVisible=false;Find<TextBox>("ContentInput").Focus();}
     void MemoryChanged(object? s,SelectionChangedEventArgs e){if(Find<ListBox>("Memories").SelectedItem is not MemoryItem memory)return;if(HasDraft()){ShowEditor(true);StatusMessage("有未保存的编辑，请先保存后再打开其他记录。");return;}ShowEditor(true);ApplyMemory(memory);}
-    void ApplyMemory(MemoryItem memory){Find<Button>("ReloadButton").IsVisible=false;selected=memory;origin=null;Set("TitleInput",memory.Title);Set("ContentInput",memory.Text("content"));Set("SourceInput",memory.Text("source"));Set("ConditionsInput",memory.Text("conditions"));Find<ComboBox>("Kind").SelectedIndex=Math.Max(0,Array.IndexOf(kinds,memory.Text("kind")));Find<TextBlock>("EditorHeading").Text="查看与纠正";Find<TextBlock>("EvidenceLabel").Text=$"{memory.Summary}\n依据：陈述，尚未核实\n更新：{memory.Text("updated_at")}";Find<Button>("UndoButton").IsVisible=memory.Version>1;Find<Button>("PromoteButton").IsVisible=memory.Scope=="project";Find<TextBlock>("HistoryText").Text="";}
+    void ApplyMemory(MemoryItem memory){Find<Button>("ReloadButton").IsVisible=false;selected=memory;origin=null;Set("TitleInput",memory.Title);Set("ContentInput",memory.Text("content"));Set("SourceInput",memory.Text("source"));Set("ConditionsInput",memory.Text("conditions"));SetKind(memory.Text("kind"));Find<TextBlock>("EditorHeading").Text="查看与纠正";Find<TextBlock>("EvidenceLabel").Text=$"{memory.Summary}\n依据：陈述，尚未核实\n更新：{memory.Text("updated_at")}";Find<Button>("UndoButton").IsVisible=memory.Version>1;Find<Button>("PromoteButton").IsVisible=memory.Scope=="project";Find<TextBlock>("HistoryText").Text="";}
     async void SaveClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
         if(string.IsNullOrWhiteSpace(Text("ContentInput")))throw new InvalidOperationException("请先填写记忆内容。");
         JsonNode response;
-        if(selected!=null)response=await Api().PostAsync("api/v1/memories/update",new{id=selected.Id,expected_version=selected.Version,kind=kinds[Math.Max(0,Find<ComboBox>("Kind").SelectedIndex)],title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput")});
-        else{var signature=JsonSerializer.Serialize(new{scope=project?.Id,title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),kind=Find<ComboBox>("Kind").SelectedIndex,origin});if(lastRequest!=""&&lastRequest!=signature)eventId=Guid.NewGuid().ToString();lastRequest=signature;response=await Api().PostAsync("api/v1/memories",new{memory_scope=project==null?"personal":"project",project_id=project?.Id,event_id=eventId,title=string.IsNullOrWhiteSpace(Text("TitleInput"))?"记忆":Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),origin_memory_id=origin,kind=kinds[Math.Max(0,Find<ComboBox>("Kind").SelectedIndex)]});}
+        if(selected!=null)response=await Api().PostAsync("api/v1/memories/update",new{id=selected.Id,expected_version=selected.Version,kind=SelectedKind(),title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput")});
+        else{var signature=JsonSerializer.Serialize(new{scope=project?.Id,title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),kind=SelectedKind(),origin});if(lastRequest!=""&&lastRequest!=signature)eventId=Guid.NewGuid().ToString();lastRequest=signature;response=await Api().PostAsync("api/v1/memories",new{memory_scope=project==null?"personal":"project",project_id=project?.Id,event_id=eventId,title=string.IsNullOrWhiteSpace(Text("TitleInput"))?"记忆":Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),origin_memory_id=origin,kind=SelectedKind()});}
         selected=new MemoryItem(response["memory"]!.DeepClone());drafts.Remove(project?.Id??"personal");Find<Border>("ContextPanel").IsVisible=false;await LoadMemories();StatusMessage($"已保存 v{selected.Version}。原有上下文已失效，需要重新生成。");Find<Button>("UndoButton").IsVisible=selected.Version>1;ShowEditor(false);ClearEditor();Find<Button>("NewMemoryButton").Content="记一条";
     });
     async void PromoteClick(object? s,RoutedEventArgs e)=>await Run(async()=>{if(selected==null)return;if(HasDraft())throw new InvalidOperationException("请先保存当前修改，再沉淀为个人经验。");if(drafts.TryGetValue("personal",out var personalDraft)&&!string.IsNullOrWhiteSpace(personalDraft.content+personalDraft.title+personalDraft.source+personalDraft.conditions))throw new InvalidOperationException("个人经验中已有草稿，请先处理后再沉淀。");var old=selected;switching=true;Find<ListBox>("Projects").SelectedItem=null;switching=false;await SwitchScope(null);ClearEditor();ShowEditor(true);origin=old.Id;Set("TitleInput",old.Title);Set("ContentInput",old.Text("content"));Set("SourceInput",old.Text("source"));Set("ConditionsInput",old.Text("conditions"));StatusMessage("已准备个人经验草稿，保留原记录引用。请核对适用条件后保存。");});
