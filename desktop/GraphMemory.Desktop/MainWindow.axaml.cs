@@ -3,6 +3,7 @@ using Avalonia.Animation;
 using Avalonia.Threading;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
+using Avalonia.Platform.Storage;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Collections.ObjectModel;
@@ -134,13 +135,130 @@ public partial class MainWindow : Window {
         await LoadMemories();
         StatusMessage(retract?$"已撤回 v{updated.Version}：默认检索与续接不再采用这条记录，记录没有被删除，可用“恢复这条”还原。":$"已恢复 v{updated.Version}：重新参与检索与续接，历史仍保留撤回痕迹。");
     }
+    // —— P2-A 数据面板：只调用同目录 graph-memory-backup.exe；桌面自身从不读写工作库，也没有任何覆盖动作 ——
+    string dataDir="";
+    string pendingRestoreInput="",pendingRestoreTarget="";
+    static bool IsWritableDirectory(string? path)=>IsExistingDirectory(path)&&(new DirectoryInfo(path!).Attributes&FileAttributes.ReadOnly)==0;
+    static bool IsExistingDirectory(string? path){if(string.IsNullOrWhiteSpace(path))return false;try{return Directory.Exists(path);}catch{return false;}}
+    string DataTextBox(string name)=>Find<TextBox>(name)==null?"":Find<TextBox>(name).Text??"";
+    void SetDataStatus(string text){var label=Find<TextBlock>("DataStatus2");if(label!=null)label.Text=text;var sidebar=Find<TextBlock>("DataStatus");if(sidebar!=null)sidebar.Text=text.Split('\n')[0];}
+    // 失败一律给出退出码 + stderr 原文，成功给出 CLI 的 JSON 原文，绝不静默。
+    void ShowBackupResult(BackupResult result){
+        Set("DataOutput",result.Ok?result.StandardOutput.Trim():$"exit code {result.ExitCode}\n{result.StandardError.Trim()}");
+    }
+    // 服务未连接或库目录未知时禁用动作并说明原因，避免用户提交后才发现不可用。
+    void RefreshDataPanel(){
+        var connected=client!=null;var known=!string.IsNullOrWhiteSpace(dataDir);var writable=IsWritableDirectory(Path.GetDirectoryName(dataDir));
+        Find<TextBlock>("DataDirText").Text=known?$"当前工作库目录（由本地服务报告）：{dataDir}":connected?"当前工作库目录未知：服务没有返回 data_dir。导出暂时不可用，可点右下角“重试连接”。":"服务未连接，无法读取工作库目录。导出暂时不可用，可点右下角“重试连接”。";
+        Find<TextBlock>("DataCountText").Text=known?"记录计数见下方；导出与校验使用下方输入的路径。导出可在服务运行中执行，不需要先停止服务。":"导出需要先连接服务并取得工作库目录；校验与恢复只需选择文件，不依赖服务。";
+        Find<Button>("ExportBackupButton").IsEnabled=known&&writable;
+        Find<Button>("ExportBackupButton").Content=connected&&known&&writable?"导出备份":"导出备份（不可用）";
+        Find<Button>("VerifyBackupButton").IsEnabled=true;
+        var restorable=!string.IsNullOrWhiteSpace(DataTextBox("RestoreInputPath"))&&!string.IsNullOrWhiteSpace(DataTextBox("RestoreTargetDirInput"));
+        Find<Button>("RestoreDryRunButton").IsEnabled=restorable;
+        Find<Button>("RestoreApplyButton").IsEnabled=restorable;
+        Find<Button>("ConfirmRestoreButton").IsEnabled=restorable;
+    }
+    void CloseDataPanelClick(object? s,RoutedEventArgs e){Find<Border>("DataPanel").IsVisible=false;Find<Grid>("HomePanel").IsVisible=true;Find<StackPanel>("EmptyState").IsVisible=false;}
+    async void DataPanelClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        ShowEditor(false);Find<Grid>("HomePanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=true;
+        RefreshDataPanel();
+        try{var info=await Api().GetAsync("api/service");dataDir=info["data_dir"]?.GetValue<string>()??"";}catch{dataDir="";}
+        RefreshDataPanel();
+        try{var search=await Api().PostAsync("api/v1/search",new{project_id=project?.Id,query="",include_retracted=true});
+            var live=search["memories"]!.AsArray().Count(x=>!new MemoryItem(x!.DeepClone()).IsRetracted);
+            Find<TextBlock>("DataCountText").Text=$"记录计数：当前视图共 {search["total"]?.GetValue<int>()??search["memories"]!.AsArray().Count} 条，其中未撤回 {live} 条。导出文件包含工作库全部记录（含已撤回与历史版本）。";}
+        catch{Find<TextBlock>("DataCountText").Text="记录计数：暂时无法读取（不影响导出；导出直接读取工作库文件）。";}
+        if(DataTextBox("DataOutput")=="")Set("DataOutput","");
+    });
+    // 文件选择器只负责把路径填进输入框，不做任何校验或写入。
+    async void PickBackupClick(object? s,RoutedEventArgs e){
+        var file=await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions{Title="选择导出位置（不会覆盖已有文件）",SuggestedFileName=$"graph-memory-{DateTime.Now:yyyyMMdd-HHmm}.gmbackup",DefaultExtension="gmbackup",FileTypeChoices=[new FilePickerFileType("Graph Memory 备份"){Patterns=["*.gmbackup"]}]});
+        if(file?.TryGetLocalPath() is {Length:>0} path)Set("BackupPathInput",path);
+    }
+    async void PickVerifyClick(object? s,RoutedEventArgs e){
+        var files=await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions{Title="选择要校验的备份文件",AllowMultiple=false,FileTypeFilter=[new FilePickerFileType("Graph Memory 备份"){Patterns=["*.gmbackup"]}]});
+        if(files.Count>0&&files[0].TryGetLocalPath() is {Length:>0} path)Set("VerifyPathInput",path);
+    }
+    async void PickRestoreTargetFolderClick(object? s,RoutedEventArgs e){
+        var folders=await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions{Title="选择已存在的空目录作为恢复目标",AllowMultiple=false});
+        if(folders.Count>0&&folders[0].TryGetLocalPath() is {Length:>0} path)Set("RestoreTargetDirInput",path);
+    }
+    async void ExportBackupClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        var output=DataTextBox("BackupPathInput").Trim();
+        if(output==""){ShowBackupResult(new BackupResult(2,"","请先填写导出目标文件路径（例如 D:\\备份\\memory.gmbackup）。"));SetDataStatus("导出未执行：没有填写目标路径。");return;}
+        if(!IsWritableDirectory(Path.GetDirectoryName(output))){ShowBackupResult(new BackupResult(1,"",$"目标目录不存在：{Path.GetDirectoryName(output) ?? output}\n请先创建目录或改选其他位置；备份程序也不会创建目录。"));SetDataStatus("导出未执行：目标目录不存在。");return;}
+        // 目标已存在必须在 UI 先拒绝：CLI 也会拒绝，这里连调用都不发生，更不可能覆盖。
+        if(File.Exists(output)){ShowBackupResult(new BackupResult(1,"",$"目标文件已存在：{output}\n为防覆盖，导出现在被拒绝且未执行；请改用新的文件名，或先自行处理旧文件。"));SetDataStatus("导出被拒绝：目标文件已存在，没有覆盖，也没有调用备份程序。");return;}
+        if(string.IsNullOrWhiteSpace(dataDir)||client==null){ShowBackupResult(new BackupResult(1,"","当前工作库目录未知（服务未连接或未返回 data_dir），导出未执行。可点右下角“重试连接”后重试。"));SetDataStatus("导出未执行：工作库目录未知，未调用备份程序。");return;}
+        SetDataStatus($"正在导出到 {output} …");
+        var result=await BackupClient.ExportAsync(dataDir,output);
+        ShowBackupResult(result);
+        SetDataStatus(result.Ok?$"导出成功：{output}\n{result.Counts}":$"导出失败（exit code {result.ExitCode}）：{result.StandardError.Trim()}");
+        if(result.Ok)Set("VerifyPathInput",output);
+    });
+    async void VerifyBackupClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        var file=DataTextBox("VerifyPathInput").Trim();
+        if(file==""){ShowBackupResult(new BackupResult(2,"","请先填写要校验的备份文件路径。"));SetDataStatus("校验未执行：没有填写备份文件。");return;}
+        if(!File.Exists(file)){ShowBackupResult(new BackupResult(1,"",$"文件不存在：{file}"));SetDataStatus("校验未执行：文件不存在。");return;}
+        SetDataStatus($"正在校验 {file} …");
+        var result=await BackupClient.VerifyAsync(file);
+        ShowBackupResult(result);
+        SetDataStatus(result.Ok?$"校验通过：{file}\n{result.Counts}":$"校验失败（exit code {result.ExitCode}）：{result.StandardError.Trim()}");
+    });
+    // dry-run 与 apply 都先做纯 UI 检查（存在、为空、可写），因此被拒绝时 CLI 不会被调用，目标目录保持原样。
+    bool CheckRestoreInputs(bool requireEmptyTarget,out string reason){
+        reason="";
+        var input=DataTextBox("RestoreInputPath").Trim();
+        var target=DataTextBox("RestoreTargetDirInput").Trim();
+        if(input==""||target==""){reason="请先填写备份文件与目标目录。";return false;}
+        if(!File.Exists(input)){reason=$"备份文件不存在：{input}";return false;}
+        if(!IsExistingDirectory(target)){reason=$"目标目录不存在：{target}\n恢复只写入已存在且为空的目录，不会创建目录。";return false;}
+        var entries=Directory.EnumerateFileSystemEntries(target).Take(1).ToList();
+        if(requireEmptyTarget&&entries.Count>0){reason=$"目标目录不是空目录：{target}\n为防覆盖，恢复被拒绝且未执行；请另选一个空目录。";return false;}
+        if((new DirectoryInfo(target).Attributes&FileAttributes.ReadOnly)!=0){reason=$"目标目录只读：{target}";return false;}
+        return true;
+    }
+    void FinishRestore(bool confirmed){
+        Find<Border>("RestoreConfirmPanel").IsVisible=false;pendingRestoreInput="";pendingRestoreTarget="";
+        RefreshDataPanel();
+        if(!confirmed)SetDataStatus("已取消恢复：没有写入任何文件。");
+    }
+    async void RestoreDryRunClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        if(!CheckRestoreInputs(false,out var reason)){ShowBackupResult(new BackupResult(2,"",reason));SetDataStatus("试运行未执行："+reason.Split('\n')[0]);FinishRestore(false);return;}
+        var input=DataTextBox("RestoreInputPath").Trim();
+        var target=DataTextBox("RestoreTargetDirInput").Trim();
+        SetDataStatus($"正在试运行（不写文件）：{input} → {target} …");
+        var result=await BackupClient.RestoreAsync(input,target,true);
+        ShowBackupResult(result);
+        SetDataStatus(result.Ok?$"试运行通过：将恢复 {result.Counts}。没有写入任何文件，目标目录保持原样。"+$"\n目标目录：{target}":$"试运行失败（exit code {result.ExitCode}）：{result.StandardError.Trim()}");
+        FinishRestore(false);
+    });
+    async void RestoreApplyClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        if(!CheckRestoreInputs(true,out var reason)){ShowBackupResult(new BackupResult(2,"",reason));SetDataStatus("恢复未执行："+reason.Split('\n')[0]);FinishRestore(false);return;}
+        pendingRestoreInput=DataTextBox("RestoreInputPath").Trim();pendingRestoreTarget=DataTextBox("RestoreTargetDirInput").Trim();
+        Find<TextBlock>("RestoreConfirmText").Text=$"将把备份恢复到空目录：{pendingRestoreTarget}\n备份文件：{pendingRestoreInput}\n当前工作库（{dataDir}）不会被写入、覆盖、合并或删除；原备份文件保持原样。恢复后请勿再用该目录以外的旧库文件混用。";
+        Find<Border>("RestoreConfirmPanel").IsVisible=true;
+        SetDataStatus("等待二次确认：确认后才会写入目标空目录。");
+    });
+    async void ConfirmRestoreClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        var input=pendingRestoreInput;
+        var target=pendingRestoreTarget;
+        if(input==""||target==""){ShowBackupResult(new BackupResult(2,"","没有待确认的恢复请求，请重新选择备份文件与空目录。"));FinishRestore(false);return;}
+        SetDataStatus($"正在恢复到空目录 {target} …");
+        var result=await BackupClient.RestoreAsync(input,target,false);
+        ShowBackupResult(result);
+        SetDataStatus(result.Ok?$"恢复完成（exit code 0）：{result.Counts}\n目标目录：{target}\n当前工作库未被改动；如需使用该副本，请让本地服务指向该目录并重启。":$"恢复失败（exit code {result.ExitCode}）：{result.StandardError.Trim()}\n目标目录保持原样，当前工作库未被改动。");
+        FinishRestore(result.Ok);
+    });
+    void CancelRestoreConfirmClick(object? s,RoutedEventArgs e){FinishRestore(false);}
     T Find<T>(string name) where T:Control => this.FindControl<T>(name)!;
     string Text(string name)=>Find<TextBox>(name).Text??"";
     void Set(string name,string text)=>Find<TextBox>(name).Text=text;
     bool HasDraft()=>selected==null
         ? !string.IsNullOrWhiteSpace(Text("TitleInput")+Text("ContentInput")+Text("SourceInput")+Text("ConditionsInput")) || SelectedEvidence()!=EvidenceTags.Statement
         : Text("TitleInput")!=selected.Title || Text("ContentInput")!=selected.Text("content") || Text("SourceInput")!=selected.Text("source") || Text("ConditionsInput")!=selected.Text("conditions") || SelectedKind()!=selected.Text("kind") || SelectedEvidence()!=selected.EvidenceType;
-    void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
+    void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
     void CloseEditorClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(false);Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";}
     void StatusMessage(string text)=>Find<TextBlock>("Status").Text=text;
     // 列表区的加载/失败状态：加载中与失败都可见，失败文案包含可执行动作。
@@ -154,7 +272,7 @@ public partial class MainWindow : Window {
         try{
             var url=await host.EnsureAsync(Program.Arguments);client?.Dispose();client=new ServiceClient(url);
             await LoadProjects();await LoadMemories();await LoadAgentStatus();
-            Find<Button>("ReconnectButton").IsVisible=false;StatusMessage("");
+            Find<Button>("ReconnectButton").IsVisible=false;RefreshDataPanel();StatusMessage("");
         }catch(Exception e){
             // 连接阶段失败也要给出可操作状态；随后重抛，保留 Run 既有的状态栏与“重试连接”反馈。
             Find<ListBox>("Memories").ItemsSource=null;Find<Button>("ReconnectButton").IsVisible=true;
