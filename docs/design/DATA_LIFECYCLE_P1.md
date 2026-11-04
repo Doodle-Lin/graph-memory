@@ -38,9 +38,14 @@
 
 不新增第六个工具，避免破坏已验收的五工具契约：
 
-- `memory_update` schema 增加可选 `retract`（bool，默认 false）与 `reason`（string）；`retract=true` 时调用 retract 端点（仅 `id`+`expected_version` 必填，`content` 改为可选），否则维持现有纠正语义。
+- `memory_update` schema 增加可选 `retract`（bool，默认 false）与 `restore`（bool，默认 false）以及 `reason`（string）；`retract=true` 时调用 retract 端点、`restore=true` 时调用 restore 端点（二者皆真返回 400 `retract and restore are mutually exclusive`），此时 `content` 可选；否则维持现有纠正语义。**`/api/v1/agent/call` 必须完成该映射**，不能只暴露 schema 而不转发。
 - `memory_search` schema 增加可选 `include_retracted`（bool）。
 - 旧的七工具分支行为不变。
+
+### 语义补充（供验收判定）
+
+- `retracted_excluded` 在 `search` 中表示**本次匹配集**中因撤回被丢弃的条数，不随 `offset` 变化。
+- `context` 的 `retracted_excluded` 按请求范围计：带 `project_id` 时统计「该项目查询原本会返回、但因撤回被丢弃」的条数（已覆盖的个人维度不重复计数）；不带 `project_id` 时只计个人维度。
 
 ## 备份/恢复（owner: data-restore）
 

@@ -1,7 +1,37 @@
 use super::*;
+use crate::backup_format::{EventRow, MemoryRow, RevisionRow};
 use crate::memory_store::MemoryStore;
 use rusqlite::Connection;
 use serde_json::{json, Value};
+
+/// One `Memory` body with the two P1 retraction fields, built as a JSON literal
+/// so it does not depend on the `memory_store` API another owner is extending.
+fn retracted_body(
+    id: &str,
+    version: u64,
+    content: &str,
+    retracted_at: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    json!({
+        "id": id,
+        "version": version,
+        "memory_scope": "personal",
+        "project_id": null,
+        "title": "撤回样本",
+        "content": content,
+        "kind": "note",
+        "source": "fixture",
+        "conditions": "test only",
+        "evidence_type": "user_or_agent_statement",
+        "origin_memory_id": null,
+        "created_at": "2026-11-04T00:00:00+00:00",
+        "updated_at": format!("2026-11-04T00:00:0{version}+00:00"),
+        "retracted_at": retracted_at,
+        "retract_reason": reason,
+    })
+    .to_string()
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -369,4 +399,202 @@ fn restore_rejects_damaged_backup_and_leaves_target_empty() {
         assert_eq!(fs::read(&bad).unwrap(), bytes);
     }
     assert!(fixture.no_staging());
+}
+
+/// A workspace whose memory has four versions: statement, retracted with a
+/// reason, restored (fields null again) and then retracted again with a
+/// different reason, so no two versions agree on the mutable retraction fields.
+fn retracted_snapshot() -> Snapshot {
+    let id = "retracted-memory";
+    let request = |version: u64, content: &str| {
+        format!(
+            "{{\"event_id\":\"retract-event-{version}\",\"memory_scope\":\"personal\",\"project_id\":null,\"content\":\"{content}\"}}"
+        )
+    };
+    let response = |body: &str| format!("{{\"memory\":{body}}}");
+    let bodies = [
+        retracted_body(id, 1, "初版结论", None, None),
+        retracted_body(
+            id,
+            2,
+            "初版结论",
+            Some("2026-11-04T01:00:00+00:00"),
+            Some("结论被证伪"),
+        ),
+        retracted_body(id, 3, "初版结论", None, None),
+        retracted_body(
+            id,
+            4,
+            "初版结论",
+            Some("2026-11-04T02:00:00+00:00"),
+            Some("再次被证伪"),
+        ),
+    ];
+    Snapshot {
+        projects: vec![],
+        memories: vec![MemoryRow {
+            id: id.into(),
+            memory_scope: "personal".into(),
+            project_id: None,
+            body: bodies[3].clone(),
+        }],
+        revisions: bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| RevisionRow {
+                memory_id: id.into(),
+                version: index as u64 + 1,
+                body: body.clone(),
+            })
+            .collect(),
+        events: vec![EventRow {
+            event_id: "retract-event-1".into(),
+            request: request(1, "初版结论"),
+            response: response(&bodies[0]),
+        }],
+    }
+}
+
+#[test]
+fn legacy_export_loses_nothing_when_retraction_fields_appear() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    let bytes = fs::read(fixture.output()).unwrap();
+    let envelope: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(envelope["manifest"]["format_version"], 1);
+
+    // A legacy envelope still verifies and restores while its bodies have none
+    // of the new fields: the additions are optional, not required.
+    assert_eq!(verify_file(&fixture.output()).unwrap(), exported);
+    let target = empty_target(&fixture);
+    assert_eq!(
+        restore_workspace(&fixture.output(), &target, false).unwrap(),
+        exported
+    );
+    assert_eq!(
+        counts(&snapshot::read_snapshot(&target.join("work-memory.db")).unwrap()),
+        exported
+    );
+
+    // The same legacy payload with the fields added to every body, and the
+    // checksum recomputed, decodes unchanged: nothing is rejected or dropped.
+    // `retracted_at`/`retract_reason` are optional, so the current row's
+    // retraction state must keep the version that carries it, and every body
+    // must survive verbatim.
+    let mut extended = snapshot::read_snapshot(&fixture.db()).unwrap();
+    let stamp = |body: &mut Value| {
+        let retired = body["content"] == json!("第二版内容");
+        body["retracted_at"] = if retired {
+            json!("2026-11-04T03:00:00+00:00")
+        } else {
+            Value::Null
+        };
+        body["retract_reason"] = if retired {
+            json!("旧包补写撤回字段")
+        } else {
+            Value::Null
+        };
+    };
+    for row in extended.memories.iter_mut() {
+        let mut body: Value = serde_json::from_str(&row.body).unwrap();
+        stamp(&mut body);
+        row.body = body.to_string();
+    }
+    for row in extended.revisions.iter_mut() {
+        let mut body: Value = serde_json::from_str(&row.body).unwrap();
+        stamp(&mut body);
+        row.body = body.to_string();
+    }
+    let decoded = backup_format::decode(
+        &backup_format::encode(extended.clone(), "2026-11-04T00:00:00+00:00").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(counts(&decoded), exported);
+    let current: Value = serde_json::from_str(
+        &decoded
+            .memories
+            .iter()
+            .find(|row| row.body.contains("第二版内容"))
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(current["retracted_at"], "2026-11-04T03:00:00+00:00");
+    assert_eq!(current["retract_reason"], "旧包补写撤回字段");
+    let id = current["id"].as_str().unwrap().to_owned();
+    let revision: Value = serde_json::from_str(
+        &decoded
+            .revisions
+            .iter()
+            .find(|row| row.memory_id == id && row.version == 1)
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(revision["retracted_at"], Value::Null);
+    assert_eq!(revision["retract_reason"], Value::Null);
+    assert!(revision["content"].as_str().unwrap().contains("second"));
+}
+
+#[test]
+fn retracted_workspace_round_trips_through_cli_export_verify_restore() {
+    let fixture = Fixture::new();
+    let snapshot = retracted_snapshot();
+    let bytes = backup_format::encode(snapshot.clone(), "2026-11-04T00:00:00+00:00").unwrap();
+    fs::write(fixture.output(), &bytes).unwrap();
+
+    // verify accepts the retraction fields and reports their rows.
+    assert_eq!(
+        verify_file(&fixture.output()).unwrap(),
+        Counts {
+            projects: 0,
+            memories: 1,
+            revisions: 4,
+            events: 1,
+        }
+    );
+
+    let target = empty_target(&fixture);
+    assert_eq!(
+        restore_workspace(&fixture.output(), &target, false).unwrap(),
+        verify_file(&fixture.output()).unwrap()
+    );
+
+    // The restored database keeps every version and the retraction state.
+    let restored = snapshot::read_snapshot(&target.join("work-memory.db")).unwrap();
+    assert_eq!(counts(&restored), counts(&snapshot));
+    assert_eq!(restored.revisions.len(), 4);
+    let body_at = |version: u64| -> Value {
+        serde_json::from_str(
+            &restored
+                .revisions
+                .iter()
+                .find(|row| row.version == version)
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    assert_eq!(body_at(1)["retracted_at"], Value::Null);
+    assert_eq!(body_at(2)["retracted_at"], "2026-11-04T01:00:00+00:00");
+    assert_eq!(body_at(2)["retract_reason"], "结论被证伪");
+    assert_eq!(body_at(3)["retracted_at"], Value::Null);
+    assert_eq!(body_at(4)["retract_reason"], "再次被证伪");
+    let current: Value = serde_json::from_str(&restored.memories[0].body).unwrap();
+    assert_eq!(current["version"], 4);
+    assert_eq!(current["retracted_at"], "2026-11-04T02:00:00+00:00");
+    assert_eq!(current["retract_reason"], "再次被证伪");
+
+    // Re-exporting the restored directory reproduces the original payload.
+    let reexported = fixture.0.join("retracted-reexport.gmbackup");
+    assert_eq!(
+        export_workspace(&target, &reexported).unwrap(),
+        counts(&snapshot)
+    );
+    let original: Value = serde_json::from_slice(&bytes).unwrap();
+    let again: Value = serde_json::from_slice(&fs::read(&reexported).unwrap()).unwrap();
+    assert_eq!(
+        original["manifest"]["payload_sha256"],
+        again["manifest"]["payload_sha256"]
+    );
 }

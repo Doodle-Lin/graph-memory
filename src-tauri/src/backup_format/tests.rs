@@ -473,6 +473,108 @@ fn store_export_after_evidence_type_change_round_trips() {
 }
 
 #[test]
+fn retraction_fields_are_mutable_and_survive_round_trip() {
+    let original = sample("撤回字段合成样本");
+    let personal = original
+        .memories
+        .iter()
+        .find(|m| m.memory_scope == "personal")
+        .unwrap();
+    let id = personal.id.clone();
+
+    // Stamp a different retraction state on each version of one memory, and
+    // keep the matching creation event and current row in sync, so the two
+    // mutable retraction fields disagree across versions by construction.
+    let state = |version: u64| match version {
+        1 => (
+            json!("2026-11-04T05:00:00+00:00"),
+            json!("第一版结论被证伪"),
+        ),
+        2 => (Value::Null, Value::Null),
+        _ => (
+            json!("2026-11-04T06:00:00+00:00"),
+            json!("复核后仍不成立"),
+        ),
+    };
+    let mut payload = original.clone();
+    let mut first_version_body = None;
+    for row in payload.revisions.iter_mut().filter(|r| r.memory_id == id) {
+        let mut body: Value = serde_json::from_str(&row.body).unwrap();
+        let (at, reason) = state(row.version);
+        body["retracted_at"] = at;
+        body["retract_reason"] = reason;
+        row.body = body.to_string();
+        if row.version == 1 {
+            first_version_body = Some(row.body.clone());
+        }
+    }
+    let first_version_body = first_version_body.unwrap();
+    let latest_body = payload
+        .revisions
+        .iter()
+        .find(|r| r.memory_id == id && r.version == 3)
+        .unwrap()
+        .body
+        .clone();
+    payload
+        .memories
+        .iter_mut()
+        .find(|m| m.id == id)
+        .unwrap()
+        .body = latest_body;
+    let event = payload
+        .events
+        .iter_mut()
+        .find(|e| e.event_id == "personal-event")
+        .unwrap();
+    let mut response: Value = serde_json::from_str(&event.response).unwrap();
+    response["memory"] = serde_json::from_str(&first_version_body).unwrap();
+    event.response = response.to_string();
+
+    let decoded = decode(&encode(payload.clone(), DATE).unwrap()).unwrap();
+    let body_at = |snapshot: &Snapshot, version: u64| -> Value {
+        serde_json::from_str(
+            &snapshot
+                .revisions
+                .iter()
+                .find(|r| r.memory_id == id && r.version == version)
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        body_at(&decoded, 1)["retracted_at"],
+        "2026-11-04T05:00:00+00:00"
+    );
+    assert_eq!(body_at(&decoded, 1)["retract_reason"], "第一版结论被证伪");
+    assert_eq!(body_at(&decoded, 2)["retracted_at"], Value::Null);
+    assert_eq!(body_at(&decoded, 2)["retract_reason"], Value::Null);
+    assert_eq!(body_at(&decoded, 3)["retract_reason"], "复核后仍不成立");
+    let current: Value =
+        serde_json::from_str(&decoded.memories.iter().find(|m| m.id == id).unwrap().body).unwrap();
+    assert_eq!(current["retracted_at"], "2026-11-04T06:00:00+00:00");
+    // The two fields must survive verbatim, including non-ASCII reasons.
+    assert!(decoded
+        .revisions
+        .iter()
+        .any(|r| r.body.contains("第一版结论被证伪")));
+
+    // Identity fields stay immutable even next to the new optional fields.
+    let mut bad = payload.clone();
+    let revision = bad
+        .revisions
+        .iter_mut()
+        .find(|r| r.memory_id == id && r.version == 2)
+        .unwrap();
+    let mut body: Value = serde_json::from_str(&revision.body).unwrap();
+    body["created_at"] = json!("2020-01-01T00:00:00+00:00");
+    revision.body = body.to_string();
+    assert!(encode(bad.clone(), DATE).is_err());
+    assert!(decode(&unchecked(bad)).is_err());
+}
+
+#[test]
 fn rejects_unsorted_payload_and_oversize_input() {
     let mut payload = decode(&encode(sample("排序合成样本"), DATE).unwrap()).unwrap();
     payload.projects.reverse();

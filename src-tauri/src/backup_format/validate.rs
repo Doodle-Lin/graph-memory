@@ -91,8 +91,14 @@ pub(super) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
         )?;
         // Identity fields are immutable across revisions: scope, project
         // ownership, creation time and the original-case reference. Everything
-        // else in the body (content, title, kind, source, conditions,
-        // updated_at and, since P0-A3, evidence_type) may change per version.
+        // else in the body may change per version: content, title, kind, source,
+        // conditions, updated_at, evidence_type (P0-A3) and the P1 retraction
+        // fields `retracted_at`/`retract_reason`.
+        //
+        // The optional retraction fields are deliberately not type-checked here.
+        // `Memory` treats them as `#[serde(default)]` additions, so an older body
+        // simply has none, and a newer one must round-trip verbatim instead of
+        // being rejected for their shape.
         check(
             body.version <= current.version
                 && body.memory_scope == current.memory_scope
