@@ -50,6 +50,15 @@ fn optional_evidence_type(body: &Value) -> ApiResult<Option<String>> {
     }
 }
 
+/// P1-A3: optional boolean flag; absent or `null` means the default.
+fn optional_flag(body: &Value, key: &str, default: bool) -> ApiResult<bool> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ApiError(400, format!("{key} must be a boolean"))),
+    }
+}
+
 fn has_cjk(text: &str) -> bool {
     text.chars().any(|c| {
         matches!(c as u32,
@@ -164,6 +173,13 @@ pub struct Memory {
     pub origin_memory_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// P1-A: `Some` means the current version is retracted; old bodies without the field
+    /// deserialize as `None` (not retracted).
+    #[serde(default)]
+    pub retracted_at: Option<String>,
+    /// P1-A: retraction reason; cleared again on restore.
+    #[serde(default)]
+    pub retract_reason: Option<String>,
 }
 pub struct MemoryStore {
     db: Connection,
@@ -205,23 +221,30 @@ impl MemoryStore {
             .ok_or_else(|| ApiError(404, "memory not found".into()))?;
         Ok(serde_json::from_str(&text)?)
     }
-    fn list(&self, project: Option<&str>, query: &str) -> ApiResult<Vec<Memory>> {
-        self.list_scoped(project, query, false)
+    /// P1-A: `include_retracted=false` drops retracted records and reports how many were
+    /// excluded. Context always passes `false`; only `/api/v1/search` may opt in.
+    fn list_scoped(
+        &self,
+        project: Option<&str>,
+        query: &str,
+        all: bool,
+        include_retracted: bool,
+    ) -> ApiResult<(Vec<Memory>, usize)> {
+        let (matched, excluded) = self.search_scored(project, query, all, include_retracted)?;
+        Ok((
+            matched.into_iter().map(|(memory, _)| memory).collect(),
+            excluded,
+        ))
     }
-    fn list_scoped(&self, project: Option<&str>, query: &str, all: bool) -> ApiResult<Vec<Memory>> {
-        Ok(self
-            .search_scored(project, query, all)?
-            .into_iter()
-            .map(|(memory, _)| memory)
-            .collect())
-    }
-    /// P0-A1: scope isolation plus term matching. Returns each match with its relevance score.
+    /// P0-A1: scope isolation plus term matching. Returns each match with its relevance score
+    /// and, when `include_retracted` is false, how many retracted matches were dropped.
     fn search_scored(
         &self,
         project: Option<&str>,
         query: &str,
         all: bool,
-    ) -> ApiResult<Vec<(Memory, f64)>> {
+        include_retracted: bool,
+    ) -> ApiResult<(Vec<(Memory, f64)>, usize)> {
         if let Some(p) = project {
             self.project_exists(p)?;
         }
@@ -235,9 +258,15 @@ impl MemoryStore {
             })
             .collect::<ApiResult<Vec<Value>>>()?;
         let mut result = Vec::new();
+        let mut excluded = 0usize;
         for body in parsed {
             if let Some(score) = match_terms(&body, &terms) {
-                result.push((serde_json::from_value::<Memory>(body)?, score));
+                let memory = serde_json::from_value::<Memory>(body)?;
+                if memory.retracted_at.is_some() && !include_retracted {
+                    excluded += 1;
+                    continue;
+                }
+                result.push((memory, score));
             }
         }
         result.sort_by(|a, b| {
@@ -246,7 +275,7 @@ impl MemoryStore {
                 .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        Ok(result)
+        Ok((result, excluded))
     }
     fn search(&self, body: &Value) -> ApiResult<Value> {
         fn string<'a>(body: &'a Value, key: &str, default: &'a str) -> ApiResult<&'a str> {
@@ -306,8 +335,9 @@ impl MemoryStore {
         let offset = number(body, "offset")?.unwrap_or(0);
         let kind = string(body, "kind", "")?;
         let query = string(body, "query", "")?;
-        let mut dated = Vec::new();
-        for item in self.search_scored(
+        // P1-A: retracted records are excluded unless the caller explicitly opts in.
+        let include_retracted = optional_flag(body, "include_retracted", false)?;
+        let (matched, retracted_excluded) = self.search_scored(
             if project.is_empty() {
                 None
             } else {
@@ -315,8 +345,10 @@ impl MemoryStore {
             },
             query,
             scope == "all",
-        )? {
-            let (memory, score) = item;
+            include_retracted,
+        )?;
+        let mut dated = Vec::new();
+        for (memory, score) in matched {
             if (scope == "project" && memory.memory_scope != "project")
                 || (scope == "personal" && memory.memory_scope != "personal")
                 || (!kind.is_empty() && memory.kind != kind)
@@ -357,7 +389,7 @@ impl MemoryStore {
         let end = offset.saturating_add(memories.len());
         let next = if end < total { Some(end) } else { None };
         Ok(
-            json!({"ranked":true,"memories":memories,"total":total,"offset":offset,"next_offset":next,"truncated":next.is_some(),
+            json!({"ranked":true,"memories":memories,"total":total,"offset":offset,"next_offset":next,"truncated":next.is_some(),"retracted_excluded":retracted_excluded,
             "filters":{"scope":scope,"project_id":if project.is_empty(){None}else{Some(project)},"query":query,"kind":kind,"date_field":field,"from":from,"to":to},
             "time_semantics":"record timestamps, not occurrence dates; from inclusive, to exclusive; latest versions only"}),
         )
@@ -373,15 +405,35 @@ impl MemoryStore {
             }
             ("POST", "/api/v1/agent/call") => {
                 let tool = required(&body, "tool")?;
+                let arguments = body["arguments"].clone();
                 let (method, path) = match tool.as_str() {
                     "memory_projects" => ("GET", "/api/v1/projects"),
                     "memory_write" => ("POST", "/api/v1/memories"),
                     "memory_search" => ("POST", "/api/v1/search"),
                     "memory_context" => ("POST", "/api/v1/context"),
-                    "memory_update" => ("POST", "/api/v1/memories/update"),
+                    // P1-A: `memory_update` stays the single MCP entry point; `retract=true`
+                    // and `restore=true` are translated to the lifecycle endpoints here.
+                    // Validate the flags before dispatch so a bad value leaves no version.
+                    "memory_update" => {
+                        let retract = optional_flag(&arguments, "retract", false)?;
+                        let restore = optional_flag(&arguments, "restore", false)?;
+                        if retract && restore {
+                            return Err(ApiError(
+                                400,
+                                "retract and restore are mutually exclusive".into(),
+                            ));
+                        }
+                        if retract {
+                            ("POST", "/api/v1/memories/retract")
+                        } else if restore {
+                            ("POST", "/api/v1/memories/restore")
+                        } else {
+                            ("POST", "/api/v1/memories/update")
+                        }
+                    }
                     _ => return Err(ApiError(400, "unknown memory tool".into())),
                 };
-                let result = self.route(method, path, body["arguments"].clone());
+                let result = self.route(method, path, arguments);
                 // Store only bounded per-tool counters, never query text, content or host secrets.
                 // Telemetry failure must not turn a successful memory write into a retryable failure.
                 if let Err(e)=self.db.execute("INSERT INTO agent_activity VALUES(?1,1,?2,?3,?2) ON CONFLICT(tool) DO UPDATE SET calls=calls+1,successes=successes+?2,last_at=?3,last_ok=?2",params![tool,result.is_ok(),now()]){log::warn!("cannot record MCP activity: {e}");}
@@ -428,16 +480,24 @@ impl MemoryStore {
             ("POST", "/api/v1/search") => self.search(&body),
             ("POST", "/api/v1/context") => {
                 let project = body["project_id"].as_str();
-                let all = self.list(project, "")?;
                 let query = body["query"].as_str().unwrap_or("");
-                let related = self.list(None, query)?;
-                let project_records: Vec<_> = all
+                // P1-A: the handover view is always current state, so retracted records are
+                // never returned here; the dropped count is reported instead.
+                let (project_scope, project_retracted) =
+                    self.list_scoped(project, "", false, false)?;
+                let (related, personal_retracted) = self.list_scoped(None, query, false, false)?;
+                // The project lookup already spans personal records, so counting both would
+                // double-count; only add the personal figure when no project was requested.
+                let retracted_excluded = if project.is_some() {
+                    project_retracted
+                } else {
+                    personal_retracted
+                };
+                let related = related;
+                let project_records: Vec<_> = project_scope
                     .into_iter()
                     .filter(|m| m.memory_scope == "project")
                     .collect();
-                // P0-A2: conclusion groups are computed before truncation so they keep the
-                // newest entries, while `project_records`/`personal_experiences` keep the
-                // pre-existing 40/20 caps.
                 let q = query.to_string();
                 let p = project.map(|p| p.to_string());
                 let (project_records, related, blockers, next_steps, recent_decisions, text, project_total, personal_total) = {
@@ -479,6 +539,9 @@ impl MemoryStore {
                     if truncated {
                         text.push_str("结果已截断：仅包含最近40条项目记录与20条相关个人经验，请使用关键词检索补充。\n");
                     }
+                    if retracted_excluded > 0 {
+                        text.push_str(&format!("已排除 {retracted_excluded} 条撤回记录\n"));
+                    }
                     for (label, items) in [
                         ("未解决阻塞", blockers.clone()),
                         ("下一步", next_steps.clone()),
@@ -513,11 +576,13 @@ impl MemoryStore {
                     )
                 };
                 Ok(
-                    json!({"project_records":project_records,"personal_experiences":related,"blockers":blockers,"next_steps":next_steps,"recent_decisions":recent_decisions,"text":text,"generated_at":now(),"query":query,"truncated":project_total > project_records.len() || personal_total > related.len(),"project_total":project_total,"personal_total":personal_total}),
+                    json!({"project_records":project_records,"personal_experiences":related,"blockers":blockers,"next_steps":next_steps,"recent_decisions":recent_decisions,"text":text,"generated_at":now(),"query":query,"truncated":project_total > project_records.len() || personal_total > related.len(),"project_total":project_total,"personal_total":personal_total,"retracted_excluded":retracted_excluded}),
                 )
             }
             ("POST", "/api/v1/memories/update") => self.update(body, false),
             ("POST", "/api/v1/memories/undo") => self.update(body, true),
+            ("POST", "/api/v1/memories/retract") => self.retract(body, true),
+            ("POST", "/api/v1/memories/restore") => self.retract(body, false),
             ("POST", "/api/v1/memories/history") => {
                 let id = required(&body, "id")?;
                 self.get(&id)?;
@@ -593,6 +658,8 @@ impl MemoryStore {
             origin_memory_id: origin,
             created_at: timestamp.clone(),
             updated_at: timestamp,
+            retracted_at: None,
+            retract_reason: None,
         };
         let raw = serde_json::to_string(&memory)?;
         let response = json!({"memory":memory});
@@ -648,6 +715,46 @@ impl MemoryStore {
             }
             next
         };
+        next.version = current.version + 1;
+        next.updated_at = now();
+        let raw = serde_json::to_string(&next)?;
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE work_memories SET body=? WHERE id=?",
+            params![raw, id],
+        )?;
+        tx.execute(
+            "INSERT INTO work_revisions VALUES(?,?,?)",
+            params![id, next.version, raw],
+        )?;
+        tx.commit()?;
+        Ok(json!({"memory":next}))
+    }
+    /// P1-A: retract (`retracting=true`) or restore (`false`). Both produce version+1 and
+    /// append to `work_revisions`; no row is ever deleted. `expected_version` conflicts win
+    /// over the already/not-retracted state checks (same 409 rule as update).
+    fn retract(&mut self, body: Value, retracting: bool) -> ApiResult<Value> {
+        let id = required(&body, "id")?;
+        let reason = body["reason"].as_str().unwrap_or("").to_string();
+        let current = self.get(&id)?;
+        if body["expected_version"].as_u64() != Some(current.version) {
+            return Err(ApiError(409, "record changed; reload before saving".into()));
+        }
+        if retracting && current.retracted_at.is_some() {
+            return Err(ApiError(400, "memory is already retracted".into()));
+        }
+        if !retracting && current.retracted_at.is_none() {
+            return Err(ApiError(400, "memory is not retracted".into()));
+        }
+        let mut next = current.clone();
+        if retracting {
+            next.retracted_at = Some(now());
+            next.retract_reason = Some(reason);
+        } else {
+            // Restore clears the state; the restore `reason` is not persisted.
+            next.retracted_at = None;
+            next.retract_reason = None;
+        }
         next.version = current.version + 1;
         next.updated_at = now();
         let raw = serde_json::to_string(&next)?;
@@ -720,6 +827,8 @@ mod tests {
                 origin_memory_id: None,
                 created_at: created.into(),
                 updated_at: updated.into(),
+                retracted_at: None,
+                retract_reason: None,
             };
             store
                 .db
@@ -1201,5 +1310,484 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m["id"] == json!(chinese)));
+    }
+
+    fn create_legacy(store: &mut MemoryStore, event: &str, body: Value) -> Value {
+        // Write a pre-P1 body straight into the table: no retracted_at/retract_reason keys.
+        let memory = json!({
+            "id": format!("legacy-{event}"),
+            "version": 1,
+            "memory_scope": body["memory_scope"],
+            "project_id": body.get("project_id").cloned().unwrap_or(Value::Null),
+            "title": body["title"],
+            "content": body["content"],
+            "kind": body.get("kind").cloned().unwrap_or(json!("note")),
+            "source": "legacy",
+            "conditions": "",
+            "evidence_type": "user_or_agent_statement",
+            "origin_memory_id": Value::Null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        store
+            .db
+            .execute(
+                "INSERT INTO work_memories VALUES(?,?,?,?)",
+                params![
+                    memory["id"].as_str().unwrap(),
+                    memory["memory_scope"].as_str().unwrap(),
+                    memory["project_id"].as_str(),
+                    memory.to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO work_revisions VALUES(?,?,?)",
+                params![memory["id"].as_str().unwrap(), 1, memory.to_string()],
+            )
+            .unwrap();
+        memory
+    }
+
+    /// P1-A: retract is a new version, hidden from default search but visible on request.
+    #[test]
+    fn retract_hides_record_from_default_search_and_counts_exclusions() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = new_project(&mut store, "Alpha");
+        let id = store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"retract-1",
+                "title":"过期结论","content":"旧部署方式已失效"}),
+            )
+            .unwrap()["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"retract-keep",
+                "title":"有效结论","content":"新的部署方式"}),
+            )
+            .unwrap();
+
+        let retracted = store
+            .route(
+                "POST",
+                "/api/v1/memories/retract",
+                json!({"id":id,"expected_version":1,"reason":"结论被证伪"}),
+            )
+            .unwrap();
+        assert_eq!(retracted["memory"]["version"], 2);
+        assert_eq!(retracted["memory"]["retract_reason"], "结论被证伪");
+        assert!(retracted["memory"]["retracted_at"].as_str().is_some());
+
+        let default = store.search(&json!({"scope":"all","query":"部署"})).unwrap();
+        assert_eq!(default["total"], 1);
+        assert_eq!(default["retracted_excluded"], 1);
+        assert!(!ids(&default).contains(&id));
+        let included = store
+            .search(&json!({"scope":"all","query":"部署","include_retracted":true}))
+            .unwrap();
+        assert_eq!(included["total"], 2);
+        assert_eq!(included["retracted_excluded"], 0);
+        let marked = included["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == json!(id))
+            .unwrap();
+        assert!(marked["retracted_at"].as_str().is_some());
+        assert_eq!(marked["retract_reason"], "结论被证伪");
+
+        // No query at all also excludes retracted records from the count.
+        let listed = store.search(&json!({"scope":"all"})).unwrap();
+        assert_eq!(listed["total"], 1);
+        assert_eq!(listed["retracted_excluded"], 1);
+
+        // history keeps the retracted version and the earlier one.
+        let history = store
+            .route("POST", "/api/v1/memories/history", json!({"id":id,"expected_version":2}))
+            .unwrap();
+        let versions: Vec<u64> = history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["version"].as_u64().unwrap())
+            .collect();
+        assert_eq!(versions, vec![2, 1]);
+        let retracted_version = history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["version"] == json!(2))
+            .unwrap();
+        assert!(retracted_version["retracted_at"].as_str().is_some());
+        assert!(history["history"][1]["retracted_at"].is_null());
+    }
+
+    /// P1-A: retract -> restore round trip, with 409/404/400 and restore clearing the state.
+    #[test]
+    fn restore_roundtrip_and_state_errors() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = new_project(&mut store, "Alpha");
+        let id = store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"restore-1",
+                "title":"可恢复结论","content":"先撤回再恢复"}),
+            )
+            .unwrap()["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // restore before retract -> 400, no new version
+        let error = store
+            .route("POST", "/api/v1/memories/restore", json!({"id":id,"expected_version":1}))
+            .unwrap_err();
+        assert_eq!((error.0, error.1.as_str()), (400, "memory is not retracted"));
+        assert_eq!(store.get(&id).unwrap().version, 1);
+
+        // 404 for an unknown id
+        let missing = store
+            .route("POST", "/api/v1/memories/retract", json!({"id":"nope","expected_version":1}))
+            .unwrap_err();
+        assert_eq!((missing.0, missing.1.as_str()), (404, "memory not found"));
+
+        // wrong expected_version -> 409, no new version
+        let conflict = store
+            .route("POST", "/api/v1/memories/retract", json!({"id":id,"expected_version":7,"reason":"r"}))
+            .unwrap_err();
+        assert_eq!(conflict.0, 409);
+        assert_eq!(store.get(&id).unwrap().version, 1);
+
+        let retracted = store
+            .route("POST", "/api/v1/memories/retract", json!({"id":id,"expected_version":1}))
+            .unwrap();
+        assert_eq!(retracted["memory"]["version"], 2);
+        // reason defaults to the empty string, not null
+        assert_eq!(retracted["memory"]["retract_reason"], "");
+
+        // retracting again -> 400 with the exact message, still no new version
+        let again = store
+            .route("POST", "/api/v1/memories/retract", json!({"id":id,"expected_version":2}))
+            .unwrap_err();
+        assert_eq!(
+            (again.0, again.1.as_str()),
+            (400, "memory is already retracted")
+        );
+        assert_eq!(store.get(&id).unwrap().version, 2);
+
+        let restored = store
+            .route(
+                "POST",
+                "/api/v1/memories/restore",
+                json!({"id":id,"expected_version":2,"reason":"结论重新验证通过"}),
+            )
+            .unwrap();
+        assert_eq!(restored["memory"]["version"], 3);
+        assert!(restored["memory"]["retracted_at"].is_null());
+        assert!(restored["memory"]["retract_reason"].is_null());
+
+        // restored records are searchable again
+        let found = store.search(&json!({"scope":"all","query":"可恢复结论"})).unwrap();
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["retracted_excluded"], 0);
+
+        // history holds all three versions including the retracted one
+        let history = store
+            .route("POST", "/api/v1/memories/history", json!({"id":id}))
+            .unwrap();
+        let versions: Vec<u64> = history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["version"].as_u64().unwrap())
+            .collect();
+        assert_eq!(versions, vec![3, 2, 1]);
+        assert!(history["history"][1]["retracted_at"].as_str().is_some());
+
+        // restore conflict after restore -> 400 not retracted (409 wins only on version)
+        let stale = store
+            .route("POST", "/api/v1/memories/restore", json!({"id":id,"expected_version":2}))
+            .unwrap_err();
+        assert_eq!(stale.0, 409);
+    }
+
+    /// P1-A: context always excludes retracted records and reports the excluded count.
+    #[test]
+    fn context_excludes_retracted_and_reports_count() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = new_project(&mut store, "Alpha");
+        let blocker = store.route("POST","/api/v1/memories",json!({"memory_scope":"project","project_id":alpha,"event_id":"ctx-live","title":"当前阻塞","content":"端口冲突","kind":"blocker"})).unwrap()["memory"]["id"].as_str().unwrap().to_string();
+        let dead = store.route("POST","/api/v1/memories",json!({"memory_scope":"project","project_id":alpha,"event_id":"ctx-dead","title":"已失效阻塞","content":"旧问题已解决","kind":"blocker"})).unwrap()["memory"]["id"].as_str().unwrap().to_string();
+        let personal = store.route("POST","/api/v1/memories",json!({"memory_scope":"personal","event_id":"ctx-exp","title":"个人经验","content":"端口冲突经验"})).unwrap()["memory"]["id"].as_str().unwrap().to_string();
+        store
+            .route("POST", "/api/v1/memories/retract", json!({"id":dead,"expected_version":1,"reason":"已解决"}))
+            .unwrap();
+        store
+            .route("POST", "/api/v1/memories/retract", json!({"id":personal,"expected_version":1}))
+            .unwrap();
+
+        let context = store
+            .route("POST", "/api/v1/context", json!({"project_id":alpha}))
+            .unwrap();
+        assert_eq!(context["retracted_excluded"], 2);
+        assert_eq!(context["project_total"], 1);
+        assert_eq!(context["personal_total"], 0);
+        let ids_in = |key: &str| -> Vec<String> {
+            context[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids_in("blockers"), vec![blocker.clone()]);
+        assert_eq!(ids_in("project_records"), vec![blocker.clone()]);
+        assert!(ids_in("personal_experiences").is_empty());
+        let text = context["text"].as_str().unwrap();
+        assert!(text.contains("已排除 2 条撤回记录"), "{text}");
+        assert!(!text.contains("已失效阻塞"));
+
+        // Personal context: this store also holds project records and the retracted project
+        // record, so the figure is no longer isolated; the text line still reports it.
+        let personal_context = store.route("POST", "/api/v1/context", json!({})).unwrap();
+        let dropped = personal_context["retracted_excluded"].as_u64().unwrap();
+        assert!(dropped >= 1);
+        assert!(personal_context["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("已排除 {dropped} 条撤回记录")));
+
+        // No retracted records anywhere: no line, count 0 (needs a separate store, because a
+        // retracted personal record would surface in every project context).
+        let mut fresh = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let gamma = new_project(&mut fresh, "Gamma");
+        fresh.route("POST","/api/v1/memories",json!({"memory_scope":"project","project_id":gamma,"event_id":"ctx-g","title":"Gamma","content":"正常"})).unwrap();
+        let clean = fresh
+            .route("POST", "/api/v1/context", json!({"project_id":gamma}))
+            .unwrap();
+        assert_eq!(clean["retracted_excluded"], 0);
+        assert!(!clean["text"].as_str().unwrap().contains("已排除"));
+    }
+
+    /// P1-A: old bodies without retraction fields stay readable, searchable and updatable.
+    #[test]
+    fn legacy_bodies_without_retraction_fields_stay_compatible() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let legacy = create_legacy(
+            &mut store,
+            "old",
+            json!({"memory_scope":"personal","title":"旧格式经验","content":"旧 body 没有撤回字段"}),
+        );
+        let id = legacy["id"].as_str().unwrap().to_string();
+
+        // readable: no retraction fields, treated as not retracted
+        let found = store
+            .search(&json!({"scope":"personal","query":"旧格式经验"}))
+            .unwrap();
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["retracted_excluded"], 0);
+        assert!(found["memories"][0]["retracted_at"].is_null());
+
+        // includable without any special casing
+        let included = store
+            .search(&json!({"scope":"personal","include_retracted":true}))
+            .unwrap();
+        assert!(ids(&included).contains(&id));
+
+        // updatable: the new version gains the fields and can then be retracted
+        let updated = store
+            .route(
+                "POST",
+                "/api/v1/memories/update",
+                json!({"id":id,"expected_version":1,"content":"升级后的旧记录"}),
+            )
+            .unwrap();
+        assert_eq!(updated["memory"]["version"], 2);
+        assert!(updated["memory"]["retracted_at"].is_null());
+        let retracted = store
+            .route(
+                "POST",
+                "/api/v1/memories/retract",
+                json!({"id":id,"expected_version":2,"reason":"兼容性验证"}),
+            )
+            .unwrap();
+        assert_eq!(retracted["memory"]["version"], 3);
+        // history exposes the pre-P1 body shape too
+        let history = store
+            .route("POST", "/api/v1/memories/history", json!({"id":id}))
+            .unwrap();
+        let versions: Vec<u64> = history["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["version"].as_u64().unwrap())
+            .collect();
+        assert_eq!(versions, vec![3, 2, 1]);
+        assert!(history["history"][2]["retracted_at"].is_null());
+        // The legacy body re-serializes with explicit nulls; the field stays optional and
+        // deserializes as "not retracted" either way.
+        let field = history["history"][2].get("retracted_at");
+        assert!(field.is_some() && field.unwrap().is_null());
+    }
+
+    /// P1-A: `include_retracted` type validation and undo keeping retraction state.
+    #[test]
+    fn include_retracted_validation_and_undo_keeps_state() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = new_project(&mut store, "Alpha");
+        let id = store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"undo-1",
+                "title":"撤回后撤销","content":"v1 内容"}),
+            )
+            .unwrap()["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store
+            .route("POST", "/api/v1/memories/retract", json!({"id":id,"expected_version":1,"reason":"r"}))
+            .unwrap();
+        store
+            .route(
+                "POST",
+                "/api/v1/memories/update",
+                json!({"id":id,"expected_version":2,"content":"v3 内容"}),
+            )
+            .unwrap();
+        let undone = store
+            .route("POST", "/api/v1/memories/undo", json!({"id":id,"expected_version":3}))
+            .unwrap();
+        assert_eq!(undone["memory"]["version"], 4);
+        assert_eq!(undone["memory"]["content"], "v1 内容");
+        assert!(undone["memory"]["retracted_at"].as_str().is_some());
+        assert_eq!(undone["memory"]["retract_reason"], "r");
+
+        for bad in [json!("yes"), json!(1)] {
+            let error = store
+                .search(&json!({"scope":"all","include_retracted":bad}))
+                .unwrap_err();
+            assert_eq!((error.0, error.1.as_str()), (400, "include_retracted must be a boolean"));
+        }
+        // absent / null keep the default
+        assert_eq!(
+            store
+                .search(&json!({"scope":"all","include_retracted":null}))
+                .unwrap()["retracted_excluded"],
+            1
+        );
+    }
+
+    /// P1-A: MCP keeps one `memory_update` tool and routes `retract=true` to the retract
+    /// endpoint at the agent-call boundary.
+    #[test]
+    fn agent_call_routes_memory_update_retract_flag() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let alpha = new_project(&mut store, "Alpha");
+        let id = store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"mcp-retract",
+                "title":"MCP 撤回","content":"通过工具撤回"}),
+            )
+            .unwrap()["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let retracted = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":1,"retract":true,"reason":"工具撤回"}}),
+            )
+            .unwrap();
+        assert_eq!(retracted["memory"]["version"], 2);
+        assert_eq!(retracted["memory"]["retract_reason"], "工具撤回");
+        assert!(retracted["memory"]["retracted_at"].as_str().is_some());
+
+        // retract absent/false keeps the correction semantics (content required)
+        let missing_content = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":2}}),
+            )
+            .unwrap_err();
+        assert_eq!(missing_content.0, 400);
+        let corrected = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":2,"content":"撤回后仍可纠正","retract":false}}),
+            )
+            .unwrap();
+        assert_eq!(corrected["memory"]["version"], 3);
+        // correcting keeps the retracted state
+        assert!(corrected["memory"]["retracted_at"].as_str().is_some());
+
+        // a non-boolean flag is rejected before any version is written
+        let bad = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":3,"retract":"yes"}}),
+            )
+            .unwrap_err();
+        assert_eq!((bad.0, bad.1.as_str()), (400, "retract must be a boolean"));
+        assert_eq!(store.get(&id).unwrap().version, 3);
+
+        // retract + restore together -> 400 before any version is written
+        let both = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":3,"retract":true,"restore":true}}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            (both.0, both.1.as_str()),
+            (400, "retract and restore are mutually exclusive")
+        );
+        assert_eq!(store.get(&id).unwrap().version, 3);
+
+        // restore=true routes to the restore endpoint and makes the record visible again
+        let restored = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":3,"restore":true,"reason":"重新验证通过"}}),
+            )
+            .unwrap();
+        assert_eq!(restored["memory"]["version"], 4);
+        assert!(restored["memory"]["retracted_at"].is_null());
+        let visible = store
+            .search(&json!({"scope":"all","query":"MCP 撤回"}))
+            .unwrap();
+        assert_eq!(visible["total"], 1);
+        assert_eq!(visible["retracted_excluded"], 0);
+
+        // restore on a live record -> 400 not retracted, no new version
+        let stale = store
+            .route(
+                "POST",
+                "/api/v1/agent/call",
+                json!({"tool":"memory_update","arguments":{"id":id,"expected_version":4,"restore":true}}),
+            )
+            .unwrap_err();
+        assert_eq!((stale.0, stale.1.as_str()), (400, "memory is not retracted"));
+        assert_eq!(store.get(&id).unwrap().version, 4);
     }
 }
