@@ -13,7 +13,8 @@ public partial class MainWindow {
         if(allowClose)return;                       // 显式放弃或全部保存成功后才放行
         if(busy){e.Cancel=true;StatusMessage("当前操作尚未完成，请等待完成后再关闭窗口。");return;}
         if(PendingDraftCount()>0){e.Cancel=true;ShowClosePrompt();return;}
-        // 没有未保存草稿：正常关闭，不停止后台服务。
+        // 没有未保存草稿：清掉可能残留的持久化分片（例如刚保存完最后一份），再正常关闭。
+        DiscardAllDrafts();
     }
     void WindowKeyDown(object? sender,KeyEventArgs e){
         if(e.Key==Key.Escape&&Find<Border>("ClosePrompt").IsVisible){RequestCancelClose();e.Handled=true;}
@@ -46,6 +47,7 @@ public partial class MainWindow {
     void DiscardAndCloseClick(object? s,RoutedEventArgs e){
         if(busy)return;
         drafts.Clear();                    // 显式放弃，不交给隐藏的自动保存策略
+        DiscardAllDrafts();                // 同时删除持久化条目，否则下次启动又会恢复已放弃的草稿
         allowClose=true;
         HideClosePrompt();
         Close();
@@ -74,5 +76,6 @@ public partial class MainWindow {
             }
         }
         if(PendingDraftCount()>0)throw new InvalidOperationException("仍有未保存的草稿，已取消关闭。");
+        DiscardAllDrafts();               // 全部保存成功后持久化分片也应为空
     }
 }

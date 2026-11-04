@@ -65,7 +65,7 @@ public partial class MainWindow : Window {
         }catch{Find<TextBlock>("AgentStatus").Text="接入状态暂不可用";Find<TextBlock>("AgentDetail").Text="请刷新或重试连接；未将服务可用推断为 Agent 已接入。";}
         finally{checkingActivity=false;}
     }
-    async void RefreshClick(object? s,RoutedEventArgs e)=>await Run(async()=>{await LoadProjects();await LoadMemories();await LoadAgentStatus();});
+    async void RefreshClick(object? s,RoutedEventArgs e)=>await Run(async()=>{await RefreshWorkspaceDirectoryAsync();await LoadProjects();await LoadMemories();await RestoreDraftsAfterLoad();await LoadAgentStatus();});
     readonly Dictionary<string,(DispatcherTimer timer,object? label)> copyFeedback=new();
     // Restart the acknowledgement on repeat clicks; timers never hold the busy gate.
     void ShowCopied(string name){
@@ -146,10 +146,21 @@ public partial class MainWindow : Window {
     void ShowBackupResult(BackupResult result){
         Set("DataOutput",result.Ok?result.StandardOutput.Trim():$"exit code {result.ExitCode}\n{result.StandardError.Trim()}");
     }
+    // 服务报告的 data_dir 可能带 \\?\ 前缀（与 ServiceHost 做发现比较时的归一方式保持一致），
+    // 只影响显示：传给 CLI 和做目录校验的仍是原样值，两者对备份程序都可接受。
+    internal static string NormalizePathForDisplay(string? path){
+        if(string.IsNullOrWhiteSpace(path))return path??"";
+        try{return Path.GetFullPath(path.Replace("\\\\?\\",""));}catch{return path;}
+    }
+    // 连接成功后立刻取回真实 data_dir：草稿分桶必须基于它，否则会在“用户还没打开数据面板”时
+    // 把草稿写进空工作库分片，开窗后也读不回真实工作库的草稿。
+    async Task RefreshWorkspaceDirectoryAsync(){
+        try{var info=await Api().GetAsync("api/service");dataDir=info["data_dir"]?.GetValue<string>()??"";}catch{dataDir="";}
+    }
     // 服务未连接或库目录未知时禁用动作并说明原因，避免用户提交后才发现不可用。
     void RefreshDataPanel(){
         var connected=client!=null;var known=!string.IsNullOrWhiteSpace(dataDir);var writable=IsWritableDirectory(Path.GetDirectoryName(dataDir));
-        Find<TextBlock>("DataDirText").Text=known?$"当前工作库目录（由本地服务报告）：{dataDir}":connected?"当前工作库目录未知：服务没有返回 data_dir。导出暂时不可用，可点右下角“重试连接”。":"服务未连接，无法读取工作库目录。导出暂时不可用，可点右下角“重试连接”。";
+        Find<TextBlock>("DataDirText").Text=known?$"当前工作库目录（由本地服务报告）：{NormalizePathForDisplay(dataDir)}":connected?"当前工作库目录未知：服务没有返回 data_dir。导出暂时不可用，可点右下角“重试连接”。":"服务未连接，无法读取工作库目录。导出暂时不可用，可点右下角“重试连接”。";
         Find<TextBlock>("DataCountText").Text=known?"记录计数见下方；导出与校验使用下方输入的路径。导出可在服务运行中执行，不需要先停止服务。":"导出需要先连接服务并取得工作库目录；校验与恢复只需选择文件，不依赖服务。";
         Find<Button>("ExportBackupButton").IsEnabled=known&&writable;
         Find<Button>("ExportBackupButton").Content=connected&&known&&writable?"导出备份":"导出备份（不可用）";
@@ -163,7 +174,7 @@ public partial class MainWindow : Window {
     async void DataPanelClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
         ShowEditor(false);Find<Grid>("HomePanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=true;
         RefreshDataPanel();
-        try{var info=await Api().GetAsync("api/service");dataDir=info["data_dir"]?.GetValue<string>()??"";}catch{dataDir="";}
+        await RefreshWorkspaceDirectoryAsync();
         RefreshDataPanel();
         try{var search=await Api().PostAsync("api/v1/search",new{project_id=project?.Id,query="",include_retracted=true});
             var live=search["memories"]!.AsArray().Count(x=>!new MemoryItem(x!.DeepClone()).IsRetracted);
@@ -265,13 +276,15 @@ public partial class MainWindow : Window {
     void ShowListStatus(string text){Find<Border>("ListStatusPanel").IsVisible=true;Find<TextBlock>("ListStatus").Text=text;}
     void HideListStatus(){Find<Border>("ListStatusPanel").IsVisible=false;Find<TextBlock>("ListStatus").Text="";}
     static string? FailureNote(Exception e)=>e is AggregateException aggregate&&aggregate.InnerException!=null?aggregate.InnerException.Message:e.Message;
-    public MainWindow(){AvaloniaXamlLoader.Load(this);InitializeKinds();Closing+=WindowClosing;KeyDown+=WindowKeyDown;Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
+    public MainWindow(){AvaloniaXamlLoader.Load(this);InitializeKinds();InitializeDraftPersistence();Closing+=WindowClosing;KeyDown+=WindowKeyDown;Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();draftTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
     async Task Run(Func<Task> action){if(busy)return;busy=true;try{await action();}catch(Exception e){bool conflict=e.Message.Contains("HTTP 409");Find<Button>("ReloadButton").IsVisible=conflict&&selected!=null;Find<Button>("ReconnectButton").IsVisible=!conflict;var note=conflict?"记录已被其他会话修改，草稿仍保留。可加载历史核对；放弃草稿后再载入最新版本。":e.Message;if(closeSaveNote!=""){note+=" "+closeSaveNote;closeSaveNote="";}StatusMessage(note);}finally{busy=false;}}
     async Task Connect()=>await Run(async()=>{
         StatusMessage("正在连接本地服务…");ShowListStatus("正在加载记忆列表…");EmptyStateOff();
         try{
             var url=await host.EnsureAsync(Program.Arguments);client?.Dispose();client=new ServiceClient(url);
+            await RefreshWorkspaceDirectoryAsync();
             await LoadProjects();await LoadMemories();await LoadAgentStatus();
+            LoadPersistedDrafts();
             Find<Button>("ReconnectButton").IsVisible=false;RefreshDataPanel();StatusMessage("");
         }catch(Exception e){
             // 连接阶段失败也要给出可操作状态；随后重抛，保留 Run 既有的状态栏与“重试连接”反馈。
@@ -283,6 +296,8 @@ public partial class MainWindow : Window {
     ServiceClient Api()=>client??throw new InvalidOperationException("服务尚未连接，请点击重新连接。");
     async Task LoadProjects(){var response=await Api().GetAsync("api/v1/projects");switching=true;Find<ListBox>("Projects").ItemsSource=response["projects"]!.AsArray().Select(x=>new ProjectItem(x!["id"]!.GetValue<string>(),x["name"]!.GetValue<string>())).ToList();Find<ListBox>("Projects").SelectedItem=Find<ListBox>("Projects").Items.Cast<ProjectItem>().FirstOrDefault(x=>x.Id==project?.Id);Find<ListBox>("Projects").IsVisible=response["projects"]!.AsArray().Count>0;Find<TextBlock>("ProjectHeading").IsVisible=Find<ListBox>("Projects").IsVisible;switching=false;}
     void EmptyStateOff()=>Find<StackPanel>("EmptyState").IsVisible=false;
+    // 首屏数据装载后的草稿恢复入口：刷新记忆列表后由 RefreshClick 调用（LoadMemories 自身被 SwitchScope 复用，避免重复触发）。
+    async Task RestoreDraftsAfterLoad()=>await SelectFirstAsync();
     // 首屏自动加载：进入个人视图或项目视图都会调用；失败时保留可操作提示与“重试连接”，不会静默留白。
     async Task LoadMemories(){
         ShowListStatus("正在加载记忆列表…");EmptyStateOff();
@@ -332,14 +347,26 @@ public partial class MainWindow : Window {
         }catch{expander.IsVisible=false;box.Text="";}   // 续接摘要不可用不影响列表首屏
     }
     void ClearEditor(){Find<Button>("ReloadButton").IsVisible=false;selected=null;origin=null;eventId=Guid.NewGuid().ToString();lastRequest="";Set("TitleInput","");Set("ContentInput","");Set("SourceInput","");Set("ConditionsInput","");SetKind("note");SetEvidence(EvidenceTags.Statement);Find<TextBlock>("EditorHeading").Text=project==null?"记一条个人经验":"记录项目进展";UpdateEvidenceHint();Set("RetractReasonInput","");SetRetractStatus("");RefreshRetractActionButtons();Find<Button>("UndoButton").IsVisible=false;Find<Button>("PromoteButton").IsVisible=false;Find<TextBlock>("HistoryText").Text="";}
-    async Task SwitchScope(ProjectItem? next){if(HasDraft())drafts[project?.Id??"personal"]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),SelectedEvidence(),selected,origin,SelectedKind(),eventId,lastRequest);else drafts.Remove(project?.Id??"personal");ShowEditor(false);
-ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").SelectedItem=Find<ListBox>("Projects").Items.Cast<ProjectItem>().FirstOrDefault(x=>x.Id==next?.Id);switching=false;Find<Button>("PersonalButton").Classes.Set("scopeSelected",next==null);ClearEditor();Set("Query","");Find<Border>("ContextPanel").IsVisible=false;Find<TextBlock>("ScopeTitle").Text=next?.Name??"个人经验";Find<TextBlock>("ScopeHint").Text=next==null?"踩过的坑、学到的方法，不必属于某个项目。":"查看本项目记录与相关个人经验，其他项目事实不会混入。";if(drafts.TryGetValue(project?.Id??"personal",out var draft)){Set("TitleInput",draft.title);Set("ContentInput",draft.content);Set("SourceInput",draft.source);Set("ConditionsInput",draft.conditions);selected=draft.memory;origin=draft.origin;eventId=draft.eventId;lastRequest=draft.request;SetKind(draft.kind);SetEvidence(draft.evidence);UpdateEvidenceHint();Find<Button>("UndoButton").IsVisible=selected?.Version>1;Find<Button>("PromoteButton").IsVisible=selected?.Scope=="project";Find<TextBlock>("EditorHeading").Text=selected==null?"继续草稿":"继续纠正（保存时校验版本）";}Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";await LoadMemories();}
+    async Task SwitchScope(ProjectItem? next){if(HasDraft())drafts[project?.Id??"personal"]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),SelectedEvidence(),selected,origin,SelectedKind(),eventId,lastRequest);else drafts.Remove(project?.Id??"personal");PersistDrafts();ShowEditor(false);
+ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").SelectedItem=Find<ListBox>("Projects").Items.Cast<ProjectItem>().FirstOrDefault(x=>x.Id==next?.Id);switching=false;Find<Button>("PersonalButton").Classes.Set("scopeSelected",next==null);ClearEditor();Set("Query","");Find<Border>("ContextPanel").IsVisible=false;Find<TextBlock>("ScopeTitle").Text=next?.Name??"个人经验";Find<TextBlock>("ScopeHint").Text=next==null?"踩过的坑、学到的方法，不必属于某个项目。":"查看本项目记录与相关个人经验，其他项目事实不会混入。";if(drafts.TryGetValue(project?.Id??"personal",out var draft)){Set("TitleInput",draft.title);Set("ContentInput",draft.content);Set("SourceInput",draft.source);Set("ConditionsInput",draft.conditions);selected=draft.memory;origin=draft.origin;eventId=draft.eventId;lastRequest=draft.request;SetKind(draft.kind);SetEvidence(draft.evidence);UpdateEvidenceHint();Find<Button>("UndoButton").IsVisible=selected?.Version>1;Find<Button>("PromoteButton").IsVisible=selected?.Scope=="project";Find<TextBlock>("EditorHeading").Text=selected==null?"继续草稿":"继续纠正（保存时校验版本）";}SetDraftNotice(drafts.ContainsKey(project?.Id??"personal")?"这是上次未保存的草稿，未保存的编辑已经恢复。核对后再保存或放弃。":"");RefreshDraftAffordances();Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";await LoadMemories();}
     async void PersonalClick(object? s,RoutedEventArgs e)=>await Run(async()=>{switching=true;Find<ListBox>("Projects").SelectedItem=null;switching=false;await SwitchScope(null);});
     async void ProjectChanged(object? s,SelectionChangedEventArgs e){if(!switching&&Find<ListBox>("Projects").SelectedItem is ProjectItem item)await Run(()=>SwitchScope(item));}
     async void CreateProjectClick(object? s,RoutedEventArgs e)=>await Run(async()=>{var response=await Api().PostAsync("api/v1/projects",new{name=Text("ProjectName")});var next=new ProjectItem(response["id"]!.GetValue<string>(),Text("ProjectName"));Set("ProjectName","");await LoadProjects();await SwitchScope(next);StatusMessage("项目已创建，可以直接记录进展。");});
     async void SearchClick(object? s,RoutedEventArgs e)=>await Run(async()=>{ShowEditor(false);await LoadMemories();});
-    void NewClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(true);Find<Border>("ContextPanel").IsVisible=false;Find<TextBox>("ContentInput").Focus();}
-    void MemoryChanged(object? s,SelectionChangedEventArgs e){if(Find<ListBox>("Memories").SelectedItem is not MemoryItem memory)return;if(HasDraft()){ShowEditor(true);StatusMessage("有未保存的编辑，请先保存后再打开其他记录。");return;}ShowEditor(true);ApplyMemory(memory);}
+    void NewClick(object? s,RoutedEventArgs e){if(busy)return;var restored=!HasDraft()&&ApplyDraftToEditor();if(!HasDraft())ClearEditor();ShowEditor(true);Find<Border>("ContextPanel").IsVisible=false;if(restored)_=CheckDraftBaselineAsync();Find<TextBox>("ContentInput").Focus();}
+    // 打开记录时：先看该 scope 是否有可恢复的持久化草稿，再按既有未保存编辑规则拦截。
+    void MemoryChanged(object? s,SelectionChangedEventArgs e){if(Find<ListBox>("Memories").SelectedItem is not MemoryItem memory)return;if(HasDraft()){ShowEditor(true);StatusMessage("有未保存的编辑，请先保存后再打开其他记录。");return;}if(drafts.ContainsKey(DraftScopeKey())){ShowEditor(true);ApplyDraftToEditor();_=CheckDraftBaselineAsync();StatusMessage("这是上次未保存的草稿，未保存的编辑已经恢复；先保存或放弃它，再打开其他记录。");return;}ShowEditor(true);ApplyMemory(memory);}
+    // 首屏/刷新后自动打开第一条：让恢复出的草稿立即可见（打开编辑器即恢复）。
+    async Task SelectFirstAsync(){
+        if(!draftsLoaded)return;
+        var list=Find<ListBox>("Memories");
+        try{if(list.SelectedItem!=null)list.SelectedItem=null;}catch{ /* 控件尚未就绪 */ }
+        try{
+            if(drafts.ContainsKey(DraftScopeKey())){ShowEditor(true);ApplyDraftToEditor();await CheckDraftBaselineAsync();return;}
+            var items=list.ItemsSource?.Cast<MemoryItem>().ToList();
+            if(items!=null&&items.Count>0&&!HasDraft()&&!drafts.ContainsKey(DraftScopeKey())){list.SelectedItem=items[0];ShowEditor(true);ApplyMemory(items[0]);}
+        }catch{ /* 控件尚未就绪时跳过，不阻塞首屏 */ }
+    }
     // 打开记录：依据与撤回状态按记录回显；旧服务缺字段时分别按“陈述 / 未撤回”处理。
     void ApplyMemory(MemoryItem memory){Find<Button>("ReloadButton").IsVisible=false;selected=memory;origin=null;Set("TitleInput",memory.Title);Set("ContentInput",memory.Text("content"));Set("SourceInput",memory.Text("source"));Set("ConditionsInput",memory.Text("conditions"));SetKind(memory.Text("kind"));SetEvidence(memory.EvidenceType);UpdateEvidenceHint();Find<TextBlock>("EditorHeading").Text="查看与纠正";Find<TextBlock>("EvidenceLabel").Text=$"{memory.Summary}\n依据：{memory.EvidenceLabel}\n更新：{memory.Text("updated_at")}";SetRetractStatus(memory.IsRetracted?$"这条记录已撤回：{memory.RetractReason}"+$"\n撤回时间：{memory.RetractedAt}":"");Set("RetractReasonInput","");RefreshRetractActionButtons();Find<Button>("UndoButton").IsVisible=memory.Version>1;Find<Button>("PromoteButton").IsVisible=memory.Scope=="project";Find<TextBlock>("HistoryText").Text="";}
     async void SaveClick(object? s,RoutedEventArgs e)=>await Run(SaveCurrentAsync);
@@ -349,7 +376,7 @@ ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").Selected
         JsonNode response;
         if(selected!=null)response=await Api().PostAsync("api/v1/memories/update",new{id=selected.Id,expected_version=selected.Version,kind=SelectedKind(),title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),evidence_type=SelectedEvidence()});
         else{var signature=JsonSerializer.Serialize(new{scope=project?.Id,title=Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),kind=SelectedKind(),evidence=SelectedEvidence(),origin});if(lastRequest!=""&&lastRequest!=signature)eventId=Guid.NewGuid().ToString();lastRequest=signature;response=await Api().PostAsync("api/v1/memories",new{memory_scope=project==null?"personal":"project",project_id=project?.Id,event_id=eventId,title=string.IsNullOrWhiteSpace(Text("TitleInput"))?"记忆":Text("TitleInput"),content=Text("ContentInput"),source=Text("SourceInput"),conditions=Text("ConditionsInput"),origin_memory_id=origin,kind=SelectedKind(),evidence_type=SelectedEvidence()});}
-        selected=new MemoryItem(response["memory"]!.DeepClone());drafts.Remove(project?.Id??"personal");Find<Border>("ContextPanel").IsVisible=false;await LoadMemories();StatusMessage($"已保存 v{selected.Version}。原有上下文已失效，需要重新生成。");Find<Button>("UndoButton").IsVisible=selected.Version>1;ShowEditor(false);ClearEditor();Find<Button>("NewMemoryButton").Content="记一条";
+        selected=new MemoryItem(response["memory"]!.DeepClone());drafts.Remove(project?.Id??"personal");SetDraftNotice("");Find<Border>("ContextPanel").IsVisible=false;await LoadMemories();StatusMessage($"已保存 v{selected.Version}。原有上下文已失效，需要重新生成。");Find<Button>("UndoButton").IsVisible=selected.Version>1;ShowEditor(false);ClearEditor();Find<Button>("NewMemoryButton").Content="记一条";
     }
     async void PromoteClick(object? s,RoutedEventArgs e)=>await Run(async()=>{if(selected==null)return;if(HasDraft())throw new InvalidOperationException("请先保存当前修改，再沉淀为个人经验。");if(drafts.TryGetValue("personal",out var personalDraft)&&!string.IsNullOrWhiteSpace(personalDraft.content+personalDraft.title+personalDraft.source+personalDraft.conditions))throw new InvalidOperationException("个人经验中已有草稿，请先处理后再沉淀。");var old=selected;switching=true;Find<ListBox>("Projects").SelectedItem=null;switching=false;await SwitchScope(null);ClearEditor();ShowEditor(true);origin=old.Id;Set("TitleInput",old.Title);Set("ContentInput",old.Text("content"));Set("SourceInput",old.Text("source"));Set("ConditionsInput",old.Text("conditions"));SetEvidence(old.EvidenceType);UpdateEvidenceHint();StatusMessage("已准备个人经验草稿，保留原记录引用。请核对适用条件后保存。");});
     async void UndoClick(object? s,RoutedEventArgs e)=>await Run(async()=>{if(selected==null)return;if(HasDraft())throw new InvalidOperationException("请先保存当前编辑，再恢复上一版本。");var response=await Api().PostAsync("api/v1/memories/undo",new{id=selected.Id,expected_version=selected.Version});ApplyMemory(new MemoryItem(response["memory"]!.DeepClone()));Find<Border>("ContextPanel").IsVisible=false;await LoadMemories();StatusMessage("已恢复上一版本的内容，并保留变更历史。");});
@@ -358,7 +385,7 @@ ShowEditor(false);project=next;switching=true;Find<ListBox>("Projects").Selected
         var response=await Api().PostAsync("api/v1/search",new{project_id=selected.Scope=="personal"?null:selected.Text("project_id"),query="",include_retracted=true});
         var latest=response["memories"]!.AsArray().FirstOrDefault(x=>x!["id"]!.GetValue<string>()==selected.Id);
         if(latest==null)throw new InvalidOperationException("未找到最新记录，草稿仍保留。");
-        ApplyMemory(new MemoryItem(latest.DeepClone()));drafts.Remove(project?.Id??"personal");StatusMessage("已放弃当前草稿并载入最新版本，可重新核对与编辑。");
+        ApplyMemory(new MemoryItem(latest.DeepClone()));drafts.Remove(project?.Id??"personal");PersistDrafts();SetDraftNotice("已放弃当前草稿并载入最新版本，可重新核对与编辑。");
     });
     async void HistoryClick(object? s,RoutedEventArgs e)=>await Run(async()=>{if(selected==null)return;var response=await Api().PostAsync("api/v1/memories/history",new{id=selected.Id});Find<TextBlock>("HistoryText").Text=string.Join("\n\n",response["history"]!.AsArray().Select(x=>{string at="";try{at=x?["retracted_at"]?.GetValue<string>()??"";}catch{}return $"v{x!["version"]}    {x["updated_at"]}{(at==""?"":"    已撤回 "+at)}\n{x["content"]}";}));});
     async void ContextClick(object? s,RoutedEventArgs e)=>await Run(async()=>{var response=await Api().PostAsync("api/v1/context",new{project_id=project?.Id,query=Text("Query")});Set("ContextText",response["text"]!.GetValue<string>());ShowEditor(false);Find<Border>("ContextPanel").IsVisible=true;Find<Button>("CopyContextButton").Focus();StatusMessage("背景已准备。复制即可用于新会话，无需逐条审核。");});
