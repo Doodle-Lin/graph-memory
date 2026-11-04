@@ -201,11 +201,40 @@ P1 提交：`dd570b6`(契约) / `9b24f36`(引擎) / `15b42e7`(备份) / `c4682e5
 | P2-C | `scripts/package-release.ps1` + `scripts/verify-release.ps1`；版本统一 **0.3.0**（Cargo.toml/csproj/mcp_server.rs/Cargo.lock/VERSION.txt） | 打包 exit 0（227 文件 153.99MB、ZIP 62.48MB），verify-release 20/20 PASS |
 | P2-D | 独立复核（lead 接管）：`artifacts/usability-verify/lead-p2-probe.ps1`，**只用 ZIP 解压出的发布物二进制** + 对抗性 CLI 用例 | **20 PASS / 0 FAIL**；日志 `artifacts/usability-verify/lead-p2-probe.log` |
 
-**lead 独立复核中发现的真实缺陷（P2 阻断级，已修）**：v1 API 返回中文 JSON，但响应头只有 `Content-Type: application/json`（HTTP 默认字符集是 ISO-8859-1）。字节本身是合法 UTF-8，严格客户端（.NET `HttpClient` + `ReadAsStringAsync`）按 Latin-1 解码，桌面端 `memory_context` 正文与所有中文错误信息显示为乱码；宽松客户端（Python urllib、reqwest）因默认 UTF-8 而看不见问题，所以 P0/P1 的 Python/Rust 验收全部漏过。
-定位过程：lead 的 P2 探针断言 `text` 含「未解决阻塞」失败 → 改用显式 UTF-8 读取原始字节即通过（证明字节正确）→ 去掉探针 charset 提示后仍失败（证明 `Invoke-RestMethod` 也确实按 Latin-1 解码）→ 根因确认为缺失 `charset=utf-8`。
+**lead 独立复核中发现的真实缺陷（P2 阻断级，已修）**：v1 API 返回中文 JSON，但响应头只有 `Content-Type: application/json`（HTTP 默认字符集是 ISO-8859-1）。字节本身是合法 UTF-8，**缺陷在"声明"而非字节**：缺 charset 时严格按规范回退的客户端会按 Latin-1 解码中文，桌面端 `memory_context` 正文与中文错误信息显示为乱码；宽松客户端（Python urllib、reqwest）因默认 UTF-8 而看不见问题，所以 P0/P1 的 Python/Rust 验收全部漏过。
+定位过程：lead 的 P2 探针断言 `text` 含「未解决阻塞」失败 → 改用显式 UTF-8 读取原始字节即通过（证明字节正确）→ 去掉探针 charset 提示后仍失败（证明客户端确实在按 Latin-1 回退）→ 根因确认为缺失 `charset=utf-8`。
+第二方复核（verifier3）进一步收紧了判定口径：**决定性证据是 Windows PowerShell 5.1 的 `Invoke-RestMethod`**（缺 charset → 按 Latin-1 回退，正文出现 `ä»¥ä¸‹...`、标记 False；发布物 → 正文正确、标记 True）；而**现代 .NET（net10 的 `ReadAsStringAsync`）修复前后都正常**（默认 UTF-8），因此"桌面端必然乱码"这一表述不准确——缺陷本体是响应头声明缺失，桌面端受影响与否取决于客户端实现。该二方复核同时确认：ZIP 与目录 227=227 全字节一致、独立重跑 `verify-release.ps1` 20/20、亲自做的 export→verify→restore 往返 `payload_sha256` 一致。
 修复：`static_server.rs` 的 `send_json`/`send_err` 统一声明 `application/json; charset=utf-8`；`tests/test_headless_service.py` 增加响应头断言；重新打包并复验。修复后：lead 探针 20/20、verify-release 20/20、headless 套件通过。（探针中还有两处**探针自身**的问题：P1 转义写坏了中文模式；`Start-Process -ArgumentList` 不转义含空格路径——产品 CLI 本身对中文空格路径工作正常。）
+
+**第二方复核另发现缺陷 D1（发布物级，已开 task-20 修复）**：「恢复到非空目录必须拒绝」在链路上不一致。契约 `RELEASE_READY_P2.md` 要求"任何非空目标拒绝"，已出货桌面 UI（`EnumerateFileSystemEntries().Take(1)`）也如此，但 CLI `backup_io.rs` 只检查目标下是否已有 `work-memory.db`：目标只放一个无关文件 `keep.txt` 时 `restore` **exit 0 并写入 `work-memory.db`**（lead 已复现，`artifacts/usability-verify/lead-d1-repro.log`），而目标含 `work-memory.db` 时才拒绝。不是数据损坏（无关文件未被覆盖），是契约与实现不符 + CLI/UI 语义分叉。裁定：改实现（统一为"目标必须已存在且完全为空"），不改文档、桌面无需改动。
 
 lead 最终验收（独立重跑权威脚本）：`scripts/package-release.ps1` exit 0 → `scripts/verify-release.ps1` **20/20 PASS** → `artifacts/usability-verify/lead-p2-probe.ps1` **20 PASS / 0 FAIL**（解压发布物跑检索/续接/撤回/恢复/导出往返/并发导出/覆盖拒绝/dry-run）→ `tests/test_headless_service.py` exit 0。
 P2 提交：`4213fa5`(版本与 bin 目标) / `c91f237`(打包与发布验证) / `ff20274`(桌面数据面板) / `53698ed`(charset 修复 + 契约)，均本地未推送。
 
-边界与未完成（P2）：没有自动更新器、安装程序、代码签名、云端同步或跨平台包；恢复仍是"只写空目录"，合并式恢复归 L2-03；`package-release.ps1` 需要本机 Rust + .NET 10 SDK；发布包内 README 为脚本生成的精简版。`verifier2` 在 P2 轮失败（无产出），P2-D 由 lead 亲自执行，因此**P2 缺少第二台独立执行的验收**——这是本批的主要残余风险，下一轮应由新的验收 teammate 至少复核 `verify-release.ps1` 与发布物功能。
+边界与未完成（P2）：没有自动更新器、安装程序、代码签名、云端同步或跨平台包；恢复仍是"只写空目录"，合并式恢复归 L2-03；`package-release.ps1` 需要本机 Rust + .NET 10 SDK；发布包内 README 为脚本生成的精简版。
+
+第二方复核（verifier3，task-15，`artifacts/usability-verify/p2-verifier3/`，30 PASS / 0 FAIL）：修复了 P2 批次"缺少第二台独立执行验收"的残余风险，并证明在**从 `53698ed` 用 git archive 导出的 P2 基线树**上回归全绿（cargo 45、Setup 102、Editor 127、Python 19、headless OK、ZIP 内 smoke exit 0），因此 P3 未提交改动不会污染 P2 判定。其两点非缺陷观察已记录：LF-only/CRLF 客户端差异（后由 task-18 证明是真实链路缺陷，见 P3 批次）、以及各版本字段语义（见 P3_CONTRACT.md 术语口径）。
+
+## P3 批次（2026-11-04，团队并行，基线 a1bc215）
+
+触发：P0/P1/P2 之后，"能装、能用、数据可托付"已成立，但还有三处直接影响实际可用：草稿只在内存里（崩溃即丢）、召回质量没有任何数字、本机 HTTP 接口没有资源边界。契约：[P3_CONTRACT.md](P3_CONTRACT.md)。分工：desktop-ux（task-16）、rust-core（task-17）、data-restore（task-18/20）、lead（契约 + 集成 + 打包 + 冻结诊断）、verifier3（task-19，第二方独立验收）。
+
+| 项 | 内容 | 结果 |
+|---|---|---|
+| task-16 | 草稿持久化与崩溃恢复：工作库之外分片、原子写、损坏降级、过期基线提示、放弃即删条目 | Editor **127 → 215**（+88 断言，含 3 个真实双进程杀进程用例）；Setup 102 不变 |
+| task-17 | 中文检索评测集与基线（68 查询 / 27 记录，冻结二进制 + SHA256） | Recall@5 **0.7959**、MRR **0.7619**、跨项目污染 **0**、撤回泄漏 **0**、无答案误召回 **0**；两次运行完全一致 |
+| task-18 | 本机协议加固：431/413（边读边判）/408/503 并发 64/405+Allow/400 不 panic | Rust **45 → 60**；Python headless 1 → 6 用例 |
+| task-20 | D1 修复：restore 拒绝任何非空目标目录 | Rust 60（新增 3 用例）；CLI 六案（含 dry-run、空子目录、目录不存在）全符合 |
+| task-19 | 第三批独立验收（第二方） | 见下"残余风险" |
+
+**本批发现并修复的两个真实缺陷**
+
+1. **静默写入失败（task-18 顺带发现，严重）**：`read_full_request` 把请求头与正文一起做 `\n→\r\n` 归一化，再用 `find("\r\n\r\n")` 切正文。于是所有用 **LF-only 请求体**的客户端（例如 Python `http.client` 默认）JSON 正文解析为空：`POST` 返回 200、库里却什么都没写，`search` 返回空。既有 Python 用例一直用 `urllib`（发 CRLF）所以完全掩盖了它；task-17 的评测器用 LF 请求体时也踩到，但当时被当成"写 200 但检索不到"的怪现象。修复：头部按行读取并归一化，正文按声明的 `Content-Length` 单独切分，并给 LF-only 路径补了回归。
+2. **D1（task-15 发现，发布物级）**：见上一节；`backup_io.rs` 现在要求目标"已存在且完全为空"，`read_dir` 出错 fail closed，dry-run 同样拒绝。
+
+**lead 独立验收（P3）**：`cargo build --no-default-features` exit 0 → `cargo test --no-default-features --lib -- --test-threads=1` **60 passed / 0 failed**；`dotnet run tests/Desktop.Setup.Tests` **PASS 102**；`tests/Desktop.Editor.Tests` **PASS 215**；`python tests/test_headless_service.py` 6/6、`tests/test_backup_cli.py` 1/1；`scripts/package-release.ps1` exit 0（227 文件、ZIP 62.50MB）→ `scripts/verify-release.ps1` **20/20 PASS**；`tests/eval/run_eval.py` 在**加固后**的二进制上重跑，Recall@5/MRR 与基线**逐位相同**（说明协议加固没有改变检索行为，也证明 task-17 的冻结二进制方法有效）。
+P3 提交：`5c8a49f`(评测集与基线) / `9e9ea94`(协议加固 + LF-only 修复) / `9944fe9`(草稿持久化) / `14642a0`(restore 空目标)，均本地未推送。
+
+**残余风险（必须如实记录）**：P3 契约与评分口径的 task-19（第三批独立验收）在打包冻结之后才开跑，因此**P3 的独立验收结论尚未回填本账本**；已冻结的待验物是：debug 二进制 `graph-memory-service.exe` SHA256 `C0B845AC…F2AA1`、`mcp_server.exe` `08EF3BEE…31CC0`、`graph-memory-backup.exe` `163089C4…3DD1`，发布物 `artifacts/release/graph-memory-0.3.0-win-x64/`（service `5CA77E22…C3BB`、mcp `0B349EB9…2703`、backup `DB57B373…A2D3`、Desktop `0C97B8FB…48C3`），ZIP SHA256 `F1D7BB04…21BCB`（18:07:23）。若 task-19 报出缺陷，需回到本账本追加并重新打包。
+
+边界与未完成（P3）：草稿仅存本机单一副本（无云同步/加密/多用户），30 天清理只在保存时触发；检索策略**未做任何优化**（本批只测量，`同义改写（不照抄）` Recall@5 仅 0.3333 已如实记录在基线文档，改检索必须另立批次且以该基线为对照）；协议加固只覆盖本机 HTTP 面，没有鉴权/令牌（仍属 L5-01 未做）；没有自动更新器/安装程序/代码签名/跨平台包。`artifacts/desktop`（用户正在使用的开发版）全程未被覆盖。
