@@ -21,7 +21,7 @@ public partial class MainWindow {
     // 把当前编辑器内容同步进草稿表；空草稿视为过期并移除，避免留下幽灵 scope。
     void SnapshotCurrentDraft(){
         var key=project?.Id??"personal";
-        if(HasDraft())drafts[key]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),selected,origin,SelectedKind(),eventId,lastRequest);
+        if(HasDraft())drafts[key]=(Text("TitleInput"),Text("ContentInput"),Text("SourceInput"),Text("ConditionsInput"),SelectedEvidence(),selected,origin,SelectedKind(),eventId,lastRequest);
         else drafts.Remove(key);
     }
     int PendingDraftCount(){SnapshotCurrentDraft();return drafts.Count;}
