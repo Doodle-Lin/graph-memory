@@ -1,6 +1,6 @@
 # 工作库备份与校验
 
-开发版提供 `graph-memory-backup` 命令行工具。服务运行中也可导出整个 v1 工作库；不需要关闭桌面或 Agent。桌面数据管理入口与恢复命令尚未实现，校验通过不等于已完成恢复演练。
+开发版提供 `graph-memory-backup` 命令行工具。服务运行中也可导出整个 v1 工作库；不需要关闭桌面或 Agent。已支持恢复到**空目录**（不覆盖现有工作库）；桌面的数据管理入口尚未实现，校验通过不等于已完成恢复演练。
 
 ## 使用
 
@@ -15,7 +15,11 @@ cargo build --manifest-path src-tauri/Cargo.toml --locked --no-default-features 
 ```powershell
 ./src-tauri/target/debug/graph-memory-backup.exe export --data-dir "E:/my-memory/workspace" --output "E:/backups/workspace-2026-11-02.gmbackup"
 ./src-tauri/target/debug/graph-memory-backup.exe verify "E:/backups/workspace-2026-11-02.gmbackup"
+./src-tauri/target/debug/graph-memory-backup.exe restore --input "E:/backups/workspace-2026-11-02.gmbackup" --data-dir "E:/my-memory/restored" --dry-run
+./src-tauri/target/debug/graph-memory-backup.exe restore --input "E:/backups/workspace-2026-11-02.gmbackup" --data-dir "E:/my-memory/restored"
 ```
+
+参数用空格分隔；`--input=FILE` 这类等号形式会被拒绝（退出码 2）。
 
 `scripts/build-desktop.ps1` 生成的新版候选包也包含 `graph-memory-backup.exe`，可从包目录调用。旧安装包不会自动增加此文件。
 
@@ -29,6 +33,19 @@ cargo build --manifest-path src-tauri/Cargo.toml --locked --no-default-features 
 
 当前格式上限为 64 MiB（最终编码文件），完整数据在内存中校验。超限明确失败，不截断。格式与字段约束见[格式 v1](design/BACKUP_FORMAT_V1.md)。
 
+## 恢复到新目录
+
+```powershell
+./src-tauri/target/debug/graph-memory-backup.exe restore --input "E:/backups/workspace-2026-11-02.gmbackup" --data-dir "E:/my-memory/restored"
+```
+
+- `--data-dir` 必须是**已存在且为空**（不含 `work-memory.db`）的目录；目标已有工作库时拒绝，绝不覆盖。原库始终保留，可继续使用。
+- 恢复先完整校验备份包（格式版本、数量、摘要、排序、引用关系），校验失败不创建任何文件、不污染目标目录。
+- 写入方式：同盘 UUID 暂存目录内建库并同步，再用硬链接无覆盖发布为 `work-memory.db`；失败路径清理暂存文件，目标目录保持原样。
+- `--dry-run` 只校验并输出将恢复的计数，不写任何文件；可用于恢复前预演。
+- 成功输出 JSON：`{"status":"ok","operation":"restore","format_version":1,"counts":{...},"dry_run":false}`。恢复后可用同一目录启动桌面或服务；也可再 `export` 核对 `payload_sha256` 与原包一致。
+- 恢复不是合并：重复导入、把恢复库并回原库、冲突预览仍属后续任务；需要合并时请人工核对记录 ID 与版本。
+
 ## 一致性与失败行为
 
 - 通过独立只读 SQLite 连接，在同一个读事务里检查结构并读取四张业务表，包含 WAL 内已经提交的数据；不会把活动中的主数据库文件直接复制成备份。
@@ -38,4 +55,4 @@ cargo build --manifest-path src-tauri/Cargo.toml --locked --no-default-features 
 - 普通错误会清理本次临时文件；进程被强制终止可能留下 `.graph-memory-*.tmp`。正式路径不会暴露部分写入文件。不承诺断电后的目录项持久性；未做真实断电或磁盘耗尽实验。
 - `verify` 只读取备份，检查格式版本、数量、摘要、排序、完整历史及引用关系，不打开工作库，也不写入或恢复数据。验证失败的输入不会被修改。
 
-恢复到新目录、冲突预览和恢复后的幂等重放属于下一步 L2-03。在它完成前，保留原工作库，勿凭校验成功删除原库。
+恢复到新目录（`restore`）已实现：目标目录必须为空，校验失败不写文件，原库不被改动。冲突预览、把恢复库合并回原库、恢复后的幂等重放仍属后续 L2-03。恢复演练通过前，不要凭校验成功删除原库。

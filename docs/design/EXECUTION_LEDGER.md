@@ -139,3 +139,32 @@
 - 完整scripts/test-windows.ps1通过：三Rust二进制构建、25项Rust、102项配置、73项真实控件+HTTP、stdio/HTTP集成、新备份CLI集成、自包含桌面smoke。候选包artifacts/ci-desktop包含备份exe；用户运行中的旧桌面包未替换。已有Rust警告及NuGet NU1900漏洞源访问警告保留，不能称零警告或漏洞检查通过。
 - [使用说明](../BACKUP.md)明确明文、64MiB、整库范围、硬链接约束和编码时间不等于业务截止时间。未实测断电/真实磁盘耗尽，不承诺断电后目录项持久性；强制终止可能留下暂存文件。正常失败路径已验证。
 - 当前交付是CLI备份与校验，不含恢复、桌面数据管理入口或真实用户库备份。本地验收通过，当前提交远端CI待核验；下一项L2-03将恢复到新目录并演练ID/版本/引用与幂等重放，不能提前标完成。
+
+## P0 可用性批次（2026-11-04，团队并行，基线 368370c）
+
+触发：用户要求"优化成一个实际可用易用的应用"。契约：[USABILITY_P0.md](USABILITY_P0.md)（唯一来源，含 P0-A/B/C/D 与验收命令）。分工：rust-core（P0-A + MCP schema）、data-restore（P0-B + 缺陷修复）、desktop-ux（P0-C）、verifier2（P0-D 独立验收，只读产品代码）、lead（契约、集成、最终验收）。
+
+实测起点（lead 在黑盒 HTTP 上复现）：`memory_search` 中文自然问句 6/6 全 0 命中（按空格分词导致整句成为单个子串）；`memory_context` 只按时间倒序返回，不区分阻塞/下一步/决策；`evidence_type` 恒为陈述；备份只能导出/校验、不能恢复。
+
+实现与验收结果：
+
+| 项 | 内容 | 结果 |
+|---|---|---|
+| P0-A1 | search 词条匹配（CJK>2 字符 bigram 兜底）+ 相关度打分 + `ranked`/`score` | 中文长问句命中、纯噪声 0 召回、AND 语义、项目隔离、空 query 时间倒序均通过 |
+| P0-A2 | context 新增 `blockers`/`next_steps`/`recent_decisions`，`text` 改结论优先固定段落 | 11 键齐全、分组精确、组内倒序且≤10、空组"（无）"、40/20 截断语义不变 |
+| P0-A3 | create/update 可选 `evidence_type`（4 值白名单，非法 400） | 缺省陈述、4 合法值接受、4 非法值 400、update/undo 语义不变 |
+| P0-A4 | MCP `memory_write`/`memory_update` schema 暴露 `evidence_type` | 真实 stdio `tools/list` 含 4 值 enum；旧七工具 schema 未变 |
+| P0-B | `graph-memory-backup restore --input --data-dir [--dry-run]` | 校验失败不写文件；非空目标拒绝；恢复库四表计数与 manifest 逐表一致；原库 SHA256 不变 |
+| P0-C | 桌面首屏自动加载、依据标签与下拉、空库引导、续接区 | Editor 73、Setup 102 全绿；真实服务与 stub 探针 30 项通过 |
+| P0-D | 独立黑盒验收 `scripts/verify-usability.ps1` | **39 PASS / 0 FAIL / 0 SKIP**；证据 `artifacts/usability-verify/run-20261104-132258/`（report.txt/json、ACCEPTANCE.md、http/*.json、*.argv.txt、套件原始日志） |
+
+集成期发现并修复的真实缺陷（P1，阻断备份恢复）：`backup_format/validate.rs` 把 `evidence_type` 当作修订不可变字段，A3 生效后任何发生过依据变更的工作库 `export` 都失败（`revision immutable fields differ`）。修复：从不可变集合移除该字段，保留 created_at/memory_scope/project_id/origin_memory_id 约束；同步修订 [BACKUP_FORMAT_V1.md](BACKUP_FORMAT_V1.md) 与契约。回归：36 项 Rust（新增 2 项）+ ADV-04A 真实 CLI export/verify。
+
+lead 最终验收（本轮）：
+- `cargo test --no-default-features --lib` → 36 passed；
+- `tests/Desktop.Setup.Tests` → PASS 102；`tests/Desktop.Editor.Tests` → PASS 73（真实 XAML 控件 + 隔离 HTTP）；
+- `test_headless_service.py`、`test_backup_cli.py` → 各 Ran 1 test OK（exit 0）；
+- 自包含发布 `artifacts/desktop-p0` + 全新临时目录 smoke → PASS；
+- 独立复验缺陷修复：evidence_type v1→v2 后 export/restore/verify 均 exit 0，计数一致。
+
+边界与未完成：本批不是语义检索（无向量）；未被 Agent 显式要求时不会自动写入；恢复不是合并、无冲突预览；桌面无导出/恢复入口；软删除/撤回、occurred_at、真实宿主全链路矩阵仍属 L2/L3/L5。文档已同步：README、desktop/README、SKILL、AGENT_INSTRUCTIONS、docs/BACKUP。本批产物为 `artifacts/desktop-p0`，未替换用户正在运行的 `artifacts/desktop`。未提交、未推送。

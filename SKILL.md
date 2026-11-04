@@ -18,10 +18,15 @@ description: 沉淀与复用跨会话个人经验及项目记录：检索、写�
 ## 五个工具（v1）
 
 - `memory_projects`：列出项目，取得真实项目 ID。
-- `memory_context`：按当前任务取上下文，用于续接。
-- `memory_search`：关键词检索，支持 scope、date_field、from/to、kind 与 limit/offset 分页。
-- `memory_write`：写入记录；个人经验用 `memory_scope=personal` 且不填 project_id，项目进展用 `memory_scope=project` 并填写 project_id。
-- `memory_update`：用 id 与读取时的 expected_version 纠正已有记录。
+- `memory_context`：按当前任务取上下文，用于续接。返回按结论优先排列：未解决阻塞、下一步、最近决策在前，其后是当前项目记录与相关个人经验；`text` 字段可直接阅读。
+- `memory_search`：关键词检索，支持 scope、date_field、from/to、kind 与 limit/offset 分页。query 按空白切分词条并全部匹配；中文长句按字符 bigram 兜底，可用自然问句检索。结果按相关度（标题权重更高）排序，每条带 `score`，响应带 `ranked: true`。
+- `memory_write`：写入记录；个人经验用 `memory_scope=personal` 且不填 project_id，项目进展用 `memory_scope=project` 并填写 project_id。可用 `evidence_type` 标注依据（默认 `user_or_agent_statement`）。
+- `memory_update`：用 id 与读取时的 expected_version 纠正已有记录；可同时修正 `evidence_type`。
+
+### 记录类型与依据
+
+- 常用 `kind`：`blocker`（阻塞）、`next_step`（下一步）、`decision`（决策）、`lesson`（经验/踩坑）、`note`（笔记）；`memory_context` 依 `blocker`/`next_step`/`decision` 分组，请如实标注，不要把所有内容都写成 `note`。
+- `evidence_type` 取值：`user_or_agent_statement`（陈述，默认）、`user_confirmed`（用户确认）、`tool_result`（工具/命令/测试实际输出）、`inference`（推断）。只有确有其事才升级依据；缺少依据时保持陈述。
 
 ## 约定
 
