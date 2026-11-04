@@ -1,6 +1,6 @@
 [package]
 name = "graph-memory"
-version = "0.2.0"
+version = "0.3.0"
 description = "Graph Memory — 图式记忆系统"
 authors = ["Graph Memory Contributors"]
 license = "MIT"
@@ -24,6 +24,14 @@ required-features = ["desktop"]
 [[bin]]
 name = "graph-memory-service"
 path = "src/bin/service.rs"
+
+[[bin]]
+name = "mcp_server"
+path = "src/bin/mcp_server.rs"
+
+[[bin]]
+name = "graph-memory-backup"
+path = "src/bin/graph-memory-backup.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
