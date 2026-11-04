@@ -42,24 +42,33 @@
 
 默认工作库为 `%LOCALAPPDATA%/GraphMemory/workspace-v1/work-memory.db`；`--data-dir <目录>` 可指定独立目录。新旧数据不自动互通。
 
+## 备份、校验与恢复
+
+三种入口，语义相同（都只通过 `graph-memory-backup`，桌面不直接改库）：
+
+1. **桌面**【数据备份与恢复】面板：显示当前工作库目录与计数；导出备份、校验备份、恢复到空目录（`apply` 前二次确认，明示当前工作库不会被写入/覆盖/合并/删除）；目标文件已存在时界面直接拒绝，绝不覆盖。
+2. **命令行**：`graph-memory-backup export --data-dir DIR --output FILE.gmbackup`、`verify FILE.gmbackup`、`restore --input FILE.gmbackup --data-dir EMPTY_DIR [--dry-run]`。详见[备份文档](docs/BACKUP.md)。
+3. **发布包**：`scripts/package-release.ps1` 产出 `artifacts/release/graph-memory-<版本>-win-x64/` 与同名 ZIP（含 4 个可执行文件、`VERSION.txt`、`SHA256SUMS.txt`）；`scripts/verify-release.ps1` 校验版本一致性、哈希、ZIP 解压后 smoke 与真实 export→verify→restore 往返。当前版本 **0.3.0**，解压即用、无需安装。
+
+恢复只写入**空的** `--data-dir`，不会覆盖现有工作库；需要把备份并回现有库时请人工核对记录 ID 与版本（合并式恢复仍未实现）。
+
 ## 文档
 
 - [桌面端使用说明](desktop/README.md)
 - [可安装的 Agent 技能](SKILL.md)
 - [Agent 使用约定](desktop/AGENT_INSTRUCTIONS.md)
 - [无界面服务](docs/HEADLESS_SERVICE.md)
+- [备份、校验与恢复](docs/BACKUP.md)
 - [长期规划](docs/design/LONG_TERM_PLAN.md)
 - [执行账本](docs/design/EXECUTION_LEDGER.md)
 - [旧版入口说明](docs/legacy/README.md)
 
 ## 边界
 
-这是可运行开发版，尚未完整发布：检索为词条 + 中文 bigram 匹配而非语义向量；依据可标注但仍需人工判断，不自动标记为已验证；旧数据迁移、桌面导出/恢复入口、批量撤回与撤回审批、完整证据生命周期与完整鉴权尚未完成。工作库已支持一致性备份、校验与**恢复到空目录**的 CLI（见[备份文档](docs/BACKUP.md)），恢复不是合并、也不会覆盖现有工作库。记录支持软撤回（`retract`/`restore`，产生新版本、不物理删除）。服务只监听本机并拒绝浏览器 Origin 请求，但本机其他进程仍属信任边界，调用统计不构成安全审计。工具失败时如实说明；成功读取也不等于本次任务已验证成功。
+这是可运行开发版，尚非完整发布版：检索为词条 + 中文 bigram 匹配而非语义向量；依据可标注但仍需人工判断，不自动标记为已验证；旧数据迁移、批量撤回与撤回审批、合并式恢复、自动更新/安装程序与代码签名、完整证据生命周期与完整鉴权尚未完成。工作库已支持一致性备份、校验与**恢复到空目录**（桌面面板 + CLI，见[备份文档](docs/BACKUP.md)），恢复不是合并、也不会覆盖现有工作库。记录支持软撤回（`retract`/`restore`，产生新版本、不物理删除）。服务只监听本机并拒绝浏览器 Origin 请求，但本机其他进程仍属信任边界，调用统计不构成安全审计。工具失败时如实说明；成功读取也不等于本次任务已验证成功。
 
 ## License
 
 MIT
 
 宿主实际验证范围与未完成项见[兼容验收矩阵](docs/HOST_COMPATIBILITY.md)；配置成功不等于Agent已经调用或采用记忆。
-
-工作库已支持[一致性备份、校验与恢复到空目录](docs/BACKUP.md)，可在服务运行中导出；`restore` 只写入空的 `--data-dir`，不会覆盖现有工作库。

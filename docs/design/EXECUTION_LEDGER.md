@@ -188,4 +188,24 @@ P0 后续：本批 13 个文件已提交为 5 个本地提交 `4f6f882`(引擎) 
 lead 最终验收（本轮，独立重跑 verifier 脚本）：`scripts/verify-usability.ps1 -Full` → exit 0、51 PASS / 0 FAIL，证据 `run-20261104-152041`；`tests/test_headless_service.py` 由 lead 追加撤回/恢复断言（21 行）后通过；自包含发布 `artifacts/desktop-p1` + 全新临时目录 smoke exit 0。
 P1 提交：`dd570b6`(契约) / `9b24f36`(引擎) / `15b42e7`(备份) / `c4682e5`(桌面)，均本地未推送。
 
-边界与未完成（P1）：撤回是状态标记而非物理删除，没有批量撤回、撤回审批、撤回原因强制或撤回统计；`retracted_at` 不做严格 RFC3339 校验（与既有宽松 serde 策略一致）；旧库兼容只覆盖"无撤回字段的 body"，不含历史遗留 schema；桌面恢复/导出入口、occurred_at 事件时间、真实宿主全链路矩阵仍属 L2-05/L3/L5。`artifacts/desktop-p1` 未替换用户正在运行的 `artifacts/desktop`。
+边界与未完成（P1）：撤回是状态标记而非物理删除，没有批量撤回、撤回审批、撤回原因强制或撤回统计；`retracted_at` 不做严格 RFC3339 校验（与既有宽松 serde 策略一致）；旧库兼容只覆盖"无撤回字段的 body"，不含历史遗留 schema；occurred_at 事件时间、真实宿主全链路矩阵仍属 L3/L5。`artifacts/desktop-p1` 未替换用户正在运行的 `artifacts/desktop`。
+
+## P2 发布就绪批次（2026-11-04，团队并行，基线 435894f）
+
+触发：P0/P1 之后最大的"不可用"点是普通用户仍要敲命令行才能备份/恢复，且项目没有版本一致的可分发产物。契约：[RELEASE_READY_P2.md](RELEASE_READY_P2.md)。分工：desktop-ux（P2-A/B）、data-restore（P2-C）、lead（契约、集成、独立复核）、verifier2（P2-D，**该实例在产出结果前失败**，由 lead 接管独立复核）。
+
+| 项 | 内容 | 结果 |
+|---|---|---|
+| P2-A | 桌面【数据备份与恢复】面板：库目录与计数、导出、校验、恢复到空目录（二次确认）、目标已存在 UI 先拒绝 | Editor **86→127**、Setup 102（lead 复跑确认编译 0 警告 0 错误） |
+| P2-B | 桌面侧 headless 用例（真实 CLI + 临时目录）：导出/覆盖拒绝/dry-run/非空目标/截断包/空路径 | 见上，P2 段落 28 项 |
+| P2-C | `scripts/package-release.ps1` + `scripts/verify-release.ps1`；版本统一 **0.3.0**（Cargo.toml/csproj/mcp_server.rs/Cargo.lock/VERSION.txt） | 打包 exit 0（227 文件 153.99MB、ZIP 62.48MB），verify-release 20/20 PASS |
+| P2-D | 独立复核（lead 接管）：`artifacts/usability-verify/lead-p2-probe.ps1`，**只用 ZIP 解压出的发布物二进制** + 对抗性 CLI 用例 | **20 PASS / 0 FAIL**；日志 `artifacts/usability-verify/lead-p2-probe.log` |
+
+**lead 独立复核中发现的真实缺陷（P2 阻断级，已修）**：v1 API 返回中文 JSON，但响应头只有 `Content-Type: application/json`（HTTP 默认字符集是 ISO-8859-1）。字节本身是合法 UTF-8，严格客户端（.NET `HttpClient` + `ReadAsStringAsync`）按 Latin-1 解码，桌面端 `memory_context` 正文与所有中文错误信息显示为乱码；宽松客户端（Python urllib、reqwest）因默认 UTF-8 而看不见问题，所以 P0/P1 的 Python/Rust 验收全部漏过。
+定位过程：lead 的 P2 探针断言 `text` 含「未解决阻塞」失败 → 改用显式 UTF-8 读取原始字节即通过（证明字节正确）→ 去掉探针 charset 提示后仍失败（证明 `Invoke-RestMethod` 也确实按 Latin-1 解码）→ 根因确认为缺失 `charset=utf-8`。
+修复：`static_server.rs` 的 `send_json`/`send_err` 统一声明 `application/json; charset=utf-8`；`tests/test_headless_service.py` 增加响应头断言；重新打包并复验。修复后：lead 探针 20/20、verify-release 20/20、headless 套件通过。（探针中还有两处**探针自身**的问题：P1 转义写坏了中文模式；`Start-Process -ArgumentList` 不转义含空格路径——产品 CLI 本身对中文空格路径工作正常。）
+
+lead 最终验收（独立重跑权威脚本）：`scripts/package-release.ps1` exit 0 → `scripts/verify-release.ps1` **20/20 PASS** → `artifacts/usability-verify/lead-p2-probe.ps1` **20 PASS / 0 FAIL**（解压发布物跑检索/续接/撤回/恢复/导出往返/并发导出/覆盖拒绝/dry-run）→ `tests/test_headless_service.py` exit 0。
+P2 提交：`4213fa5`(版本与 bin 目标) / `c91f237`(打包与发布验证) / `ff20274`(桌面数据面板) / `53698ed`(charset 修复 + 契约)，均本地未推送。
+
+边界与未完成（P2）：没有自动更新器、安装程序、代码签名、云端同步或跨平台包；恢复仍是"只写空目录"，合并式恢复归 L2-03；`package-release.ps1` 需要本机 Rust + .NET 10 SDK；发布包内 README 为脚本生成的精简版。`verifier2` 在 P2 轮失败（无产出），P2-D 由 lead 亲自执行，因此**P2 缺少第二台独立执行的验收**——这是本批的主要残余风险，下一轮应由新的验收 teammate 至少复核 `verify-release.ps1` 与发布物功能。

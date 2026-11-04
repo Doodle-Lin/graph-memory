@@ -44,6 +44,9 @@
 
 ### 语义补充（供验收判定）
 
+- `retract`/`restore` 忽略正文类字段：即使请求里带 `content`，正文也不会被改写（lead 实测 `retract` 带 `content` 后 content 不变）。
+- 撤回状态独立于正文版本：对已撤回记录执行 `update`（纠正正文）或 `undo`（回滚正文）都**不会**自动恢复，撤回状态与原因保留，仍需显式 `restore`。
+- `restore` 的 `reason` 为空字符串时 `retract_reason` 归为 null。
 - `retracted_excluded` 在 `search` 中表示**本次匹配集**中因撤回被丢弃的条数，不随 `offset` 变化。
 - `context` 的 `retracted_excluded` 按请求范围计：带 `project_id` 时统计「该项目查询原本会返回、但因撤回被丢弃」的条数（已覆盖的个人维度不重复计数）；不带 `project_id` 时只计个人维度。
 
