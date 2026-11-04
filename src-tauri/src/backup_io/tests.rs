@@ -536,6 +536,105 @@ fn legacy_export_loses_nothing_when_retraction_fields_appear() {
     assert!(revision["content"].as_str().unwrap().contains("second"));
 }
 
+/// Every entry of `path` as (relative name, bytes); directories recurse, so a
+/// refusal can be asserted to have left the target byte-for-byte unchanged.
+fn tree(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut items = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let child = entry.path();
+            let relative = child
+                .strip_prefix(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if child.is_dir() {
+                items.push((format!("{relative}/"), Vec::new()));
+                stack.push(child);
+            } else {
+                items.push((relative, fs::read(&child).unwrap()));
+            }
+        }
+    }
+    items.sort();
+    items
+}
+
+/// P3-E: only `work-memory.db` used to be checked, so a target holding just an
+/// unrelated file was accepted and restore silently added a database next to it.
+/// Any entry must now refuse the restore, for `--dry-run` as well, and the
+/// directory must stay exactly as it was.
+#[test]
+fn restore_refuses_target_with_only_unrelated_entries() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+
+    let targets = ["keep.txt", ".gitignore", "photos/payload.bin"];
+    for entry in targets {
+        let target = fixture
+            .0
+            .join(format!("occupied-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&target).unwrap();
+        let path = target.join(entry);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, format!("unrelated contents of {entry}")).unwrap();
+        let before = tree(&target);
+        assert!(!before.is_empty(), "{entry} fixture is empty");
+
+        // Dry-run is refused the same way and writes nothing either.
+        let dry = restore_workspace(&fixture.output(), &target, true).unwrap_err();
+        assert_eq!(dry, "restore requires an empty target directory", "{entry}");
+        assert_eq!(tree(&target), before, "{entry} dry-run changed the target");
+
+        let error = restore_workspace(&fixture.output(), &target, false).unwrap_err();
+        assert_eq!(error, "restore requires an empty target directory", "{entry}");
+        assert_eq!(tree(&target), before, "{entry} changed the target");
+        assert!(!target.join("work-memory.db").exists(), "{entry} wrote a database");
+        assert!(fixture.no_staging(), "{entry} left staging behind");
+        assert_eq!(
+            verify_file(&fixture.output()).unwrap(),
+            exported,
+            "{entry} modified the backup"
+        );
+    }
+}
+
+/// The refusal must not depend on the entry being readable as a file: a target
+/// holding only an empty subdirectory is still non-empty.
+#[test]
+fn restore_refuses_target_holding_only_an_empty_directory() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    let target = empty_target(&fixture);
+    fs::create_dir(target.join("empty-subdirectory")).unwrap();
+
+    let error = restore_workspace(&fixture.output(), &target, false).unwrap_err();
+    assert_eq!(error, "restore requires an empty target directory");
+    assert_eq!(entries(&target), vec!["empty-subdirectory".to_string()]);
+    assert!(!target.join("work-memory.db").exists());
+    assert_eq!(verify_file(&fixture.output()).unwrap(), exported);
+}
+
+/// A truly empty, existing target is still accepted: the stricter rule must not
+/// break the normal restore path, and the published database is the only entry
+/// afterwards.
+#[test]
+fn restore_after_export_still_accepts_a_truly_empty_target() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    let target = empty_target(&fixture);
+    assert!(entries(&target).is_empty());
+    assert_eq!(
+        restore_workspace(&fixture.output(), &target, false).unwrap(),
+        exported
+    );
+    assert_eq!(entries(&target), vec!["work-memory.db".to_string()]);
+}
+
 #[test]
 fn retracted_workspace_round_trips_through_cli_export_verify_restore() {
     let fixture = Fixture::new();

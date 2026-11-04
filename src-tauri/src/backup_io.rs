@@ -42,9 +42,11 @@ pub fn verify_file(path: &Path) -> Result<Counts, String> {
 /// Restore a validated backup into an empty target data directory.
 ///
 /// The order is fixed and observable: the backup is fully `decode`d and sized
-/// first, so an invalid input never creates, replaces or truncates anything. A
-/// target that already holds `work-memory.db` is refused, so an existing
-/// workspace is never overwritten. The database is then materialised through a
+/// first, so an invalid input never creates, replaces or truncates anything. The
+/// target must already exist and be **completely empty**: any entry at all —
+/// `work-memory.db`, an unrelated file, a stray directory — is refused, so a
+/// workspace is never overwritten and unrelated user data is never silently
+/// joined by restore output. The database is then materialised through a
 /// create-new connection inside a same-filesystem UUID staging directory, synced
 /// with `sync_all`, and only then published with a no-clobber hard link. Any
 /// failure removes this operation's staging file and leaves the target directory
@@ -59,16 +61,27 @@ pub fn restore_workspace(input: &Path, data_dir: &Path, dry_run: bool) -> Result
     let snapshot = read_backup(input)?;
     let summary = counts(&snapshot);
 
-    // 2. The target directory must exist, be a directory, and hold no workspace.
+    // 2. The target directory must exist, be a directory, and hold no entry at
+    // all. This is the same rule the shipped desktop UI applies
+    // (`Directory.EnumerateFileSystemEntries(target).Take(1)`), so the CLI and the
+    // UI cannot disagree about the same action. `read_dir` errors (permissions,
+    // disappearing directory) fail closed: they must never be mistaken for
+    // "empty" and silently restored into.
     if !data_dir.is_dir() {
         return Err("restore target must be an existing directory".into());
     }
-    let destination = data_dir.join(DB_NAME);
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => return Err("restore requires an empty target directory".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err("cannot inspect restore target".into()),
+    let mut entries =
+        fs::read_dir(data_dir).map_err(|_| "cannot inspect restore target".to_string())?;
+    match entries.next() {
+        // Completely empty: restore may proceed.
+        None => {}
+        // Any entry at all — `work-memory.db`, an unrelated file, a stray
+        // directory, or an entry that cannot even be read — makes the target
+        // non-empty: refuse and leave it exactly as it is.
+        Some(_) => return Err("restore requires an empty target directory".into()),
     }
+    drop(entries);
+    let destination = data_dir.join(DB_NAME);
 
     // 3. Nothing below this line writes when `--dry-run` was requested.
     if dry_run {
