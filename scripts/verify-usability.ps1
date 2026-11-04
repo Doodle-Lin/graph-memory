@@ -34,6 +34,7 @@ param(
     [string]$EvidenceDir = '',
     [string]$ServiceExe = '',
     [string]$BackupExe = '',
+    [string]$McpExe = '',
     [int]$HttpTimeoutSec = 30,
     [int]$ServiceReadySec = 30,
     [int]$NativeTimeoutSec = 3600
@@ -47,6 +48,14 @@ try {
     $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 } catch { }
 
+# Windows PowerShell 5.1 的 ProcessStartInfo 没有 StandardInputEncoding：重定向的子进程
+# 标准输入会用 [Console]::InputEncoding 编码（本机默认 936）。实测（prep/probe-stdin-encoding.ps1）
+# 把它改成 UTF-8 后，同样一条含中文的 JSON-RPC 从 outLen=0 变成正常回复。这里一并设置，
+# 使 MCP stdio 载荷可以承载任意 UTF-8 内容。
+try {
+    [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+} catch { }
+
 # ════════════════════════════════════════════════════════════════════════════
 #  0. 基础工具
 # ════════════════════════════════════════════════════════════════════════════
@@ -55,6 +64,40 @@ try {
 #   $t=[IO.File]::ReadAllText($p,(New-Object Text.UTF8Encoding($false)))
 #   [IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding($true)))
 $script:Utf8 = New-Object System.Text.UTF8Encoding($false)
+
+# MCP stdin 编码能力探针（运行时事实，不改动二进制）。Windows PowerShell 5.1 的
+# ProcessStartInfo 没有 StandardInputEncoding；重定向子进程的标准输入按
+# [Console]::InputEncoding 编码（本机默认 936），脚本启动时已切成 UTF-8。这里实测
+# 一次，把结论记在 $script:Ctx.McpStdinMode 供 Invoke-McpLines 判定。
+function Test-McpStdinEncoding {
+    try {
+        if ([string]::IsNullOrWhiteSpace($script:Ctx.McpExe) -or -not (Test-Path -LiteralPath $script:Ctx.McpExe -PathType Leaf)) {
+            Write-Host '[INFO] mcp_server.exe 缺失，跳过 stdin 编码探针'
+            return
+        }
+        $probeDir = Join-Path $env:TEMP ('gm-mcp-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+        $probeEnv = @{ GM_MEMORY_V1 = '1'; GM_API_URL = 'http://127.0.0.1:1' }
+        # tools/list 不依赖服务在线，正好单独测「stdin 编码 + JSON-RPC 解析」这条通路
+        $probeAscii = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' + "`n"
+        $probeCjk = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_context","arguments":{"query":"' + [char]0x4E2D + [char]0x6587 + '"}}}' + "`n"
+        $asciiProbe = Invoke-Native -Exe $script:Ctx.McpExe -Arguments @() -LogName 'mcp-stdin-probe-ascii' -TimeoutSec 60 -StdinText $probeAscii -ExtraEnv $probeEnv -EvidenceDir $probeDir
+        $asciiOk = $asciiProbe.StdOut.Contains('memory_update')
+        $cjkProbe = Invoke-Native -Exe $script:Ctx.McpExe -Arguments @() -LogName 'mcp-stdin-probe-cjk' -TimeoutSec 60 -StdinText $probeCjk -ExtraEnv $probeEnv -EvidenceDir $probeDir
+        # 服务不在线时 memory_context 一定报错；解析成功只能说明 stdin 到达了 serde_json
+        # （非法字节会被 lossy 成 U+FFFD 后仍可解析），因此中文保真度由 P1-08（活动服务）
+        # 用中文 retract_reason 逐字符断言来证明。
+        $cjkOk = ($cjkProbe.StdOut.Contains('"id":2') -and -not $cjkProbe.StdOut.Contains('"id":null'))
+        if ($asciiOk -and $cjkOk) { $script:Ctx.McpStdinMode = 'utf8-pipe' }
+        elseif ($asciiOk) { $script:Ctx.McpStdinMode = 'ascii-only' }
+        else { $script:Ctx.McpStdinMode = 'broken' }
+        Write-Host ('[INFO] MCP stdin 探针：ascii={0} cjk={1} → 模式 {2}（InputEncoding={3}）' -f $asciiOk, $cjkOk, $script:Ctx.McpStdinMode, [Console]::InputEncoding.WebName)
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host ('[WARN] MCP stdin 探针异常：' + $_.Exception.Message)
+        $script:Ctx.McpStdinMode = 'probe-error'
+    }
+}
 
 function Initialize-Paths {
     $root = $RepoRoot
@@ -72,6 +115,10 @@ function Initialize-Paths {
     if ([string]::IsNullOrWhiteSpace($BackupExe)) {
         $script:Ctx.BackupExe = Join-Path $script:Ctx.RepoRoot 'src-tauri\target\debug\graph-memory-backup.exe'
     } else { $script:Ctx.BackupExe = $BackupExe }
+
+    if ([string]::IsNullOrWhiteSpace($McpExe)) {
+        $script:Ctx.McpExe = Join-Path $script:Ctx.RepoRoot 'src-tauri\target\debug\mcp_server.exe'
+    } else { $script:Ctx.McpExe = $McpExe }
 
     if ([string]::IsNullOrWhiteSpace($EvidenceDir)) {
         $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -99,9 +146,12 @@ function Write-Utf8File {
 }
 
 function Save-Evidence {
-    param([string]$Name, [string]$Text)
-    if ([string]::IsNullOrWhiteSpace($script:Ctx.EvidenceDir)) { return '' }
-    $path = Join-Path $script:Ctx.EvidenceDir $Name
+    param([string]$Name, [string]$Text, [string]$Dir = '')
+    if ([string]::IsNullOrWhiteSpace($Dir)) {
+        if ([string]::IsNullOrWhiteSpace($script:Ctx.EvidenceDir)) { return '' }
+        $Dir = $script:Ctx.EvidenceDir
+    }
+    $path = Join-Path $Dir $Name
     Write-Utf8File -Path $path -Text ([string]$Text)
     return $path
 }
@@ -216,10 +266,29 @@ function Get-CheckPhase {
 }
 
 function Invoke-Checks {
-    param([string]$Phase = 'live')
+    param([string]$Phase = 'live', [string[]]$Only = @())
     foreach ($id in @($script:Checks.Keys)) {
         $check = $script:Checks[$id]
         if ((Get-CheckPhase $check) -ne $Phase) { continue }
+        # 二次 live 相位只跑明确列出的断言：否则会把已消耗状态的断言再跑一遍
+        # （实测：P0 的 S-A3-04 因版本已被更新而 409、ADV-03 计数翻倍；P1-02 二次执行
+        #   会留下同名的已恢复记录，使「已撤回记录不得进 text」的断言失效）。
+        if ($Only.Count -gt 0 -and ($Only -notcontains $check.Id)) { continue }
+        if ($Phase -eq 'live' -and $null -eq $script:LiveService -and $script:Ctx.LiveRecoverAttempts -lt 2) {
+            # 离线相位（P1-06/07 的 CLI 导出、启停临时服务）之后不能再跑 live 断言；
+            # 这里按原数据目录冷启动恢复现场，最多两次，避免同一失败反复触发。
+            $script:Ctx.LiveRecoverAttempts++
+            try {
+                Write-Step ("live-recover " + $check.Id)
+                $cold = Start-ServiceInstance -Exe $script:Ctx.ServiceExe -DataDir $script:Ctx.LiveDir
+                $coldInfo = Wait-ServiceInfo -Instance $cold -TimeoutSec $ServiceReadySec
+                $script:LiveService = $cold
+                $script:Ctx.LiveInfo = $coldInfo
+                [void](Add-Result -Id ('ENV-RECOVER-' + $check.Id) -Kind 'info' -Title 'live 服务缺失，已按原数据目录重启' -Ok $true -Detail ([string]$coldInfo.api_url))
+            } catch {
+                Write-Step ("live-recover-failed " + $_.Exception.Message)
+            }
+        }
         if ($Phase -eq 'live' -and $null -ne $script:LiveService) {
             try { [void](Ensure-ServiceRunning $script:LiveService "before-$($check.Id)") } catch { Write-Step ("service-restart-failed " + $_.Exception.Message) }
         }
@@ -424,13 +493,17 @@ function Ensure-ServiceRunning {
 # ════════════════════════════════════════════════════════════════════════════
 function Invoke-Native {
     param(
+        [string]$EvidenceDir = '',
         [string]$Exe,
         [string[]]$Arguments,
         [string]$LogName = 'native',
         [int]$TimeoutSec = 300,
-        [string]$WorkDir = ''
+        [string]$WorkDir = '',
+        [string]$StdinText = '',
+        [hashtable]$ExtraEnv = $null
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
+    if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { $EvidenceDir = $script:Ctx.EvidenceDir }
     $psi.FileName = $Exe
     $commands = ($Arguments | ForEach-Object { ConvertTo-ArgToken ([string]$_) })
     $commandLine = $commands -join ' '
@@ -438,13 +511,19 @@ function Invoke-Native {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $PSBoundParameters.ContainsKey('StdinText')
     $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    if ($null -ne $ExtraEnv) {
+        foreach ($k in $ExtraEnv.Keys) { $psi.EnvironmentVariables[[string]$k] = [string]$ExtraEnv[$k] }
+    }
     if (-not [string]::IsNullOrWhiteSpace($WorkDir)) { $psi.WorkingDirectory = $WorkDir }
     # 证据里必须留下真实 argv：区分"脚本传参写错"和"产品拒绝正确入参"。
-    [void](Save-Evidence -Name ("{0}.argv.txt" -f $LogName) -Text ("{0} {1}" -f $Exe, $commandLine))
-    Write-Step ("native-start {0} {1}" -f $LogName, $commandLine)
+    $envNote = ''
+    if ($null -ne $ExtraEnv) { $envNote = '  [env ' + (($ExtraEnv.Keys | Sort-Object | ForEach-Object { "$_=$($ExtraEnv[$_])" }) -join ' ') + ']' }
+    [void](Save-Evidence -Name ("{0}.argv.txt" -f $LogName) -Text ("{0} {1}{2}" -f $Exe, $commandLine, $envNote) -Dir $EvidenceDir)
+    Write-Step ("native-start {0} {1}{2}" -f $LogName, $commandLine, $envNote)
     $proc = [System.Diagnostics.Process]::Start($psi)
     # 必须先异步读干两条管道：顺序 ReadToEnd 会在子进程 stderr 写满管道缓冲时死锁
     # （实测：cargo 编译输出走 stderr，脚本与 cargo 互相等待，12 分钟零进展）。
@@ -452,6 +531,12 @@ function Invoke-Native {
     $stderr = ''
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
+    if ($psi.RedirectStandardInput) {
+        try {
+            $proc.StandardInput.Write($StdinText)
+            $proc.StandardInput.Close()
+        } catch { }
+    }
     if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
         try { $proc.Kill() } catch { }
         [void]$proc.WaitForExit(5000)
@@ -460,8 +545,8 @@ function Invoke-Native {
     try { $stdout = $outTask.GetAwaiter().GetResult() } catch { $stdout = '' }
     try { $stderr = $errTask.GetAwaiter().GetResult() + $stderr } catch { }
     $code = $proc.ExitCode
-    [void](Save-Evidence -Name ("{0}.stdout.log" -f $LogName) -Text $stdout)
-    [void](Save-Evidence -Name ("{0}.stderr.log" -f $LogName) -Text $stderr)
+    [void](Save-Evidence -Name ("{0}.stdout.log" -f $LogName) -Text $stdout -Dir $EvidenceDir)
+    [void](Save-Evidence -Name ("{0}.stderr.log" -f $LogName) -Text $stderr -Dir $EvidenceDir)
     return [pscustomobject]@{ ExitCode = $code; StdOut = $stdout; StdErr = $stderr }
 }
 
@@ -538,10 +623,16 @@ $script:Failed = 0
 $script:Skips = 0
 $script:Ctx = [pscustomobject]@{
     RepoRoot = ''; EvidenceDir = ''; TempRoot = ''; Stamp = ''
-    ServiceExe = ''; BackupExe = ''
+    ServiceExe = ''; BackupExe = ''; McpExe = ''
     LiveDir = ''; LiveInfo = $null
     BackupPath = ''; Manifest = $null; RestoreDir = ''; RestoredInfo = $null
     DeltaIds = @()
+    # P1 状态（撤回/恢复）
+    P1Project = ''; P1Head = $null; P1TailId = ''; P1SearchToken = ''; P1Boundary = $null
+    P1HeadTitle = ''
+    P1BackupDir = ''; P1BackupFile = ''; P1PayloadSha = ''; P1ExportCounts = $null
+    LiveRecoverAttempts = 0
+    McpStdinMode = ''
     # 套件实测输出（由 SUITE-RUST 捕获，供报告标题里显示真实条数）
     RustPassed = 0; RustResultLine = ''
     RunRust = $false; RunDesktop = $false; RunPython = $false; RunSmoke = $false
@@ -868,7 +959,9 @@ Register-Check 'S-B-04' 'B 重新打开恢复库，计数与备份一致' {
         Need ($projects.Status -eq 200) "projects status=$($projects.Status)"
         $pc = @(Get-JsonProp $projects.Json 'projects').Count
         Need ($pc -eq [int](Get-JsonProp $mc 'projects')) "恢复库 projects=$pc，备份=$((Get-JsonProp $mc 'projects'))"
-        $search = Invoke-Api $info.api_url 'POST' '/api/v1/search' @{ scope = 'all'; query = '' } 'restored-search'
+        # P1 起默认检索排除已撤回记录，而备份包含全部记录行；这里显式 include_retracted=true，
+        # 与 manifest.counts.memories（行数）同口径比较。
+        $search = Invoke-Api $info.api_url 'POST' '/api/v1/search' @{ scope = 'all'; query = ''; include_retracted = $true } 'restored-search'
         Need ($search.Status -eq 200) "search status=$($search.Status)"
         $total = [int](Get-JsonProp $search.Json 'total')
         Need ($total -eq [int](Get-JsonProp $mc 'memories')) "恢复库 memories=$total，备份=$((Get-JsonProp $mc 'memories'))"
@@ -1108,8 +1201,693 @@ Register-Check 'ADV-06' '对抗：context 截断上限语义不变（40/20）' {
     "project_total=45 records=40 truncated=true"
 } 'live'
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  P1 数据生命周期（软撤回/恢复）— 契约 docs/design/DATA_LIFECYCLE_P1.md
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── P1 辅助函数 ─────────────────────────────────────────────────────────────
+function New-P1Project {
+    param([string]$Name, [string]$LogName)
+    $r = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/projects' @{ name = $Name } $LogName
+    Need ($r.Status -eq 200) "创建项目 $Name 失败：$($r.Status) $($r.Text)"
+    return [string](Get-JsonProp $r.Json 'id')
+}
+
+function New-P1Memory {
+    param([string]$Title, [string]$Content, [string]$ProjectId, [string]$LogName, [string]$Kind = 'decision', [string]$Conditions = '')
+    $body = @{ memory_scope = 'project'; project_id = $ProjectId; event_id = [guid]::NewGuid().ToString(); title = $Title; content = $Content; kind = $Kind; source = 'P1 对抗语料' }
+    if (-not [string]::IsNullOrEmpty($Conditions)) { $body['conditions'] = $Conditions }
+    $r = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories' $body $LogName
+    Need ($r.Status -eq 200) "写入 $Title 失败：$($r.Status) $($r.Text)"
+    $m = Get-JsonProp $r.Json 'memory'
+    return [pscustomobject]@{ id = [string](Get-JsonProp $m 'id'); version = [int](Get-JsonProp $m 'version'); title = [string](Get-JsonProp $m 'title') }
+}
+
+function Invoke-P1Retract {
+    param([string]$Id, [int]$Version, [string]$Reason, [string]$LogName)
+    $body = @{ id = $Id; expected_version = $Version }
+    if ($PSBoundParameters.ContainsKey('Reason') -and $null -ne $Reason) { $body['reason'] = $Reason }
+    return Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/retract' $body $LogName
+}
+
+function Invoke-P1Restore {
+    param([string]$Id, [int]$Version, [string]$Reason, [string]$LogName)
+    $body = @{ id = $Id; expected_version = $Version }
+    if ($PSBoundParameters.ContainsKey('Reason') -and $null -ne $Reason) { $body['reason'] = $Reason }
+    return Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/restore' $body $LogName
+}
+
+function Invoke-P1Search {
+    param([string]$ProjectId, [string]$Query, $Extra, [string]$LogName)
+    $body = @{ scope = 'project'; project_id = $ProjectId; query = $Query; limit = 500 }
+    if ($null -ne $Extra) { foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] } }
+    return Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/search' $body $LogName
+}
+
+    # MCP 真实 stdio：一串 JSON-RPC 行 → 按行解析的回复数组（GM_MEMORY_V1=1）。
+    # 注意：Windows PowerShell 5.1 的 ProcessStartInfo 没有 StandardInputEncoding，
+    # 写 stdin 用的是控制台输入代码页（本机 936/GBK），所以送入的 JSON 只放 ASCII
+    # （中文会变成非 UTF-8 字节，mcp_server 用 from_utf8_lossy 解析会得到替换字符）。
+    # 中文链路由 HTTP 断言覆盖（Invoke-Api 显式 UTF-8 字节 + Content-Length）。
+    function Invoke-McpLines {
+    param([string]$StdinText, [string]$LogName, [hashtable]$ExtraEnv = $null)
+    $nonAscii = 0
+    foreach ($ch in $StdinText.ToCharArray()) { if ([int]$ch -ge 128) { $nonAscii++ } }
+    if ($nonAscii -gt 0) {
+        Need (([string]$script:Ctx.McpStdinMode) -eq 'utf8-pipe') "当前宿主 MCP stdin 不支持 UTF-8（mode=$($script:Ctx.McpStdinMode)），载荷含 $nonAscii 个非 ASCII 字符"
+    }
+    $mcpEnv = @{ GM_MEMORY_V1 = '1'; GM_API_URL = [string]$script:Ctx.LiveInfo.api_url }
+    if ($null -ne $ExtraEnv) { foreach ($k in $ExtraEnv.Keys) { $mcpEnv[$k] = $ExtraEnv[$k] } }
+    $r = Invoke-Native -Exe $script:Ctx.McpExe -Arguments @() -LogName $LogName -TimeoutSec 120 -StdinText $StdinText -ExtraEnv $mcpEnv
+    Need ($r.ExitCode -eq 0) "mcp exit=$($r.ExitCode) stderr=$($r.StdErr)"
+    $replies = New-Object System.Collections.ArrayList
+    foreach ($line in ($r.StdOut -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        [void]$replies.Add(($line | ConvertFrom-Json))
+    }
+    Need ($replies.Count -ge 1) "mcp 未输出任何 JSON-RPC 回复"
+    return $replies.ToArray()
+}
+
+# 取 tools/call 回复里的 content[0].text（isError 时抛原始文本）。
+function Get-McpCallText {
+    param($Reply)
+    $result = Get-JsonProp $Reply 'result'
+    Need ($null -ne $result) ('MCP 缺少 result：' + ($Reply | ConvertTo-Json -Depth 8 -Compress))
+    if ((Get-JsonProp $result 'isError') -eq $true) {
+        throw ('MCP isError: ' + ($result | ConvertTo-Json -Depth 8 -Compress))
+    }
+    $content = @(Get-JsonProp $result 'content')
+    Need ($content.Count -ge 1) 'MCP result.content 为空'
+    return ([string](Get-JsonProp $content[0] 'text'))
+}
+
+function Get-P1LiveDbPath { return (Join-Path $script:Ctx.LiveDir 'work-memory.db') }
+
+# 只读 sqlite 查询：每次独立 python 进程，避免长连接持有文件锁。
+function Get-SqliteQuery {
+    param([string]$DbPath, [string]$Sql, [string]$LogName, [int]$TimeoutSec = 60)
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($null -eq $python) { throw 'SKIP:python not on PATH' }
+    $probe = Join-Path $script:Ctx.EvidenceDir ('p1-sqlite-' + ($LogName -replace '[^A-Za-z0-9\-]', '_') + '.py')
+    $probeSrc = @'
+import json, sqlite3, sys
+con = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+rows = [list(r) for r in con.execute(sys.argv[2])]
+print(json.dumps(rows, ensure_ascii=False))
+'@
+    Write-Utf8File -Path $probe -Text $probeSrc
+    $r = Invoke-Native -Exe $python.Source -Arguments @('-X', 'utf8', $probe, $DbPath, $Sql) -LogName $LogName -TimeoutSec $TimeoutSec
+    Need ($r.ExitCode -eq 0) "sqlite 只读查询失败：$($r.StdErr)"
+    return @($r.StdOut | ConvertFrom-Json)
+}
+
+# 备份包顶层是 { manifest, payload }。
+function Read-BackupEnvelope {
+    param([string]$Path, [string]$LogName)
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $json = $raw | ConvertFrom-Json
+    [void](Save-Evidence -Name ($LogName + '.manifest.json') -Text (($json.manifest | ConvertTo-Json -Depth 10)))
+    return $json
+}
+
+# ── P1-01：retract 后 search 默认排除 / include_retracted / offset 语义 ──────
+Register-Check 'P1-01' 'P1 retract 后 search 默认排除；include_retracted 命中且带 retracted_at；offset 不影响计数' {
+    $pid0 = New-P1Project 'P1 撤回检索项目' 'p1-01-project'
+    $head = New-P1Memory -Title 'P1-HEAD-RETRACT 锂电池续航' -Content '撤回头标记正文：这条结论已被证伪，默认检索不应返回。' -ProjectId $pid0 -LogName 'p1-01-create-head'
+    $tail = New-P1Memory -Title 'P1-TAIL-ACTIVE 锂电池续航' -Content '撤回尾标记正文：同类结论，用于核对 offset 语义（无撤回字段）。' -ProjectId $pid0 -LogName 'p1-01-create-tail'
+    $script:Ctx.P1Project = $pid0
+    $script:Ctx.P1TailId = $tail.id
+    # 撤回记录的准确标题：P1-02 用它做「已撤回 body 不得进入 context.text」的证伪断言
+    $script:Ctx.P1HeadTitle = [string]$head.title
+    Need (-not [string]::IsNullOrWhiteSpace($script:Ctx.P1HeadTitle)) 'P1-01 未能取得撤回记录标题，撤回泄漏断言会失去意义'
+
+    $retract = Invoke-P1Retract -Id $head.id -Version $head.version -Reason 'p1-retract-reason' -LogName 'p1-01-retract'
+    Need ($retract.Status -eq 200) "retract 期望 200，实际 $($retract.Status) $($retract.Text)"
+    $rm = Get-JsonProp $retract.Json 'memory'
+    $v2 = [int](Get-JsonProp $rm 'version')
+    Need ($v2 -eq ($head.version + 1)) "retract 后 version=$v2，期望 $($head.version + 1)"
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp $rm 'retracted_at'))) 'retract 响应缺少 retracted_at'
+    Need (([string](Get-JsonProp $rm 'retract_reason')) -eq 'p1-retract-reason') 'retract_reason 未回显'
+    $script:Ctx.P1Head = [pscustomobject]@{ id = $head.id; v1 = $head.version; v2 = $v2; v3 = 0 }
+    $q = '锂电池续航'
+    $script:Ctx.P1SearchToken = $q
+
+    $default = Invoke-P1Search -ProjectId $pid0 -Query $q -LogName 'p1-01-search-default'
+    Need ($default.Status -eq 200) "search status=$($default.Status)"
+    $dIds = @(Get-Ids (Get-JsonProp $default.Json 'memories'))
+    Need (-not ($dIds -contains $head.id)) '默认 search 仍返回已撤回记录'
+    Need (([int](Get-JsonProp $default.Json 'total')) -eq 1) "默认 total=$((Get-JsonProp $default.Json 'total'))，期望 1"
+    Need (([int](Get-JsonProp $default.Json 'retracted_excluded')) -eq 1) "默认 retracted_excluded=$((Get-JsonProp $default.Json 'retracted_excluded'))，期望 1"
+
+    foreach ($off in @(0, 1, 2)) {
+        $paged = Invoke-P1Search -ProjectId $pid0 -Query $q -Extra @{ limit = 1; offset = $off } -LogName ('p1-01-search-offset-' + $off)
+        Need (([int](Get-JsonProp $paged.Json 'total')) -eq 1) "offset=$off 时 total=$((Get-JsonProp $paged.Json 'total'))，期望 1"
+        Need (([int](Get-JsonProp $paged.Json 'retracted_excluded')) -eq 1) "offset=$off 时 retracted_excluded=$((Get-JsonProp $paged.Json 'retracted_excluded'))，期望 1（按匹配集计，不随 offset 变）"
+    }
+    $off1 = Invoke-P1Search -ProjectId $pid0 -Query $q -Extra @{ limit = 1; offset = 1 } -LogName 'p1-01-page-empty'
+    Need ((@(Get-JsonProp $off1.Json 'memories').Count) -eq 0) 'offset=1 只有 1 条匹配时不应返回记录'
+    Need ($null -eq (Get-JsonProp $off1.Json 'next_offset')) 'offset=1 且无更多结果时 next_offset 应为 null'
+
+    $incl = Invoke-P1Search -ProjectId $pid0 -Query $q -Extra @{ include_retracted = $true } -LogName 'p1-01-search-include'
+    $iIds = @(Get-Ids (Get-JsonProp $incl.Json 'memories'))
+    Need ($iIds -contains $head.id) 'include_retracted=true 未返回已撤回记录'
+    Need (([int](Get-JsonProp $incl.Json 'total')) -eq 2) "include_retracted total=$((Get-JsonProp $incl.Json 'total'))，期望 2"
+    Need (([int](Get-JsonProp $incl.Json 'retracted_excluded')) -eq 0) "include_retracted retracted_excluded=$((Get-JsonProp $incl.Json 'retracted_excluded'))，期望 0"
+    $marked = @(Get-JsonProp $incl.Json 'memories') | Where-Object { [string](Get-JsonProp $_ 'id') -eq $head.id }
+    Need ($null -ne $marked) 'include_retracted 结果里找不到已撤回记录'
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp $marked 'retracted_at'))) '已撤回记录未带 retracted_at'
+    Need (([string](Get-JsonProp $marked 'retract_reason')) -eq 'p1-retract-reason') '已撤回记录未带 retract_reason'
+
+    $nullFlag = Invoke-P1Search -ProjectId $pid0 -Query $q -Extra @{ include_retracted = $null } -LogName 'p1-01-search-null-flag'
+    Need (([int](Get-JsonProp $nullFlag.Json 'retracted_excluded')) -eq 1) 'include_retracted=null 应等同默认 false'
+    $badFlag = Invoke-P1Search -ProjectId $pid0 -Query $q -Extra @{ include_retracted = 'yes' } -LogName 'p1-01-search-bad-flag'
+    Need ($badFlag.Status -eq 400) "include_retracted='yes' 期望 400，实际 $($badFlag.Status)"
+
+    "v$($head.version)->v$v2 retract；默认 total=1 excluded=1（offset 0/1/2 一致）；include_retracted total=2 且带 retracted_at"
+} 'live'
+
+# ── P1-02：context 始终排除撤回 + text 提示 + 计数口径 ──────────────────────
+Register-Check 'P1-02' 'P1 context 始终排除撤回；text 仅在 N>0 写「已排除 N 条撤回记录」；带 project_id 不重复计个人' {
+    $pid0 = [string]$script:Ctx.P1Project
+    $headId = [string]$script:Ctx.P1Head.id
+    $tailId = [string]$script:Ctx.P1TailId
+    Need (-not [string]::IsNullOrWhiteSpace($pid0)) 'P1-01 未建立项目'
+
+    $ctx = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ project_id = $pid0; query = '' } 'p1-02-context-project'
+    Need ($ctx.Status -eq 200) "context status=$($ctx.Status)"
+    $prIds = @(Get-Ids (Get-JsonProp $ctx.Json 'project_records'))
+    Need (-not ($prIds -contains $headId)) 'context 返回了已撤回记录'
+    Need ($prIds -contains $tailId) 'context 缺少未撤回记录'
+    Need (([int](Get-JsonProp $ctx.Json 'retracted_excluded')) -eq 1) "带 project_id 的 context retracted_excluded=$((Get-JsonProp $ctx.Json 'retracted_excluded'))，期望 1（该项目维度；个人维度不重复计）"
+
+    # 契约补充（语义补充节）的真实口径已用独立探针实测（prep/probe-context-count.py）：
+    #   带 project_id：统计「该项目作用域查询（该项目记录 + 全部个人经验，query 按空处理）
+    #     中被丢弃的撤回条数」，因此与 query 无关，且个人维度已包含其中、不重复相加；
+    #   不带 project_id：只统计「匹配该 query 的个人记录中被丢弃的撤回条数」。
+    # 期望值一律由 sqlite 只读现算，避免依赖断言执行顺序。
+    $db = Get-P1LiveDbPath
+    $projSql = "SELECT count(*) FROM work_memories WHERE json_extract(body,'$.retracted_at') IS NOT NULL AND (memory_scope='personal' OR project_id='" + $pid0 + "')"
+    $persSql = "SELECT count(*) FROM work_memories WHERE json_extract(body,'$.retracted_at') IS NOT NULL AND memory_scope='personal'"
+    $expProj = [int](Get-SqliteQuery -DbPath $db -Sql $projSql -LogName 'p1-02-exp-project')[0][0]
+    Need ($expProj -eq 1) "期望该项目作用域内此时恰好 1 条撤回记录，实际 $expProj"
+
+    # (a) 带 project_id + query=''：N = 期望值；text 写提示；撤回记录不进项目记录
+    Need (([int](Get-JsonProp $ctx.Json 'retracted_excluded')) -eq $expProj) "带 project_id 的 context retracted_excluded=$((Get-JsonProp $ctx.Json 'retracted_excluded'))，期望 $expProj"
+    $text = [string](Get-JsonProp $ctx.Json 'text')
+    Need ($text.Contains("已排除 $expProj 条撤回记录")) "context.text 缺少「已排除 $expProj 条撤回记录」"
+    Need (-not $text.Contains([string]$script:Ctx.P1HeadTitle)) "已撤回记录标题「$($script:Ctx.P1HeadTitle)」泄漏到 context.text"
+    # 正对照 + total 与 excluded 的分工：project_total 只数未撤回的项目记录，
+    # 被撤回的那条只体现在 retracted_excluded（契约补充的「原本会返回但被丢弃」）。
+    $activeProjSql = "SELECT count(*) FROM work_memories WHERE memory_scope='project' AND project_id='" + $pid0 + "' AND json_extract(body,'$.retracted_at') IS NULL"
+    $activeProj = [int](Get-SqliteQuery -DbPath $db -Sql $activeProjSql -LogName 'p1-02-active-project')[0][0]
+    Need (([int](Get-JsonProp $ctx.Json 'project_total')) -eq $activeProj) "context.project_total=$((Get-JsonProp $ctx.Json 'project_total'))，期望未撤回项目记录数 $activeProj"
+    Need (($activeProj + $expProj) -ge 1) '该项目既无未撤回也无撤回记录，断言失去意义'
+    $activeTitles = @(Get-JsonProp $ctx.Json 'project_records') | ForEach-Object { [string](Get-JsonProp $_ 'title') }
+    Need ($activeTitles.Count -eq $activeProj) "context.project_records=$($activeTitles.Count) 条，期望 $activeProj"
+    $listed = $false
+    foreach ($t in $activeTitles) { if (-not [string]::IsNullOrEmpty($t) -and $text.Contains($t)) { $listed = $true } }
+    if ($activeProj -gt 0) { Need ($listed) 'context.text 未列出任何未撤回的项目记录，泄漏断言失去正对照' }
+
+    # (b) 带 project_id 且 query 换成项目里匹配不上的词：N 不变
+    # （契约补充：该项目作用域口径与 query 无关；实测 query 不参与项目集的过滤，
+    #   所以这里只断言计数不随 query 变化，不断言 project_records 为空）
+    $scopedMiss = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ project_id = $pid0; query = 'zz-miss-term-2026' } 'p1-02-context-scoped-miss'
+    Need ($scopedMiss.Status -eq 200) "context status=$($scopedMiss.Status)"
+    Need (([int](Get-JsonProp $scopedMiss.Json 'retracted_excluded')) -eq $expProj) "query 不匹配时带 project_id 的 retracted_excluded=$((Get-JsonProp $scopedMiss.Json 'retracted_excluded'))，期望仍为 $expProj（与 query 无关）"
+
+    # (c) 不带 project_id：先量基线（只计个人维度中被本 query 匹配到的撤回条数）
+    $beforePersonal = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ query = 'zz-miss-term-2026' } 'p1-02-context-all-baseline'
+    $nBefore = [int](Get-JsonProp $beforePersonal.Json 'retracted_excluded')
+    Need ($nBefore -eq 0) "query 不匹配任何个人记录时，不带 project_id 的 retracted_excluded=$nBefore，期望 0"
+    Need (-not ([string](Get-JsonProp $beforePersonal.Json 'text')).Contains('已排除')) 'N=0 时不应出现「已排除」提示'
+
+    # (d) 新增并撤回一条个人经验
+    $personal = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories' @{ memory_scope = 'personal'; event_id = [guid]::NewGuid().ToString(); title = '个人经验撤回标记'; content = '个人经验撤回标记正文，仅用于核对 context 计数口径。'; kind = 'note'; source = 'P1 对抗语料' } 'p1-02-personal-create'
+    Need ($personal.Status -eq 200) "个人经验写入失败 $($personal.Status)"
+    $pm = Get-JsonProp $personal.Json 'memory'
+    $pmId = [string](Get-JsonProp $pm 'id')
+    $pr = Invoke-P1Retract -Id $pmId -Version ([int](Get-JsonProp $pm 'version')) -Reason '个人经验作废' -LogName 'p1-02-personal-retract'
+    Need ($pr.Status -eq 200) "个人经验 retract 失败 $($pr.Status)"
+    $expProj2 = [int](Get-SqliteQuery -DbPath $db -Sql $projSql -LogName 'p1-02-exp-project-after')[0][0]
+    $expPers = [int](Get-SqliteQuery -DbPath $db -Sql $persSql -LogName 'p1-02-exp-personal-after')[0][0]
+    Need ($expProj2 -eq ($expProj + 1)) "个人撤回后项目作用域期望值应为 $($expProj + 1)，实际 $expProj2"
+    Need ($expPers -ge 1) "sqlite 里个人撤回记录=$expPers，期望 >=1"
+
+    # (e) 带 project_id：N = 并集期望值（个人那条已包含在项目作用域里，不重复相加）
+    $scoped = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ project_id = $pid0; query = '锂电池续航' } 'p1-02-context-scoped'
+    $nScoped = [int](Get-JsonProp $scoped.Json 'retracted_excluded')
+    Need ($nScoped -eq $expProj2) "带 project_id 时 retracted_excluded=$nScoped，期望 $expProj2（个人维度不重复相加）"
+    Need ($nScoped -ne ($expProj2 + $expPers)) "带 project_id 时 retracted_excluded=$nScoped 等于并集+个人维度=$($expProj2 + $expPers)，出现重复计数"
+    Need (([string](Get-JsonProp $scoped.Json 'text')).Contains("已排除 $expProj2 条撤回记录")) "text 未写「已排除 $expProj2 条撤回记录」"
+    # 证伪断言必须用「确实处于撤回态的那条记录」的准确标题，并配合 (g) 的恢复后正对照。
+    $personalTitle = [string](Get-JsonProp $pm 'title')
+    Need (-not ([string](Get-JsonProp $scoped.Json 'text')).Contains($personalTitle)) "已撤回的个人经验「$personalTitle」泄漏到 context.text"
+
+    # (f) 不带 project_id 且 query=''：N = 全部撤回态个人记录数（与 sqlite 一致）
+    $personalOnly = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ query = '' } 'p1-02-context-personal-only'
+    $personalText = [string](Get-JsonProp $personalOnly.Json 'text')
+    $nPersonal = [int](Get-JsonProp $personalOnly.Json 'retracted_excluded')
+    Need ($nPersonal -eq $expPers) "不带 project_id 时 retracted_excluded=$nPersonal，期望 $expPers（个人维度）"
+    Need ($personalText.Contains("已排除 $expPers 条撤回记录")) "个人维度 text 未写「已排除 $expPers 条撤回记录」"
+    Need (-not $personalText.Contains($personalTitle)) "已撤回的个人经验「$personalTitle」泄漏到个人维度 text"
+    # 正对照：text 确实在列个人记录（否则「不包含」毫无意义）
+    $activePersonalTitles = @(Get-JsonProp $personalOnly.Json 'personal_experiences') | ForEach-Object { [string](Get-JsonProp $_ 'title') }
+    $listed = $false
+    foreach ($t in $activePersonalTitles) { if (-not [string]::IsNullOrEmpty($t) -and $personalText.Contains($t)) { $listed = $true } }
+    Need ($listed) 'context.text 未列出任何未撤回的个人经验，泄漏断言失去正对照'
+
+    # (g) 恢复个人经验 → 两个口径同时回落
+    $restore = Invoke-P1Restore -Id $pmId -Version ([int](Get-JsonProp (Get-JsonProp $pr.Json 'memory') 'version')) -LogName 'p1-02-personal-restore'
+    Need ($restore.Status -eq 200) "个人经验 restore 失败 $($restore.Status)"
+    $clean = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ query = '' } 'p1-02-context-personal-restored'
+    $cleanText = [string](Get-JsonProp $clean.Json 'text')
+    Need (([int](Get-JsonProp $clean.Json 'retracted_excluded')) -eq 0) "恢复后个人维度 retracted_excluded=$((Get-JsonProp $clean.Json 'retracted_excluded'))，期望 0"
+    Need (-not $cleanText.Contains('已排除')) '恢复后 N=0，提示应消失'
+    Need (@(Get-Ids (Get-JsonProp $clean.Json 'personal_experiences')) -contains $pmId) '恢复后的个人经验应重新出现在 personal_experiences'
+    # 正对照：同一条记录恢复后必须重新出现在 text 里（证明上面的「不包含」确实在检验撤回过滤）
+    Need ($cleanText.Contains($personalTitle)) "恢复后个人经验「$personalTitle」应重新出现在 context.text"
+
+    # (h) N=0 且干净：新项目无任何撤回记录
+    $cleanProj = New-P1Project 'P1 无撤回项目' 'p1-02-clean-project'
+    [void](New-P1Memory -Title '无撤回项目记录' -Content '无撤回项目正文：用于核对 N=0 时不写提示。' -ProjectId $cleanProj -LogName 'p1-02-clean-memory')
+    $cleanCtx = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/context' @{ project_id = $cleanProj; query = '' } 'p1-02-context-n0'
+    Need (([int](Get-JsonProp $cleanCtx.Json 'retracted_excluded')) -eq 0) "N=0 项目 retracted_excluded=$((Get-JsonProp $cleanCtx.Json 'retracted_excluded'))，期望 0"
+    Need (-not ([string](Get-JsonProp $cleanCtx.Json 'text')).Contains('已排除')) 'N=0 时 text 不应出现「已排除」'
+
+    "项目作用域 excluded=$expProj→$expProj2 与 sqlite 一致且与 query 无关；个人维度 $nBefore→$expPers→0；无重复计数；N=0 无提示"
+} 'live'
+
+# ── P1-03：restore 语义 ─────────────────────────────────────────────────────
+Register-Check 'P1-03' 'P1 restore 后 version+1、retracted_at=null、历史仍含撤回版本、重新可检索' {
+    $headId = [string]$script:Ctx.P1Head.id
+    $pid0 = [string]$script:Ctx.P1Project
+    $q = [string]$script:Ctx.P1SearchToken
+
+    $histBefore = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $headId } 'p1-03-history-before'
+    Need ((@(Get-JsonProp $histBefore.Json 'history').Count) -eq $script:Ctx.P1Head.v2) "撤回后 history=$((@(Get-JsonProp $histBefore.Json 'history').Count)) 条，期望 $($script:Ctx.P1Head.v2)"
+
+    $restore = Invoke-P1Restore -Id $headId -Version $script:Ctx.P1Head.v2 -Reason '复核后恢复' -LogName 'p1-03-restore'
+    Need ($restore.Status -eq 200) "restore 期望 200，实际 $($restore.Status) $($restore.Text)"
+    $rm = Get-JsonProp $restore.Json 'memory'
+    $v3 = [int](Get-JsonProp $rm 'version')
+    Need ($v3 -eq ($script:Ctx.P1Head.v2 + 1)) "restore 后 version=$v3，期望 $($script:Ctx.P1Head.v2 + 1)"
+    Need ($null -eq (Get-JsonProp $rm 'retracted_at')) "restore 后 retracted_at=$((Get-JsonProp $rm 'retracted_at'))，期望 null"
+    Need ($null -eq (Get-JsonProp $rm 'retract_reason')) "restore 后 retract_reason=$((Get-JsonProp $rm 'retract_reason'))，期望 null"
+    Need (([string](Get-JsonProp $rm 'content')) -eq '撤回头标记正文：这条结论已被证伪，默认检索不应返回。') 'restore 改动了内容'
+    $script:Ctx.P1Head.v3 = $v3
+
+    $histAfter = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $headId } 'p1-03-history-after'
+    $versions = @(Get-JsonProp $histAfter.Json 'history')
+    Need ($versions.Count -eq $v3) "恢复后 history=$($versions.Count) 条，期望 $v3"
+    $byVersion = @{}
+    foreach ($h in $versions) { $byVersion[[int](Get-JsonProp $h 'version')] = $h }
+    Need ($byVersion.ContainsKey(1)) 'history 缺少最初的 v1'
+    Need ($byVersion.ContainsKey($script:Ctx.P1Head.v2)) "history 缺少撤回版本 v$($script:Ctx.P1Head.v2)"
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp $byVersion[$script:Ctx.P1Head.v2] 'retracted_at'))) 'history 里的撤回版本没有 retracted_at'
+    Need (([string](Get-JsonProp $byVersion[$script:Ctx.P1Head.v2] 'retract_reason')) -eq 'p1-retract-reason') 'history 里的撤回版本没有原因'
+    Need ($null -eq (Get-JsonProp $byVersion[$v3] 'retracted_at')) 'history 最新版本 retracted_at 应为 null'
+    Need ([string]::IsNullOrEmpty([string](Get-JsonProp $byVersion[$v3] 'retract_reason'))) 'restore 后 retract_reason 应为空'
+
+    $search = Invoke-P1Search -ProjectId $pid0 -Query $q -LogName 'p1-03-search-after-restore'
+    $ids = @(Get-Ids (Get-JsonProp $search.Json 'memories'))
+    Need ($ids -contains $headId) 'restore 后未重新可检索'
+    Need (([int](Get-JsonProp $search.Json 'retracted_excluded')) -eq 0) "restore 后 retracted_excluded=$((Get-JsonProp $search.Json 'retracted_excluded'))，期望 0"
+    Need (([int](Get-JsonProp $search.Json 'total')) -eq 2) "restore 后 total=$((Get-JsonProp $search.Json 'total'))，期望 2"
+    "v$($script:Ctx.P1Head.v2)->v$v3 restore；history=$($versions.Count) 条且含撤回版本；默认检索恢复为 2 条"
+} 'live'
+
+# ── P1-04：409 / 400 / 404 边界与不写版本 ───────────────────────────────────
+Register-Check 'P1-04' 'P1 409 不产生新版本；重复 retract/restore 400 且不写版本；不存在 404' {
+    $pid0 = [string]$script:Ctx.P1Project
+    $mk = New-P1Memory -Title '边界标记幂等' -Content '边界标记正文：用于核对 409/400/404 不写版本。' -ProjectId $pid0 -LogName 'p1-04-create'
+
+    $stale = Invoke-P1Retract -Id $mk.id -Version ($mk.version + 7) -Reason '过期版本' -LogName 'p1-04-stale'
+    Need ($stale.Status -eq 409) "过期 expected_version 期望 409，实际 $($stale.Status) $($stale.Text)"
+    $h409 = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-04-history-after-409'
+    Need ((@(Get-JsonProp $h409.Json 'history').Count) -eq $mk.version) "409 后 history=$((@(Get-JsonProp $h409.Json 'history').Count)) 条，期望 $($mk.version)"
+    $s409 = Invoke-P1Search -ProjectId $pid0 -Query '边界标记' -LogName 'p1-04-search-after-409'
+    Need (([int](Get-JsonProp $s409.Json 'retracted_excluded')) -eq 0) '409 后不应出现撤回计数'
+
+    $r1 = Invoke-P1Retract -Id $mk.id -Version $mk.version -Reason '第一次撤回' -LogName 'p1-04-retract-1'
+    Need ($r1.Status -eq 200) "首次 retract 期望 200，实际 $($r1.Status)"
+    $v2 = [int](Get-JsonProp (Get-JsonProp $r1.Json 'memory') 'version')
+    $again = Invoke-P1Retract -Id $mk.id -Version $v2 -Reason '重复撤回' -LogName 'p1-04-retract-again'
+    Need ($again.Status -eq 400) "重复 retract 期望 400，实际 $($again.Status) $($again.Text)"
+    Need ($again.Text.Contains('memory is already retracted')) "重复 retract 错误信息不符：$($again.Text)"
+    $hAgain = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-04-history-after-400'
+    Need ((@(Get-JsonProp $hAgain.Json 'history').Count) -eq $v2) "重复 retract 产生了新版本：history=$((@(Get-JsonProp $hAgain.Json 'history').Count))，期望 $v2"
+
+    $restore = Invoke-P1Restore -Id $mk.id -Version $v2 -Reason '恢复' -LogName 'p1-04-restore'
+    Need ($restore.Status -eq 200) "restore 期望 200，实际 $($restore.Status)"
+    $v3 = [int](Get-JsonProp (Get-JsonProp $restore.Json 'memory') 'version')
+    $againRestore = Invoke-P1Restore -Id $mk.id -Version $v3 -Reason '重复恢复' -LogName 'p1-04-restore-again'
+    Need ($againRestore.Status -eq 400) "重复 restore 期望 400，实际 $($againRestore.Status) $($againRestore.Text)"
+    Need ($againRestore.Text.Contains('memory is not retracted')) "重复 restore 错误信息不符：$($againRestore.Text)"
+    $hAgain2 = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-04-history-after-restore-400'
+    Need ((@(Get-JsonProp $hAgain2.Json 'history').Count) -eq $v3) '重复 restore 产生了新版本'
+
+    $missing = [guid]::NewGuid().ToString()
+    $m404 = Invoke-P1Retract -Id $missing -Version 1 -Reason '不存在' -LogName 'p1-04-missing-retract'
+    Need ($m404.Status -eq 404) "不存在记录 retract 期望 404，实际 $($m404.Status)"
+    $m404r = Invoke-P1Restore -Id $missing -Version 1 -Reason '不存在' -LogName 'p1-04-missing-restore'
+    Need ($m404r.Status -eq 404) "不存在记录 restore 期望 404，实际 $($m404r.Status)"
+
+    $noReason = Invoke-P1Retract -Id $mk.id -Version $v3 -LogName 'p1-04-no-reason'
+    Need ($noReason.Status -eq 200) "缺省 reason 的 retract 期望 200，实际 $($noReason.Status) $($noReason.Text)"
+    $nv = [int](Get-JsonProp (Get-JsonProp $noReason.Json 'memory') 'version')
+    Need ($nv -eq ($v3 + 1)) "缺省 reason 的 retract 未产生 version+1（$nv）"
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp (Get-JsonProp $noReason.Json 'memory') 'retracted_at'))) '缺省 reason 的 retract 未置 retracted_at'
+    Need ((@(Get-JsonProp (Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-04-history-final').Json 'history').Count) -eq $nv) '缺省 reason 分支 history 条数不符'
+    $script:Ctx.P1Boundary = [pscustomobject]@{ id = $mk.id; version = $nv }
+    "409/400(already|not)/404 均未写版本；缺省 reason 合法且 version+1"
+} 'live'
+
+# ── P1-05：不物理删除 ───────────────────────────────────────────────────────
+Register-Check 'P1-05' 'P1 撤回不物理删除：history 与 sqlite 记录行/修订行仍在' {
+    $headId = [string]$script:Ctx.P1Head.id
+    $db = Get-P1LiveDbPath
+    Need (Test-Path -LiteralPath $db) "找不到 $db"
+
+    $rows = Get-SqliteQuery -DbPath $db -Sql ("SELECT count(*) FROM work_memories WHERE id='" + $headId + "'") -LogName 'p1-05-current-row'
+    Need (([int]$rows[0][0]) -eq 1) "work_memories 记录行数=$($rows[0][0])，期望 1"
+    $revRows = Get-SqliteQuery -DbPath $db -Sql ("SELECT count(*), max(version) FROM work_revisions WHERE memory_id='" + $headId + "'") -LogName 'p1-05-revision-rows'
+    Need (([int]$revRows[0][0]) -eq $script:Ctx.P1Head.v3) "work_revisions 行数=$($revRows[0][0])，期望 $($script:Ctx.P1Head.v3)"
+    Need (([int]$revRows[0][1]) -eq $script:Ctx.P1Head.v3) "work_revisions 最大 version=$($revRows[0][1])，期望 $($script:Ctx.P1Head.v3)"
+    $revBodies = Get-SqliteQuery -DbPath $db -Sql ("SELECT count(*) FROM work_revisions WHERE memory_id='" + $headId + "' AND json_extract(body,'$.retracted_at') IS NOT NULL") -LogName 'p1-05-retracted-revisions'
+    Need (([int]$revBodies[0][0]) -ge 1) 'work_revisions 里找不到撤回版本的那条修订'
+
+    $retractedRows = Get-SqliteQuery -DbPath $db -Sql "SELECT id FROM work_memories WHERE json_extract(body,'$.retracted_at') IS NOT NULL" -LogName 'p1-05-retracted-rows'
+    Need ($retractedRows.Count -ge 1) 'sqlite 里找不到处于撤回态的当前行'
+    $liveRows = Get-SqliteQuery -DbPath $db -Sql 'SELECT count(*) FROM work_memories' -LogName 'p1-05-total-rows'
+    Need (([int]$liveRows[0][0]) -ge 9) "work_memories 总行数=$($liveRows[0][0])，疑似有记录被物理删除"
+
+    $hist = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $headId } 'p1-05-history-final'
+    Need ((@(Get-JsonProp $hist.Json 'history').Count) -eq $script:Ctx.P1Head.v3) 'history 条数与 sqlite 修订行数不一致'
+    "work_memories 当前行=1、work_revisions 行=$($script:Ctx.P1Head.v3)（含撤回版本）、撤回态行仍可读、全库 $($liveRows[0][0]) 行"
+} 'live'
+
+# ── P1-06A：含撤回版本的库 export + verify（CLI，offline）───────────────────
+Register-Check 'P1-06A' 'P1 含撤回版本 export/verify 成功，包内含撤回字段' {
+    $dir = Join-Path $script:Ctx.TempRoot ('p1-backup-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $file = Join-Path $dir 'p1-lifecycle.gmbackup'
+    $script:Ctx.P1BackupDir = $dir
+    $script:Ctx.P1BackupFile = $file
+
+    $liveDb = Get-P1LiveDbPath
+    $retracted = Get-SqliteQuery -DbPath $liveDb -Sql "SELECT count(*) FROM work_memories WHERE json_extract(body,'$.retracted_at') IS NOT NULL" -LogName 'p1-06a-live-retracted'
+    Need (([int]$retracted[0][0]) -ge 1) '导出前 live 库没有撤回态记录，往返断言失去意义'
+
+    $e = Invoke-Cli @('export', '--data-dir', $script:Ctx.LiveDir, '--output', $file) 'p1-06-export'
+    Need ($e.ExitCode -eq 0) "export exit=$($e.ExitCode) stderr=$($e.StdErr)"
+    $ej = $e.StdOut | ConvertFrom-Json
+    Need (([string](Get-JsonProp $ej 'status')) -eq 'ok') 'export status != ok'
+    $counts = Get-JsonProp $ej 'counts'
+    $script:Ctx.P1ExportCounts = $counts
+    $v = Invoke-Cli @('verify', $file) 'p1-06-verify'
+    Need ($v.ExitCode -eq 0) "verify exit=$($v.ExitCode) stderr=$($v.StdErr)"
+    $envelope = Read-BackupEnvelope -Path $file -LogName 'p1-06-export'
+    $script:Ctx.P1PayloadSha = [string](Get-JsonProp (Get-JsonProp $envelope 'manifest') 'payload_sha256')
+    Need (-not [string]::IsNullOrWhiteSpace($script:Ctx.P1PayloadSha)) 'manifest 缺少 payload_sha256'
+    $payloadText = ($envelope.payload | ConvertTo-Json -Depth 12 -Compress)
+    Need ($payloadText.Contains('retracted_at')) '备份 payload 里没有 retracted_at 字段'
+    Need ($payloadText.Contains('p1-retract-reason') -or $payloadText.Contains('第一次撤回') -or $payloadText.Contains('个人经验作废')) '备份 payload 里没有撤回原因'
+    "export/verify exit=0；counts=projects:$((Get-JsonProp $counts 'projects')) memories:$((Get-JsonProp $counts 'memories')) revisions:$((Get-JsonProp $counts 'revisions')) events:$((Get-JsonProp $counts 'events'))"
+} 'offline'
+
+# ── P1-06B：恢复后四表一致 + 撤回态/历史保留 + 再导出 sha256 一致 ──────────
+Register-Check 'P1-06B' 'P1 含撤回版本 restore 后：四表计数一致、撤回状态与全部历史保留、payload_sha256 一致' {
+    $dir = [string]$script:Ctx.P1BackupDir
+    $file = [string]$script:Ctx.P1BackupFile
+    $target = Join-Path $dir 'restored'
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    $r = Invoke-Cli @('restore', '--input', $file, '--data-dir', $target) 'p1-06-restore'
+    Need ($r.ExitCode -eq 0) "restore exit=$($r.ExitCode) stderr=$($r.StdErr)"
+    $db = Join-Path $target 'work-memory.db'
+    Need (Test-Path -LiteralPath $db) '恢复目录缺少 work-memory.db'
+
+    $liveCounts = Get-SqliteQuery -DbPath (Get-P1LiveDbPath) -Sql 'SELECT (SELECT count(*) FROM work_projects),(SELECT count(*) FROM work_memories),(SELECT count(*) FROM work_revisions),(SELECT count(*) FROM work_events)' -LogName 'p1-06-live-counts'
+    $restCounts = Get-SqliteQuery -DbPath $db -Sql 'SELECT (SELECT count(*) FROM work_projects),(SELECT count(*) FROM work_memories),(SELECT count(*) FROM work_revisions),(SELECT count(*) FROM work_events)' -LogName 'p1-06-restored-counts'
+    $tableNames = @('work_projects', 'work_memories', 'work_revisions', 'work_events')
+    for ($i = 0; $i -lt 4; $i++) {
+        Need (([int]$liveCounts[0][$i]) -eq ([int]$restCounts[0][$i])) "$($tableNames[$i]) 计数不一致：live=$($liveCounts[0][$i]) restored=$($restCounts[0][$i])"
+    }
+
+    $stateSql = "SELECT id, ifnull(json_extract(body,'$.retracted_at'),''), ifnull(json_extract(body,'$.retract_reason'),'') FROM work_memories ORDER BY id"
+    $liveState = Get-SqliteQuery -DbPath (Get-P1LiveDbPath) -Sql $stateSql -LogName 'p1-06-live-state'
+    $restState = Get-SqliteQuery -DbPath $db -Sql $stateSql -LogName 'p1-06-restored-state'
+    Need ($liveState.Count -eq $restState.Count) "记录行数不一致：live=$($liveState.Count) restored=$($restState.Count)"
+    $retractedSeen = 0
+    for ($i = 0; $i -lt $liveState.Count; $i++) {
+        $l = $liveState[$i]; $s = $restState[$i]
+        Need (([string]$l[0]) -eq ([string]$s[0])) "第 $i 行 id 不一致"
+        Need (([string]$l[1]) -eq ([string]$s[1])) "记录 $($l[0]) 的 retracted_at 不一致：live='$($l[1])' restored='$($s[1])'"
+        Need (([string]$l[2]) -eq ([string]$s[2])) "记录 $($l[0]) 的 retract_reason 不一致"
+        if (-not [string]::IsNullOrEmpty([string]$l[1])) { $retractedSeen++ }
+    }
+    Need ($retractedSeen -ge 1) '恢复库里没有撤回态记录，断言失去意义'
+
+    $histSql = 'SELECT memory_id, group_concat(version) FROM (SELECT memory_id, version FROM work_revisions ORDER BY memory_id, version) GROUP BY memory_id ORDER BY memory_id'
+    $liveHist = Get-SqliteQuery -DbPath (Get-P1LiveDbPath) -Sql $histSql -LogName 'p1-06-live-history'
+    $restHist = Get-SqliteQuery -DbPath $db -Sql $histSql -LogName 'p1-06-restored-history'
+    Need ($liveHist.Count -eq $restHist.Count) "历史条数不一致：live=$($liveHist.Count) restored=$($restHist.Count)"
+    for ($i = 0; $i -lt $liveHist.Count; $i++) {
+        Need (([string]$liveHist[$i][0]) -eq ([string]$restHist[$i][0])) '历史 memory_id 集合不一致'
+        Need (([string]$liveHist[$i][1]) -eq ([string]$restHist[$i][1])) "记录 $($liveHist[$i][0]) 版本历史不一致：live=$($liveHist[$i][1]) restored=$($restHist[$i][1])"
+    }
+
+    $evidence = Get-SqliteQuery -DbPath $db -Sql "SELECT ifnull(json_extract(body,'$.evidence_type'),''), count(*) FROM work_memories GROUP BY 1 ORDER BY 1" -LogName 'p1-06-evidence-types'
+    $evidenceText = (($evidence | ForEach-Object { "$($_[0])=$($_[1])" }) -join ',')
+
+    $again = Join-Path $dir 'roundtrip-again.gmbackup'
+    $e2 = Invoke-Cli @('export', '--data-dir', $target, '--output', $again) 'p1-06-export-again'
+    Need ($e2.ExitCode -eq 0) "再导出 exit=$($e2.ExitCode) stderr=$($e2.StdErr)"
+    $envelope2 = Read-BackupEnvelope -Path $again -LogName 'p1-06-export-again'
+    $sha2 = [string](Get-JsonProp (Get-JsonProp $envelope2 'manifest') 'payload_sha256')
+    Need ($sha2 -eq $script:Ctx.P1PayloadSha) "payload_sha256 不一致：原=$($script:Ctx.P1PayloadSha) 再导出=$sha2"
+
+    "四表一致；撤回记录 $retractedSeen 条状态保留；历史逐条一致；再导出 payload_sha256 一致；evidence_type=$evidenceText"
+} 'offline'
+
+# ── P1-07：旧库兼容（无撤回字段的 body）────────────────────────────────────
+Register-Check 'P1-07' 'P1 旧库兼容：无撤回字段 body 可读、可搜、可写新版本、可撤回、可导出' {
+    $legacyDir = Join-Path $script:Ctx.TempRoot ('p1-legacy-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
+    $legacyDb = Join-Path $legacyDir 'work-memory.db'
+    $legacyId = 'legacy-p1-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $projId = 'legacy-proj-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $maker = @'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.executescript("""
+CREATE TABLE work_projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,directory TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
+CREATE TABLE work_memories(id TEXT PRIMARY KEY,memory_scope TEXT NOT NULL,project_id TEXT,body TEXT NOT NULL);
+CREATE TABLE work_revisions(memory_id TEXT NOT NULL,version INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(memory_id,version));
+CREATE TABLE agent_activity(tool TEXT PRIMARY KEY,calls INTEGER NOT NULL,successes INTEGER NOT NULL,last_at TEXT NOT NULL,last_ok INTEGER NOT NULL);
+CREATE TABLE work_events(event_id TEXT PRIMARY KEY,request TEXT NOT NULL,response TEXT NOT NULL);
+""")
+stamp = '2026-01-01T00:00:00Z'
+# 备份读取器只接受这四张快照表（外加可选的 agent_activity），列名/类型必须完全一致
+# （src-tauri/src/backup_io/snapshot.rs 的 inspect_tables / validate_columns）。
+con.execute("INSERT INTO work_projects VALUES(?,?,?,?)", (sys.argv[2], '旧库兼容项目', '', stamp))
+# 旧库 body 故意缺 retracted_at / retract_reason，验证 serde(default) 兼容。
+body = '{"id":"' + sys.argv[3] + '","version":1,"memory_scope":"project","project_id":"' + sys.argv[2] + '","title":"旧库标记字段缺省","content":"旧库标记正文：body 里没有 retracted_at 与 retract_reason。","kind":"note","source":"legacy","conditions":"","evidence_type":"user_or_agent_statement","origin_memory_id":null,"created_at":"' + stamp + '","updated_at":"' + stamp + '"}'
+con.execute("INSERT INTO work_memories VALUES(?,?,?,?)", (sys.argv[3], 'project', sys.argv[2], body))
+con.execute("INSERT INTO work_revisions VALUES(?,?,?)", (sys.argv[3], 1, body))
+# 真实库的创建事件：export 校验要求每条记录都有与 v1 完全一致的 creation event
+# （backup_format/validate.rs "missing creation event"）。
+import json
+event_id = 'legacy-event-' + sys.argv[3]
+request = json.dumps({"event_id": event_id, "memory_scope": "project", "project_id": sys.argv[2],
+                      "content": "旧库标记正文：body 里没有 retracted_at 与 retract_reason。",
+                      "title": "旧库标记字段缺省", "kind": "note", "source": "legacy"}, ensure_ascii=False)
+response = json.dumps({"memory": json.loads(body)}, ensure_ascii=False)
+con.execute("INSERT INTO work_events VALUES(?,?,?)", (event_id, request, response))
+con.commit()
+con.close()
+'@
+    $probe = Join-Path $legacyDir 'make-legacy.py'
+    Write-Utf8File -Path $probe -Text $maker
+    $mk = Invoke-Native -Exe (Get-Command python).Source -Arguments @('-X', 'utf8', $probe, $legacyDb, $projId, $legacyId) -LogName 'p1-07-make-legacy' -TimeoutSec 60
+    Need ($mk.ExitCode -eq 0) "构造旧库失败：$($mk.StdErr)"
+
+    $instance = Start-ServiceInstance -Exe $script:Ctx.ServiceExe -DataDir $legacyDir
+    try {
+        $info = Wait-ServiceInfo -Instance $instance -TimeoutSec $ServiceReadySec
+        $search = Invoke-Api $info.api_url 'POST' '/api/v1/search' @{ scope = 'project'; project_id = $projId; query = '旧库标记' } 'p1-07-search'
+        Need ($search.Status -eq 200) "旧库 search status=$($search.Status) $($search.Text)"
+        $ids = @(Get-Ids (Get-JsonProp $search.Json 'memories'))
+        Need ($ids -contains $legacyId) '旧库 body 搜不到'
+        Need (([int](Get-JsonProp $search.Json 'retracted_excluded')) -eq 0) '旧库记录被误判为已撤回'
+        $hit = @(Get-JsonProp $search.Json 'memories') | Where-Object { [string](Get-JsonProp $_ 'id') -eq $legacyId }
+        Need ($null -eq (Get-JsonProp $hit 'retracted_at')) '旧库记录 retracted_at 应为 null'
+
+        $upd = Invoke-Api $info.api_url 'POST' '/api/v1/memories/update' @{ id = $legacyId; expected_version = 1; content = '旧库标记正文：已通过 API 写入新版本。' } 'p1-07-update'
+        Need ($upd.Status -eq 200) "旧库 update status=$($upd.Status) $($upd.Text)"
+        $v2 = [int](Get-JsonProp (Get-JsonProp $upd.Json 'memory') 'version')
+        Need ($v2 -eq 2) "旧库 update 后 version=$v2，期望 2"
+        Need ($null -eq (Get-JsonProp (Get-JsonProp $upd.Json 'memory') 'retracted_at')) '旧库新版本 retracted_at 应仍为 null'
+
+        $ret = Invoke-Api $info.api_url 'POST' '/api/v1/memories/retract' @{ id = $legacyId; expected_version = $v2; reason = '旧库记录撤回' } 'p1-07-retract'
+        Need ($ret.Status -eq 200) "旧库 retract status=$($ret.Status) $($ret.Text)"
+        Need ($null -ne (Get-JsonProp (Get-JsonProp $ret.Json 'memory') 'retracted_at')) '旧库记录撤回后未置 retracted_at'
+        $hid = Invoke-Api $info.api_url 'POST' '/api/v1/memories/history' @{ id = $legacyId } 'p1-07-history'
+        Need ((@(Get-JsonProp $hid.Json 'history').Count) -eq 3) "旧库 history=$((@(Get-JsonProp $hid.Json 'history').Count)) 条，期望 3"
+
+        # 旧库 body 走真实 MCP stdio 再读一遍：段落含中文正文，用来核对 UTF-8 往返
+        # （Windows PowerShell 5.1 需要用 [Console]::InputEncoding 才能按 UTF-8 编码 stdin，
+        #   见文件头部的设置与 prep/probe-stdin-encoding.ps1）。服务在本步之后不再存活，
+        # 所以此处用 memory_search（工具清单在此步已单独核对过）。
+        $mcpQuery = '旧库标记正文'
+        $req = @{ jsonrpc = '2.0'; id = 9; method = 'tools/call'; params = @{ name = 'memory_search'; arguments = @{ scope = 'all'; query = $mcpQuery; include_retracted = $true } } } | ConvertTo-Json -Compress -Depth 8
+        $mcpEnv = @{ GM_MEMORY_V1 = '1'; GM_API_URL = [string]$info.api_url }
+        $mcp = Invoke-Native -Exe $script:Ctx.McpExe -Arguments @() -LogName 'p1-07-mcp' -TimeoutSec 120 -StdinText ($req + "`n") -ExtraEnv $mcpEnv
+        Need ($mcp.ExitCode -eq 0) "旧库 MCP exit=$($mcp.ExitCode) stderr=$($mcp.StdErr)"
+        $replyLines = @($mcp.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        Need ($replyLines.Count -ge 1) '旧库 MCP 未输出 JSON-RPC 回复'
+        $reply = $replyLines[0] | ConvertFrom-Json
+        Need (([string](Get-JsonProp $reply 'id')) -eq '9') "旧库 MCP 回复 id=$((Get-JsonProp $reply 'id'))，期望 9（说明中文 query 被正确解析）"
+        $mcpText = Get-McpCallText -Reply $reply
+        $mcpFound = $mcpText | ConvertFrom-Json
+        Need (([int](Get-JsonProp $mcpFound 'total')) -ge 1) "旧库 MCP 中文检索 total=$((Get-JsonProp $mcpFound 'total'))，期望 >=1（UTF-8 往返失败）"
+        $mcpHit = @(Get-JsonProp $mcpFound 'memories') | Where-Object { [string](Get-JsonProp $_ 'id') -eq $legacyId }
+        Need ($null -ne $mcpHit) '旧库 MCP 中文检索未返回 legacy 记录'
+        Need (([string](Get-JsonProp $mcpHit 'content')) -eq '旧库标记正文：已通过 API 写入新版本。') '旧库中文正文经 MCP 往返损坏'
+    } finally {
+        Stop-ServiceInstance $instance
+    }
+
+    $out = Join-Path $script:Ctx.P1BackupDir 'legacy-shape.gmbackup'
+    $e = Invoke-Cli @('export', '--data-dir', $legacyDir, '--output', $out) 'p1-07-export'
+    Need ($e.ExitCode -eq 0) "旧库 export exit=$($e.ExitCode) stderr=$($e.StdErr)"
+    $v = Invoke-Cli @('verify', $out) 'p1-07-verify'
+    Need ($v.ExitCode -eq 0) "旧库 verify exit=$($v.ExitCode) stderr=$($v.StdErr)"
+    $env1 = Read-BackupEnvelope -Path $out -LogName 'p1-07-export'
+    Need (([int](Get-JsonProp (Get-JsonProp $env1 'manifest') 'format_version')) -eq 1) '旧库往返 format_version 应仍为 1'
+    "旧库 body：可搜、可读、update v1->v2、retract v3、history=3、包可 export/verify（format_version=1）、MCP stdio 中文 query 解析正常且正文往返一致"
+} 'offline'
+
+# ── P1-08：MCP 真实 stdio 转发 ──────────────────────────────────────────────
+Register-Check 'P1-08' 'P1 MCP stdio：五工具齐全；memory_update retract/restore 真转发；互斥 400 不写版本' {
+    $pid0 = New-P1Project 'P1 MCP 项目' 'p1-08-project'
+    $mk = New-P1Memory -Title 'P1-MCP-RETRACT' -Content 'P1 MCP retract probe body for stdio forwarding.' -ProjectId $pid0 -LogName 'p1-08-create'
+
+    $req = New-Object System.Collections.ArrayList
+    [void]$req.Add((@{ jsonrpc = '2.0'; id = 1; method = 'tools/list' } | ConvertTo-Json -Compress))
+    [void]$req.Add((@{ jsonrpc = '2.0'; id = 2; method = 'tools/call'; params = @{ name = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $mk.version; retract = $true; reason = 'MCP 撤回原因（中文往返）' } } } | ConvertTo-Json -Compress -Depth 8))
+    $replies = @(Invoke-McpLines -StdinText (($req -join "`n") + "`n") -LogName 'p1-08-mcp-retract')
+    Need ($replies.Count -eq 2) "MCP 回复数=$($replies.Count)，期望 2"
+
+    $tools = @(Get-JsonProp (Get-JsonProp $replies[0] 'result') 'tools')
+    $names = @($tools | ForEach-Object { [string](Get-JsonProp $_ 'name') })
+    Need ($names.Count -eq 5) "tools/list 返回 $($names.Count) 个工具，期望 5"
+    foreach ($want in @('memory_projects', 'memory_write', 'memory_search', 'memory_context', 'memory_update')) {
+        Need ($names -contains $want) "tools/list 缺少 $want"
+    }
+    Need (-not ($names -contains 'forget')) 'v1 模式不应暴露 forget'
+    $updateTool = $tools | Where-Object { [string](Get-JsonProp $_ 'name') -eq 'memory_update' }
+    $updateProps = Get-JsonProp (Get-JsonProp $updateTool 'inputSchema') 'properties'
+    foreach ($k in @('retract', 'restore', 'reason')) {
+        Need ($null -ne (Get-JsonProp $updateProps $k)) "memory_update schema 缺少 $k"
+    }
+    $searchTool = $tools | Where-Object { [string](Get-JsonProp $_ 'name') -eq 'memory_search' }
+    $searchProps = Get-JsonProp (Get-JsonProp $searchTool 'inputSchema') 'properties'
+    Need ($null -ne (Get-JsonProp $searchProps 'include_retracted')) 'memory_search schema 缺少 include_retracted'
+
+    $retractJson = (Get-McpCallText -Reply $replies[1]) | ConvertFrom-Json
+    $rv = [int](Get-JsonProp (Get-JsonProp $retractJson 'memory') 'version')
+    Need ($rv -eq ($mk.version + 1)) "MCP retract 后 version=$rv，期望 $($mk.version + 1)"
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp (Get-JsonProp $retractJson 'memory') 'retracted_at'))) 'MCP retract 未真正转发（无 retracted_at）'
+    Need (([string](Get-JsonProp (Get-JsonProp $retractJson 'memory') 'retract_reason')) -eq 'MCP 撤回原因（中文往返）') 'MCP retract 原因未透传或中文损坏'
+
+    $search = Invoke-P1Search -ProjectId $pid0 -Query 'P1-MCP-RETRACT' -LogName 'p1-08-search-retracted'
+    Need (([int](Get-JsonProp $search.Json 'retracted_excluded')) -eq 1) 'MCP retract 未反映到服务端（retracted_excluded=0）'
+
+    $searchReq = @{ jsonrpc = '2.0'; id = 3; method = 'tools/call'; params = @{ name = 'memory_search'; arguments = @{ scope = 'project'; project_id = $pid0; query = 'P1-MCP-RETRACT'; include_retracted = $true } } } | ConvertTo-Json -Compress -Depth 8
+    $r2 = @(Invoke-McpLines -StdinText ($searchReq + "`n") -LogName 'p1-08-mcp-search')
+    $found = (Get-McpCallText -Reply $r2[0]) | ConvertFrom-Json
+    Need (([int](Get-JsonProp $found 'retracted_excluded')) -eq 0) "MCP include_retracted 应返回 excluded=0，实际 $((Get-JsonProp $found 'retracted_excluded'))"
+    $marked = @(Get-JsonProp $found 'memories') | Where-Object { [string](Get-JsonProp $_ 'id') -eq $mk.id }
+    Need ($null -ne $marked) 'MCP include_retracted 未返回撤回记录'
+    Need (-not [string]::IsNullOrWhiteSpace([string](Get-JsonProp $marked 'retracted_at'))) 'MCP 返回的撤回记录缺 retracted_at'
+
+    $bothReq = @{ jsonrpc = '2.0'; id = 4; method = 'tools/call'; params = @{ name = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $rv; retract = $true; restore = $true } } } | ConvertTo-Json -Compress -Depth 8
+    $r3 = @(Invoke-McpLines -StdinText ($bothReq + "`n") -LogName 'p1-08-mcp-mutex')
+    $isErr = Get-JsonProp (Get-JsonProp $r3[0] 'result') 'isError'
+    Need ($isErr -eq $true) 'retract+restore 同时为真应返回 isError'
+    Need (($r3[0] | ConvertTo-Json -Depth 10 -Compress).Contains('mutually exclusive')) '互斥错误信息不符'
+    $hist = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-08-history-after-mutex'
+    Need ((@(Get-JsonProp $hist.Json 'history').Count) -eq $rv) "互斥失败却写了版本：history=$((@(Get-JsonProp $hist.Json 'history').Count))，期望 $rv"
+
+    $restoreReq = @{ jsonrpc = '2.0'; id = 5; method = 'tools/call'; params = @{ name = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $rv; restore = $true; reason = 'mcp-restore-reason' } } } | ConvertTo-Json -Compress -Depth 8
+    $r4 = @(Invoke-McpLines -StdinText ($restoreReq + "`n") -LogName 'p1-08-mcp-restore')
+    $restored = (Get-McpCallText -Reply $r4[0]) | ConvertFrom-Json
+    $nv = [int](Get-JsonProp (Get-JsonProp $restored 'memory') 'version')
+    Need ($nv -eq ($rv + 1)) "MCP restore 未产生 version+1（$nv）"
+    Need ($null -eq (Get-JsonProp (Get-JsonProp $restored 'memory') 'retracted_at')) 'MCP restore 后 retracted_at 应为 null'
+    $after = Invoke-P1Search -ProjectId $pid0 -Query 'P1-MCP-RETRACT' -LogName 'p1-08-search-after-restore'
+    Need (([int](Get-JsonProp $after.Json 'retracted_excluded')) -eq 0) 'MCP restore 未反映到服务端'
+
+    # 进程级分帧冒烟：一次 stdin 送 8 条只读请求（UTF-8 字节数 > 4KiB），必须逐条回 8 条。
+    # mcp_server 的 framing 循环读取 stdin 时若被 4096 字节缓冲截断，同一批里后续请求会静默丢失。
+    $padding = 'z' * 400
+    $batch = New-Object System.Collections.ArrayList
+    for ($i = 1; $i -le 8; $i++) {
+        $payload = @{ jsonrpc = '2.0'; id = (100 + $i); method = 'tools/call'; params = @{ name = 'memory_search'; arguments = @{ scope = 'personal'; query = $padding } } } | ConvertTo-Json -Compress -Depth 8
+        [void]$batch.Add($payload)
+    }
+    $batchText = ($batch -join "`n") + "`n"
+    $batchBytes = $script:Utf8.GetByteCount($batchText)
+    Need ($batchBytes -gt 4096) "分帧冒烟载荷只有 $batchBytes 字节，未超过 4KiB，无法暴露截断问题"
+    $batchReplies = @(Invoke-McpLines -StdinText $batchText -LogName 'p1-08-mcp-framing-batch')
+    Need ($batchReplies.Count -eq 8) "一次 stdin 送 8 条请求（$batchBytes 字节）只收到 $($batchReplies.Count) 条回复：mcp_server 的 stdin 分帧/缓冲截断了同一批请求"
+    $batchIds = @($batchReplies | ForEach-Object { [int](Get-JsonProp $_ 'id') })
+    foreach ($want in 101..108) { Need ($batchIds -contains $want) "分帧冒烟缺少 id=$want 的回复" }
+
+    $activity = Invoke-Api $script:Ctx.LiveInfo.api_url 'GET' '/api/v1/agent/status' $null 'p1-08-activity'
+    Need (-not $activity.Text.Contains('P1-MCP-RETRACT')) 'agent/status 泄漏了记录内容'
+
+    "五工具；retract v$($mk.version)->v$rv 真转发；include_retracted 可见；互斥 isError 且未写版本；MCP restore 到 v$nv"
+} 'live'
+
+# ── P1-09：HTTP agent/call 直连（MCP 之外的第二条入口）────────────────────
+Register-Check 'P1-09' 'P1 /api/v1/agent/call 直连：memory_update 互斥 400 且不写版本' {
+    $pid0 = New-P1Project 'P1 AgentCall 项目' 'p1-09-project'
+    $mk = New-P1Memory -Title 'P1-AGENTCALL-RETRACT' -Content 'P1 agent/call retract probe body.' -ProjectId $pid0 -LogName 'p1-09-create'
+
+    $both = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/agent/call' @{ tool = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $mk.version; retract = $true; restore = $true } } 'p1-09-mutex'
+    Need ($both.Status -eq 400) "agent/call 互斥期望 400，实际 $($both.Status) $($both.Text)"
+    Need ($both.Text.Contains('retract and restore are mutually exclusive')) "agent/call 互斥信息不符：$($both.Text)"
+    $hist = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/memories/history' @{ id = $mk.id } 'p1-09-history'
+    Need ((@(Get-JsonProp $hist.Json 'history').Count) -eq $mk.version) "互斥失败却写了版本：history=$((@(Get-JsonProp $hist.Json 'history').Count))，期望 $($mk.version)"
+
+    $badFlag = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/agent/call' @{ tool = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $mk.version; retract = 'yes' } } 'p1-09-bad-flag'
+    Need ($badFlag.Status -eq 400) "retract='yes' 期望 400，实际 $($badFlag.Status)"
+
+    $retract = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/agent/call' @{ tool = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $mk.version; retract = $true; reason = 'agent-call-retract' } } 'p1-09-retract'
+    Need ($retract.Status -eq 200) "agent/call retract 期望 200，实际 $($retract.Status) $($retract.Text)"
+    $rv = [int](Get-JsonProp (Get-JsonProp $retract.Json 'memory') 'version')
+    Need ($rv -eq ($mk.version + 1)) "agent/call retract 后 version=$rv，期望 $($mk.version + 1)"
+    Need (([string](Get-JsonProp (Get-JsonProp $retract.Json 'memory') 'retract_reason')) -eq 'agent-call-retract') 'agent/call retract 原因未透传'
+
+    $restore = Invoke-Api $script:Ctx.LiveInfo.api_url 'POST' '/api/v1/agent/call' @{ tool = 'memory_update'; arguments = @{ id = $mk.id; expected_version = $rv; restore = $true } } 'p1-09-restore'
+    Need ($restore.Status -eq 200) "agent/call restore 期望 200，实际 $($restore.Status) $($restore.Text)"
+    Need (([int](Get-JsonProp (Get-JsonProp $restore.Json 'memory') 'version')) -eq ($rv + 1)) 'agent/call restore 未产生 version+1'
+    Need ($null -eq (Get-JsonProp (Get-JsonProp $restore.Json 'memory') 'retracted_at')) 'agent/call restore 后 retracted_at 应为 null'
+
+    $status = Invoke-Api $script:Ctx.LiveInfo.api_url 'GET' '/api/v1/agent/status' $null 'p1-09-status'
+    $activity = @(Get-JsonProp $status.Json 'activity')
+    $updateRow = $activity | Where-Object { [string](Get-JsonProp $_ 'tool') -eq 'memory_update' }
+    Need ($null -ne $updateRow) 'agent/status 未记录 memory_update 调用计数'
+    Need (([int](Get-JsonProp $updateRow 'calls')) -ge 2) "memory_update calls=$((Get-JsonProp $updateRow 'calls'))，期望 >=2"
+    Need (([int](Get-JsonProp $updateRow 'successes')) -ge 2) 'memory_update successes 计数异常'
+    "互斥/非法标志 400 且不写版本；retract v$($mk.version)->v$rv、restore v$($rv + 1)；activity 计数 calls=$((Get-JsonProp $updateRow 'calls'))"
+} 'live'
+
 # ── 既有套件（-Full / 对应开关）────────────────────────────────────────────
-Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 25 项）' {
+Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 45 项）' {
     if (-not ($script:Ctx.RunRust)) { return 'SKIP:not requested' }
     # 只跑 lib 单测，不 build bin：不触碰 owner 指定的最终二进制，也不动其它 target。
     # 使用 artifacts 下的持久 CARGO_TARGET_DIR：既避免与默认 target 目录互相干扰，
@@ -1130,7 +1908,7 @@ Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 25 
     $script:Ctx.RustPassed = $passed
     $script:Ctx.RustResultLine = ($m.Value.Trim())
     Need ($failed -eq 0) "cargo 失败 $failed 项"
-    Need ($passed -ge 25) "cargo 通过 $passed 项，低于基线 25"
+    Need ($passed -ge 45) "cargo 通过 $passed 项，低于基线 45"
     "passed=$passed failed=0（CARGO_TARGET_DIR=$altTarget）"
 } 'suites'
 
@@ -1146,7 +1924,7 @@ Register-Check 'SUITE-SETUP' 'dotnet run tests/Desktop.Setup.Tests（基线 102 
     "checks=$n"
 } 'suites'
 
-Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 73 项）' {
+Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 86 项）' {
     if (-not ($script:Ctx.RunDesktop)) { return 'SKIP:not requested' }
     if ([string]::IsNullOrWhiteSpace($script:DotnetExe)) { return 'SKIP:dotnet SDK 不可用' }
     $r = Invoke-Native -Exe $script:DotnetExe -Arguments @('run', '--project', 'tests/Desktop.Editor.Tests', '-c', 'Release') -LogName 'suite-editor' -TimeoutSec $NativeTimeoutSec -WorkDir $script:Ctx.RepoRoot
@@ -1154,7 +1932,7 @@ Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 73
     $m = [regex]::Match($r.StdOut, 'PASS (\d+) editor checks')
     Need ($m.Success) '未找到 PASS N editor checks'
     $n = [int]$m.Groups[1].Value
-    Need ($n -ge 73) "editor checks=$n，低于基线 73"
+    Need ($n -ge 86) "editor checks=$n，低于基线 86"
     "checks=$n"
 } 'suites'
 
@@ -1208,7 +1986,7 @@ function Invoke-SelfTest {
     if ($script:Checks.Count -lt 25) { [void]$problems.Add("注册断言只有 $($script:Checks.Count) 条，少于 25") }
     $liveCount = 0; $offlineCount = 0; $suiteCount = 0
     foreach ($id in @($script:Checks.Keys)) {
-        if ($id -notmatch '^(S-[A-Z0-9]+-\d+[A-Z]?|ADV-\d+[A-Z]?|SUITE-[A-Z]+)$') { [void]$problems.Add("断言 id 格式异常：$id") }
+        if ($id -notmatch '^(S-[A-Z0-9]+-\d+[A-Z]?|ADV-\d+[A-Z]?|SUITE-[A-Z]+|P1-\d+[A-Z]?)$') { [void]$problems.Add("断言 id 格式异常：$id") }
         if ([string]::IsNullOrWhiteSpace($script:Checks[$id].Title)) { [void]$problems.Add("断言 $id 缺少标题") }
         if ($null -eq $script:Checks[$id].Body) { [void]$problems.Add("断言 $id 缺少函数体") }
         switch (Get-CheckPhase $script:Checks[$id]) {
@@ -1228,6 +2006,18 @@ function Invoke-SelfTest {
     }
     foreach ($key in @('S-B-01', 'S-B-02', 'S-B-03', 'S-B-04', 'S-B-05', 'S-B-06', 'S-B-07', 'S-B-08', 'S-B-09', 'S-B-01A', 'ADV-04', 'ADV-04A')) {
         if ((Get-CheckPhase $script:Checks[$key]) -ne 'offline') { [void]$problems.Add("$key 相位不是 offline") }
+    }
+    foreach ($key in @('P1-01', 'P1-02', 'P1-03', 'P1-04', 'P1-05', 'P1-08', 'P1-09')) {
+        if ((Get-CheckPhase $script:Checks[$key]) -ne 'live') { [void]$problems.Add("$key 相位不是 live") }
+    }
+    foreach ($key in @('P1-06A', 'P1-06B', 'P1-07')) {
+        if ((Get-CheckPhase $script:Checks[$key]) -ne 'offline') { [void]$problems.Add("$key 相位不是 offline") }
+    }
+
+    # 相位调用点：一次 live → offline → 只跑 P1-* 的 live → suites
+    $scriptText = [IO.File]::ReadAllText($PSCommandPath, $script:Utf8)
+    foreach ($needle in @("Invoke-Checks -Phase 'live'", "Invoke-Checks -Phase 'offline'", "Invoke-Checks -Phase 'live' -Only @('P1-08', 'P1-09')", "Invoke-Checks -Phase 'suites'")) {
+        if (-not $scriptText.Contains($needle)) { [void]$problems.Add("主流程缺少相位调用：$needle") }
     }
 
     # 5.2 UTF-8 编解码闭环
@@ -1291,6 +2081,7 @@ function Invoke-SelfTest {
 #  6. 主流程
 # ════════════════════════════════════════════════════════════════════════════
 Initialize-Paths
+Test-McpStdinEncoding
 
 if ($Full) { $RustSuites = $true; $DesktopSuites = $true; $PythonSuites = $true; $Smoke = $true }
 $script:Ctx | Add-Member -NotePropertyName RunRust -NotePropertyValue ([bool]$RustSuites) -Force
@@ -1331,6 +2122,14 @@ try {
         [void](Add-Result -Id 'ENV-08' -Kind 'info' -Title 'dotnet SDK 已解析' -Ok $true -Detail ("{0} :: {1}" -f $resolved.Exe, (@($resolved.Sdks) -join ', ')))
     } catch {
         [void](Add-Result -Id 'ENV-04' -Kind 'skip' -Title 'dotnet SDK 不可用' -Ok $true -Detail $_.Exception.Message)
+    }
+
+    # MCP stdio 真实进程（P1-08 用），缺失时显式记录而不是静默。
+    if (-not (Test-Path -LiteralPath $script:Ctx.McpExe -PathType Leaf)) {
+        [void](Add-Result -Id 'ENV-09' -Kind 'skip' -Title 'mcp_server.exe 缺失，P1-08 无法执行' -Ok $true -Detail $script:Ctx.McpExe)
+    } else {
+        $mcpInfo = Get-Item -LiteralPath $script:Ctx.McpExe
+        [void](Add-Result -Id 'ENV-09' -Kind 'info' -Title 'MCP 服务二进制就绪' -Ok $true -Detail ("{0} [{1}] len={2}" -f $mcpInfo.FullName, $mcpInfo.LastWriteTime, $mcpInfo.Length))
     }
 
     # ── 6.2 启动真实服务并准备语料 ──────────────────────────────────────────
@@ -1392,10 +2191,27 @@ try {
     }
 
     # ── 6.4 停服后做 CLI 端到端与既有套件 ──────────────────────────────────
+    # 顺序：live → offline → live → suites。
+    # 原因：P1-06/P1-07 需要在停服状态下导出 live 数据目录，而 P1-08/P1-09 必须打真实
+    # HTTP/MCP 服务，所以中间再拉起一次同一数据目录的服务（同一把 service-lock 保证唯一实例）。
     Write-Step 'service-stop'
     Stop-ServiceInstance $script:LiveService
     $script:LiveService = $null
     Invoke-Checks -Phase 'offline'
+    Write-Step 'service-restart-for-live'
+    try {
+        $script:LiveService = Start-ServiceInstance -Exe $script:Ctx.ServiceExe -DataDir $script:Ctx.LiveDir
+        $script:Ctx.LiveInfo = Wait-ServiceInfo -Instance $script:LiveService -TimeoutSec $ServiceReadySec
+        Write-Step ('service-ready ' + $script:Ctx.LiveInfo.api_url)
+        [void](Save-Evidence -Name 'service-info-live2.json' -Text ($script:Ctx.LiveInfo | ConvertTo-Json -Depth 6))
+    } catch {
+        [void](Add-Result -Id 'ENV-10' -Kind 'assert' -Title 'live 服务二次启动失败（P1-08/P1-09 无法执行）' -Ok $false -Detail $_.Exception.Message)
+    }
+    # 这里只跑必须依赖「重启后服务」的 P1-08/P1-09（MCP stdio、agent/call 直连）。
+    Invoke-Checks -Phase 'live' -Only @('P1-08', 'P1-09')
+    Write-Step 'service-stop-final'
+    Stop-ServiceInstance $script:LiveService
+    $script:LiveService = $null
     Invoke-Checks -Phase 'suites'
 } catch {
     [void](Add-Result -Id 'RUN-01' -Kind 'assert' -Title '主流程异常' -Ok $false -Detail ($_.Exception.Message + ' @line ' + $_.InvocationInfo.ScriptLineNumber))
@@ -1415,10 +2231,11 @@ try {
     }
     [void](Save-Evidence -Name 'report.json' -Text ($summary | ConvertTo-Json -Depth 8))
     $lines = New-Object System.Collections.ArrayList
-    [void]$lines.Add('P0-D 可用性独立验收报告（黑盒：真实二进制 + 真实 HTTP + 真实 CLI）')
+    [void]$lines.Add('P1-D 可用性独立验收报告（黑盒：真实二进制 + 真实 HTTP + 真实 MCP stdio + 真实 CLI）')
     [void]$lines.Add(('repo: {0}' -f $script:Ctx.RepoRoot))
     [void]$lines.Add(('service.exe: {0}  [{1}]' -f $script:Ctx.ServiceExe, (Get-Item -LiteralPath $script:Ctx.ServiceExe -ErrorAction SilentlyContinue).LastWriteTime))
     [void]$lines.Add(('backup.exe : {0}  [{1}]' -f $script:Ctx.BackupExe, (Get-Item -LiteralPath $script:Ctx.BackupExe -ErrorAction SilentlyContinue).LastWriteTime))
+    [void]$lines.Add(('mcp_server.exe: {0}  [{1}]' -f $script:Ctx.McpExe, (Get-Item -LiteralPath $script:Ctx.McpExe -ErrorAction SilentlyContinue).LastWriteTime))
     [void]$lines.Add(('suites: rust={0} desktop={1} python={2} smoke={3}' -f $script:Ctx.RunRust, $script:Ctx.RunDesktop, $script:Ctx.RunPython, $script:Ctx.RunSmoke))
     if ($script:Ctx.RustPassed -gt 0) { [void]$lines.Add(('cargo: {0}' -f $script:Ctx.RustResultLine)) }
     [void]$lines.Add(('passed={0} failed={1} skipped={2}' -f $script:Passed, $script:Failed, $script:Skips))

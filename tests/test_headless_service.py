@@ -156,6 +156,27 @@ class HeadlessServiceTest(unittest.TestCase):
                 counters={x['tool']:x for x in api(info,'/api/v1/agent/status')['activity']}
                 self.assertEqual(counters['memory_update']['calls'],2)
                 self.assertEqual(counters['memory_update']['successes'],1)
+                # Retraction hides a record without deleting it; history keeps every version.
+                self.assertEqual([r['id'] for r in api(info,'/api/v1/search',{'scope':'project','project_id':alpha})['memories']],[a['id']])
+                retracted=api(info,'/api/v1/memories/retract',{'id':a['id'],'expected_version':1,'reason':'结论被证伪'})['memory']
+                self.assertEqual((retracted['version'],retracted['retract_reason']),(2,'结论被证伪'))
+                self.assertIsNotNone(retracted['retracted_at'])
+                hidden=api(info,'/api/v1/search',{'scope':'project','project_id':alpha})
+                self.assertEqual((hidden['total'],hidden['retracted_excluded']),(0,1))
+                shown=api(info,'/api/v1/search',{'scope':'project','project_id':alpha,'include_retracted':True})
+                self.assertEqual((shown['total'],shown['memories'][0]['retract_reason']),(1,'结论被证伪'))
+                with self.assertRaises(urllib.error.HTTPError) as already:
+                    api(info,'/api/v1/memories/retract',{'id':a['id'],'expected_version':2})
+                self.assertEqual(already.exception.code,400)
+                restored_record=api(info,'/api/v1/memories/restore',{'id':a['id'],'expected_version':2,'reason':'复核通过'})['memory']
+                self.assertEqual(restored_record['version'],3)
+                self.assertIsNone(restored_record['retracted_at'])
+                self.assertIsNone(restored_record['retract_reason'])
+                history=api(info,'/api/v1/memories/history',{'id':a['id']})['history']
+                self.assertEqual([v['version'] for v in history],[3,2,1])
+                self.assertIsNotNone(history[1]['retracted_at'])
+                self.assertIsNone(history[2]['retracted_at'])
+                self.assertEqual([r['id'] for r in api(info,'/api/v1/search',{'scope':'project','project_id':alpha})['memories']],[a['id']])
                 # Abrupt termination releases the directory lock; stale discovery is replaced.
                 first.kill(); first.communicate(timeout=5)
                 restarted=start(); fresh=discover(restarted,info['instance_id'])
