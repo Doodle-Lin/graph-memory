@@ -4,6 +4,9 @@ data/
 *.npz
 .env
 
+# P3 检索评测集夹具必须入库(否则基线无法复现);报告产物仍在 artifacts/ 下不入库
+!tests/eval/*.json
+
 # Python
 __pycache__/
 *.pyc
