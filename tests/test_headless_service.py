@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
 import time
@@ -214,6 +215,204 @@ class HeadlessServiceTest(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                     process.communicate(timeout=5)
+
+class ProtocolLimitsTest(unittest.TestCase):
+    """L5-02: the local HTTP protocol must enforce resource limits on real sockets."""
+
+    def setUp(self):
+        self.env={k:v for k,v in os.environ.items() if not k.startswith('GM_')}
+        self.folder=tempfile.TemporaryDirectory(prefix='gm-limits-')
+        self.addCleanup(self.folder.cleanup)
+        self.cwd=Path(self.folder.name)
+        self.data=self.cwd/'isolated'
+        self.process=subprocess.Popen(
+            [str(BIN/('graph-memory-service'+SUFFIX)),'--data-dir',str(self.data)],
+            cwd=self.cwd,env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,creationflags=FLAGS)
+        self.addCleanup(self._stop)
+        deadline=time.monotonic()+15
+        info=None
+        while time.monotonic()<deadline:
+            if self.process.poll() is not None:
+                self.fail(self.process.communicate()[1].decode(errors='replace'))
+            try:
+                info=json.loads((self.data/'service.json').read_text())
+                break
+            except (OSError,ValueError):
+                time.sleep(.05)
+        if info is None:
+            self.fail('service readiness timed out')
+        self.port=int(info['api_url'].rsplit(':',1)[1])
+
+    def _stop(self):
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.communicate(timeout=5)
+        # A leaked service keeps a lock on its exe and data directory; also kill the
+        # pid published in service.json, then wait until it is really gone.
+        try:
+            published=int(json.loads((self.data/'service.json').read_text())['pid'])
+        except (OSError,ValueError,KeyError):
+            published=None
+        for pid in {self.process.pid,published}-{None}:
+            for _ in range(20):
+                try:
+                    os.kill(pid,9)
+                except OSError:
+                    break
+                time.sleep(.1)
+
+    def raw(self,payload,shutdown_write=False,read=True,timeout=25):
+        """Send raw bytes, return (status, headers dict, raw header text).
+
+        With read=False the open socket is returned to the caller (used to hold
+        connections open); the caller owns closing it.
+        """
+        sock=socket.create_connection(('127.0.0.1',self.port),timeout=5)
+        sock.settimeout(timeout)
+        if not read:
+            sock.sendall(payload)
+            return sock
+        try:
+            sock.sendall(payload)
+            if shutdown_write:
+                sock.shutdown(socket.SHUT_WR)
+            data=b''
+            while b'\r\n\r\n' not in data:
+                try:
+                    chunk=sock.recv(4096)
+                except ConnectionResetError:
+                    # Windows can turn an immediate close into an RST that discards the
+                    # buffered response (seen with the 40 KB header rejection).
+                    break
+                if not chunk:
+                    break
+                data+=chunk
+            if not data:
+                raise ConnectionResetError('connection reset before any response bytes')
+            head=data.split(b'\r\n\r\n',1)[0].decode('latin-1')
+            lines=head.split('\r\n')
+            headers={}
+            for line in lines[1:]:
+                if ':' in line:
+                    name,value=line.split(':',1)
+                    headers[name.strip().lower()]=value.strip()
+            return int(lines[0].split(' ')[1]),headers,head
+        finally:
+            sock.close()
+
+    def assert_json_error(self,status,headers,expected):
+        self.assertEqual(status,expected,headers)
+        self.assertEqual(headers.get('content-type'),'application/json; charset=utf-8')
+        self.assertTrue(headers.get('content-length','').isdigit(),headers)
+
+    def test_request_line_and_header_limits(self):
+        filler=b'x'*(40*1024)
+        status,headers,_=self.raw(
+            b'GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Filler: '+filler+b'\r\n\r\n')
+        self.assert_json_error(status,headers,431)
+        status,headers,_=self.raw(b'GET /'+b'a'*(8*1024+100)+b' HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+        self.assert_json_error(status,headers,431)
+        # The service must still answer normal traffic after rejecting those.
+        status,headers,_=self.raw(b'GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+        self.assertEqual(status,200,headers)
+
+    def test_body_limit_and_lying_content_length(self):
+        # Declared size is over the 1 MiB limit: rejected while reading, no body sent at all.
+        status,headers,_=self.raw(
+            b'POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+            b'Content-Type: application/json\r\nContent-Length: 2097152\r\n\r\n')
+        self.assert_json_error(status,headers,413)
+        # "Lying" Content-Length: declares a huge size but sends only a few bytes.
+        status,headers,_=self.raw(
+            b'POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+            b'Content-Type: application/json\r\nContent-Length: 999999999\r\n\r\n{}')
+        self.assert_json_error(status,headers,413)
+        # Declared body is within the limit but the client stops early: malformed, not a hang.
+        status,headers,_=self.raw(
+            b'POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+            b'Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{"name":',shutdown_write=True)
+        self.assert_json_error(status,headers,400)
+
+    def test_disallowed_api_methods_return_405_with_allow(self):
+        for method,path in [(b'DELETE',b'/api/v1/projects'),(b'PUT',b'/api/v1/memories'),(b'PATCH',b'/api/v1/search')]:
+            status,headers,_=self.raw(method+b' '+path+b' HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+            self.assert_json_error(status,headers,405)
+            self.assertEqual(headers.get('allow'),'GET, POST')
+        # The method rejection must not have mutated anything.
+        status,headers,_=self.raw(b'GET /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+        self.assertEqual(status,200,headers)
+
+    def test_malformed_requests_are_400_and_never_crash(self):
+        for payload in [b'GARBAGE-NO-SPACES\r\n\r\n',b'GET\r\n\r\n',b'GET /ok\r\n\r\n',
+                        b'GET  HTTP/1.1\r\n\r\n',b'GET /x HTTP/2.0\r\n\r\n',
+                        b'GET /x HTTP/1.1\r\nBroken-Header\r\n\r\n']:
+            status,headers,_=self.raw(payload)
+            self.assert_json_error(status,headers,400)
+        # Still alive after all of that garbage.
+        status,headers,_=self.raw(b'GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+        self.assertEqual(status,200,headers)
+
+    def test_excess_concurrent_connections_get_503(self):
+        # Hold 120 idle connections open without sending a request: the limit is
+        # enforced when the connection is admitted, so the excess ones must be
+        # refused immediately with 503 (no queueing) while the first 64 wait.
+        held=[]
+        try:
+            for _ in range(120):
+                sock=socket.create_connection(('127.0.0.1',self.port),timeout=5)
+                sock.settimeout(3)
+                held.append(sock)
+            time.sleep(1.5)
+            rejected=0
+            waiting=0
+            timed_out=0
+            for sock in held:
+                try:
+                    data=b''
+                    while b'\r\n\r\n' not in data:
+                        chunk=sock.recv(4096)
+                        if not chunk:
+                            break
+                        data+=chunk
+                    if data.startswith(b'HTTP/1.1 503'):
+                        rejected+=1
+                        head=data.split(b'\r\n\r\n',1)[0].decode('latin-1').lower()
+                        self.assertIn('content-type: application/json; charset=utf-8',head)
+                        self.assertIn('content-length:',head)
+                        self.assertIn('connection: close',head)
+                    elif data.startswith(b'HTTP/1.1 408'):
+                        # An admitted connection that sat idle past the 15s deadline.
+                        timed_out+=1
+                    elif data:
+                        self.fail('unexpected response under load: %r' % data[:120])
+                except socket.timeout:
+                    # An admitted connection is still waiting for its request.
+                    waiting+=1
+                except ConnectionError:
+                    # A server-side close can arrive as RST on Windows.
+                    rejected+=1
+            self.assertGreaterEqual(rejected,120-64,
+                'only %d of 120 connections were rejected' % rejected)
+            self.assertEqual(waiting+timed_out,64,
+                'expected only the admitted connections to be served, got %d open / %d timed out'
+                % (waiting,timed_out))
+        finally:
+            for sock in held:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        # Once the clients disconnect, the service must recover.
+        deadline=time.monotonic()+30
+        while time.monotonic()<deadline:
+            try:
+                status,headers,_=self.raw(b'GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n',timeout=5)
+                if status==200:
+                    return
+            except OSError:
+                pass
+            time.sleep(.25)
+        self.fail('service did not recover after the concurrency burst')
 
 if __name__=='__main__':
     unittest.main()

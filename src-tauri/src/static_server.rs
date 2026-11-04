@@ -1,11 +1,51 @@
 // 极简静态文件服务器 + 引擎 HTTP API + 模型下载状态/进度
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::engine::GraphEngine;
+
+// ───────────────────────── 本机协议资源上限 (L5-02) ─────────────────────────
+// 服务只监听 127.0.0.1,但同机任意进程都能连:没有上限时一个脚本就能让服务
+// 分配无界内存或堆积线程。默认值全部集中在这里,并有单元测试与真实套接字断言。
+
+/// 请求行 + 全部头部字节数上限。超过 → 431(超限时只读到上限+1 就返回,不累积)。
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// 正文上限。超过 → 413;声明就超限直接拒,实际读取时边读边判。
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// 单个连接读取/写入空闲超时。超时 → 408(读超时)。
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// 同时处理的连接数上限。超出立即 503,不排队、不阻塞 accept 循环。
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// 写入超时(与读取同值即可;大量写阻塞交给 OS 缓冲,不需要更久)。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 请求行长度上限(单行,含方法/目标/版本)。
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+
+/// 当前正在处理的连接数 + 累计拒绝计数(拒绝只记原因与计数,绝不记正文)。
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+static REJECTIONS_HEADER_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_BODY_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_MALFORMED: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_METHOD_NOT_ALLOWED: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static REJECTIONS_TOO_MANY_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// 拒绝日志:原因 + 累计计数,不含正文(只记方法/路径等元数据)。
+fn log_rejection(counter: &AtomicU64, status: u16, reason: &str, detail: &str) {
+    let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if detail.is_empty() {
+        log::warn!("rejected request status={} reason={} count={}", status, reason, total);
+    } else {
+        log::warn!(
+            "rejected request status={} reason={} count={} detail={}",
+            status, reason, total, detail
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct ModelState {
@@ -190,69 +230,319 @@ fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
         body.len()
-    );    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-}
-
-fn send_err(stream: &mut TcpStream, status: u16, msg: &str) {
-    let body = serde_json::json!({"error": msg}).to_string();
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-        status, body.len()
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
 }
 
-/// 从请求里解析 JSON body(找 \r\n\r\n 之后的内容)。
-/// 返回 400 风格的 None 时调用方自行处理;此处仍宽松:解析失败给空 {}。
-fn parse_json_body(req: &str) -> serde_json::Value {
-    if let Some(pos) = req.find("\r\n\r\n") {
-        let body = &req[pos + 4..];
-        if body.is_empty() { return serde_json::json!({}); }
-        return serde_json::from_str(body).unwrap_or_else(|e| {
-            log::warn!("JSON body parse failed: {}", e);
-            serde_json::json!({})
-        });
+/// 统一的错误响应:**所有**状态码都经由同一个构造函数,保证
+/// (1) Content-Type 恒为 `application/json; charset=utf-8`,
+/// (2) 一定带 Content-Length(不允许只发头),
+/// (3) 额外头(如 405 的 `Allow`)也在这里拼装,不另起分支。
+/// 返回写入是否成功,便于调用方在连接已断开时跳过后续处理。
+fn send_error(stream: &mut TcpStream, status: u16, extra_headers: &[(&str, &str)], msg: &str) -> bool {
+    let body = serde_json::json!({"error": msg}).to_string();
+    let mut header = format!("HTTP/1.1 {} {}\r\n", status, reason_phrase(status));
+    header.push_str("Content-Type: application/json; charset=utf-8\r\n");
+    for (name, value) in extra_headers {
+        header.push_str(&format!("{}: {}\r\n", name, value));
     }
-    serde_json::json!({})
+    header.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    stream.write_all(header.as_bytes()).is_ok() && stream.write_all(body.as_bytes()).is_ok()
 }
 
-/// 健壮地读取完整 HTTP 请求:先读到 headers 结束(\r\n\r\n),
-/// 再按 Content-Length 读完整 body。避免单次 read() 截断大 body。
-fn read_full_request(stream: &mut TcpStream) -> Option<String> {    let mut buf = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 8192];
-    // 1. 读到包含 \r\n\r\n (headers 结束)
-    loop {
-        let n = stream.read(&mut tmp).ok()?;
-        if n == 0 { break; }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-        if buf.len() > 50_000_000 { log::warn!("request headers too large"); return None; }
-    }
-    if buf.is_empty() { return None; }
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(buf.len());
-    // 2. 解析 Content-Length,按需补读 body
-    let headers_str = String::from_utf8_lossy(&buf[..header_end]);
-    let content_length = extract_header(&headers_str, "content-length")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let body_have = buf.len() - header_end;
-    let mut body = buf[header_end..].to_vec();
-    if content_length > body_have {
-        let mut remaining = content_length - body_have;
-        while remaining > 0 {
-            let n = stream.read(&mut tmp).ok()?;
-            if n == 0 { break; }
-            let take = n.min(remaining);
-            body.extend_from_slice(&tmp[..take]);
-            remaining -= take;
+/// 既有签名(无额外头)的薄封装:历史调用点语义与输出保持不变。
+fn send_err(stream: &mut TcpStream, status: u16, msg: &str) {
+    send_error(stream, status, &[], msg);
+}
+
+/// 拒绝响应写出后,尽量把对端已送达的字节排空再关闭连接。
+///
+/// Windows 上如果关闭时接收缓冲里仍有未读数据,内核发的是 RST 而不是 FIN,
+/// 对端可能因此丢掉刚写出的错误响应(实测:431 + 40KB 头部时客户端收不到 431)。
+/// 这里用短超时 + 上限排空:既避免 RST,也不给滥用者留下无界读取。
+fn drain_before_close(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut scratch = [0u8; 8 * 1024];
+    let mut drained = 0usize;
+    while drained < 256 * 1024 {
+        match stream.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(n) => drained += n,
+            Err(_) => break,
         }
     }
-    // 3. 重组完整请求字符串(headers + body),供后续 parse_json_body 复用
-    let mut full = headers_str.into_owned();
-    full.push_str(&String::from_utf8_lossy(&body));
-    Some(full)
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
+/// 解析请求正文 JSON(正文已由 read_full_request 按 Content-Length 精确切出)。
+/// 宽松:空正文或解析失败都给空对象(与原行为一致,错误由路由层报)。
+fn parse_json_body(body: &str) -> serde_json::Value {
+    if body.trim().is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::from_str(body).unwrap_or_else(|e| {
+        log::warn!("JSON body parse failed: {}", e);
+        serde_json::json!({})
+    })
+}
+
+/// 已成功解析的请求:头部原文、正文原文、方法、原始目标、路径、查询串。
+struct HttpRequest {
+    header_text: String,
+    body: String,
+    method: String,
+    raw_target: String,
+    path: String,
+    query: String,
+}
+
+/// 协议层拒绝原因。每个 variant 对应一个固定状态码,便于断言与日志。
+#[derive(Debug, PartialEq, Eq)]
+enum Reject {
+    /// 头部超过 MAX_HEADER_BYTES,或单行超过 MAX_REQUEST_LINE_BYTES → 431
+    HeaderTooLarge,
+    /// 声明的或实际的正文超过 MAX_BODY_BYTES → 413
+    BodyTooLarge,
+    /// 请求行/头部畸形(无空格、无路径、非法字节、非 UTF-8 路径、缺 Host 之类的空行) → 400
+    Malformed(&'static str),
+    /// 连接读取超时 → 408
+    Timeout,
+}
+
+impl Reject {
+    fn status(&self) -> u16 {
+        match self {
+            Reject::HeaderTooLarge => 431,
+            Reject::BodyTooLarge => 413,
+            Reject::Malformed(_) => 400,
+            Reject::Timeout => 408,
+        }
+    }
+    fn reason(&self) -> &'static str {
+        match self {
+            Reject::HeaderTooLarge => "header_too_large",
+            Reject::BodyTooLarge => "body_too_large",
+            Reject::Malformed(what) => what,
+            Reject::Timeout => "read_timeout",
+        }
+    }
+    /// 回给客户端的可读消息:不含正文,只描述协议问题。
+    fn message(&self) -> String {
+        match self {
+            Reject::HeaderTooLarge => format!(
+                "request line and headers must not exceed {} bytes",
+                MAX_HEADER_BYTES
+            ),
+            Reject::BodyTooLarge => format!("request body must not exceed {} bytes", MAX_BODY_BYTES),
+            Reject::Malformed(what) => format!("malformed request: {}", what),
+            Reject::Timeout => format!(
+                "request timed out after {}s; send the full request before the deadline",
+                CONNECTION_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// 解析请求行:`METHOD SP request-target SP HTTP/x.y`。
+/// 任何不满足形状的输入都返回 400,绝不对输入做裸切片(消除 `&req[..find(' ')]` 崩溃点)。
+fn parse_request_line(line: &str) -> Result<(String, String, String), Reject> {
+    if line.is_empty() {
+        return Err(Reject::Malformed("empty request line"));
+    }
+    if line.len() > MAX_REQUEST_LINE_BYTES {
+        return Err(Reject::HeaderTooLarge);
+    }
+    let mut parts = line.split(' ');
+    let method = parts
+        .next()
+        .filter(|m| !m.is_empty())
+        .ok_or(Reject::Malformed("missing method"))?;
+    let target = parts
+        .next()
+        .filter(|t| !t.is_empty())
+        .ok_or(Reject::Malformed("missing request target"))?;
+    let version = parts
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or(Reject::Malformed("missing HTTP version"))?;
+    if parts.next().is_some() {
+        return Err(Reject::Malformed("request line has extra fields"));
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(Reject::Malformed("request line is not HTTP/1.0 or HTTP/1.1"));
+    }
+    if !target.starts_with('/') && target != "*" {
+        return Err(Reject::Malformed("request target must be an absolute path"));
+    }
+    // 控制字符(含 CR/LF、NUL)一律拒绝:避免 header/请求行走私与日志注入。
+    if !method.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(Reject::Malformed("method contains non-token bytes"));
+    }
+    if target.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Reject::Malformed("request target contains control bytes"));
+    }
+    Ok((method.to_string(), target.to_string(), version.to_string()))
+}
+
+/// 校验请求头(Content-Length 已在读取阶段限额并校验):每一行必须是 `name: value`。
+/// 注意用 `\r\n` 精确切分:裸 `\n` 行尾在解析阶段已被归一化,这里再遇到说明头块本身畸形。
+fn validate_headers(header_block: &str) -> Result<(), Reject> {
+    for line in header_block.split("\r\n").skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(Reject::Malformed("header continuation line is not allowed"));
+        }
+        let colon = line
+            .find(':')
+            .ok_or(Reject::Malformed("header line has no colon"))?;
+        let name = &line[..colon];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic() && b != b':') {
+            return Err(Reject::Malformed("invalid header name"));
+        }
+    }
+    Ok(())
+}
+
+/// 把已限量的头部原文与正文组装成 `HttpRequest`,顺便做协议层校验。
+fn build_request(header_block: &str, body: &[u8]) -> Result<HttpRequest, Reject> {
+    let request_line = header_block.split("\r\n").next().unwrap_or_default();
+    let (method, raw_target, _version) = parse_request_line(request_line)?;
+    validate_headers(header_block)?;
+    let declared = declared_content_length(header_block)?;
+    if declared > MAX_BODY_BYTES {
+        return Err(Reject::BodyTooLarge);
+    }
+    if body.len() > declared {
+        // 发送的字节多于声明:多余字节可能是下一个请求(HTTP 流水线),协议上不接受。
+        return Err(Reject::Malformed("body exceeds the declared content-length"));
+    }
+    let (path, query) = match raw_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (raw_target.clone(), String::new()),
+    };
+    Ok(HttpRequest {
+        header_text: header_block.to_string(),
+        body: String::from_utf8_lossy(body).into_owned(),
+        method,
+        raw_target,
+        path,
+        query,
+    })
+}
+
+/// 读取完整 HTTP 请求:先按行读到空行(头部结束),再**边读边判**地读正文。
+///
+/// 资源边界:
+/// - 头部/请求行字节数在累计过程中检查,超过 MAX_HEADER_BYTES 立即 431(只多读 1 字节探测);
+/// - 正文声明超过 MAX_BODY_BYTES 立即 413(不读正文);
+/// - 实际读取时每次读取前先检查剩余额度,绝不会把无界数据读进内存;
+/// - 读超时(socket read timeout,15s)→ 408;
+/// - 畸形请求行/头(无空格、无路径、非 UTF-8、无冒号等)→ 400,且不 panic。
+fn read_full_request(stream: &mut TcpStream) -> Result<HttpRequest, Reject> {
+    let mut reader = BufReader::with_capacity(8 * 1024, stream.try_clone().map_err(|_| Reject::Timeout)?);
+    let mut header_bytes: usize = 0;
+    let mut header_text = String::new();
+    loop {
+        let available = MAX_HEADER_BYTES.saturating_sub(header_bytes);
+        // 每次最多读一个限额片段,便于准确判断"是否越界"。
+        let mut limited = (&mut reader).take((available as u64) + 1);
+        let mut line = Vec::new();
+        let read = limited.read_until(b'\n', &mut line);
+        match read {
+            Ok(0) => {
+                if header_text.is_empty() {
+                    return Err(Reject::Malformed("connection closed before any request bytes"));
+                }
+                return Err(Reject::Malformed("connection closed inside the header block"));
+            }
+            Ok(n) => {
+                header_bytes += n;
+                if header_bytes > MAX_HEADER_BYTES {
+                    return Err(Reject::HeaderTooLarge);
+                }
+                let text = String::from_utf8(line)
+                    .map_err(|_| Reject::Malformed("header block is not valid UTF-8"))?;
+                let terminated = text.ends_with('\n');
+                header_text.push_str(text.trim_end_matches(['\r', '\n']));
+                if terminated {
+                    header_text.push_str("\r\n");
+                }
+                if !terminated {
+                    // read_until 只在 EOF 或限额耗尽时返回不带换行的片段。
+                    return Err(if header_bytes > MAX_HEADER_BYTES {
+                        Reject::HeaderTooLarge
+                    } else {
+                        Reject::Malformed("header line is not terminated")
+                    });
+                }
+                if text == "\r\n" || text == "\n" {
+                    break;
+                }
+                if text.trim_end_matches(['\r', '\n']).len() > MAX_REQUEST_LINE_BYTES {
+                    return Err(Reject::HeaderTooLarge);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut => return Err(Reject::Timeout),
+            Err(_) => return Err(Reject::Malformed("header read failed")),
+        }
+    }
+
+    // 头部已完整:先解析/校验 Content-Length,再决定是否读正文。
+    // 声明就超限 → 直接 413,一个正文字节都不读(欺骗请求在此被拦)。
+    let declared = declared_content_length(&header_text)?;
+    if declared > MAX_BODY_BYTES {
+        return Err(Reject::BodyTooLarge);
+    }
+    let mut body = Vec::with_capacity(declared.min(64 * 1024));
+    // 无论声明多少,累计正文永远不超过 MAX_BODY_BYTES(声明与实际不一致时也受此约束)。
+    let cap = declared.min(MAX_BODY_BYTES);
+    while body.len() < declared {
+        let want = (declared - body.len()).min(64 * 1024);
+        let mut chunk = vec![0u8; want];
+        match reader.read(&mut chunk) {
+            Ok(0) => return Err(Reject::Malformed("connection closed before the body was complete")),
+            Ok(n) => {
+                body.extend_from_slice(&chunk[..n]);
+                if body.len() > cap || body.len() > MAX_BODY_BYTES {
+                    return Err(Reject::BodyTooLarge);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut => return Err(Reject::Timeout),
+            Err(_) => return Err(Reject::Malformed("body read failed")),
+        }
+    }
+    build_request(&header_text, &body)
+}
+
+/// 从头部原文里取 Content-Length(缺失 = 0;非数字 = 400)。
+fn declared_content_length(header_text: &str) -> Result<usize, Reject> {
+    match extract_header(header_text, "content-length") {
+        None => Ok(0),
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Reject::Malformed("content-length is not a number")),
+    }
 }
 
 /// 从 headers 文本里取某个 header 值(大小写不敏感)
@@ -701,25 +991,130 @@ fn handle_engine_api(
     false
 }
 
+/// `/api/v1/*` 允许的方法白名单:与 `memory_store::MemoryStore::route` 的实际能力一致。
+/// 这里只做协议层快速拒绝(405 + Allow),不是路由表本身。
+const API_V1_ALLOWED_METHODS: &[&str] = &["GET", "POST"];
+/// 405 响应里 `Allow` 头的取值。
+const API_V1_ALLOW: &str = "GET, POST";
+
+/// 连接并发闸门:超过 MAX_CONCURRENT_CONNECTIONS 时**立即** 503,
+/// 不排队、不阻塞 accept 循环(排队等于变相把资源上限变成延迟上限)。
+struct ConnectionGate;
+
+impl ConnectionGate {
+    /// 尝试占用一个连接名额;超限时返回 None(并在内部完成 503 响应与计数)。
+    fn acquire() -> Option<ConnectionPermit> {
+        let previous = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
+        if previous >= MAX_CONCURRENT_CONNECTIONS {
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(ConnectionPermit { released: false })
+    }
+}
+
+/// RAII 名额:线程 panic 或提前 return 都会归还计数。
+struct ConnectionPermit {
+    released: bool,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        if !self.released {
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+            self.released = true;
+        }
+    }
+}
+
+/// 收下一个连接(或拒收)。返回 None 表示已按资源上限拒绝并写回响应。
+fn admit_connection(mut stream: TcpStream) -> Option<(TcpStream, ConnectionPermit)> {
+    // 超时必须在读取之前设置:15s 无数据 → 读超时 → 408。
+    if stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
+    {
+        log::warn!("failed to configure socket timeouts; connection dropped");
+        return None;
+    }
+    match ConnectionGate::acquire() {
+        Some(permit) => Some((stream, permit)),
+        None => {
+            log_rejection(
+                &REJECTIONS_TOO_MANY_CONNECTIONS,
+                503,
+                "too_many_connections",
+                &format!("active>={}", MAX_CONCURRENT_CONNECTIONS),
+            );
+            let _ = send_error(
+                &mut stream,
+                503,
+                &[("Connection", "close")],
+                &format!(
+                    "too many concurrent connections (limit {})",
+                    MAX_CONCURRENT_CONNECTIONS
+                ),
+            );
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            None
+        }
+    }
+}
+
+/// `/api/v1/*` 的方法白名单检查:不在白名单 → 405 + Allow,且**不执行任何路由**。
+/// 返回 true 表示已响应并应结束该连接的处理。
+fn reject_disallowed_method(stream: &mut TcpStream, method: &str, clean: &str) -> bool {
+    if !clean.starts_with("/api/v1/") || API_V1_ALLOWED_METHODS.contains(&method) {
+        return false;
+    }
+    log_rejection(
+        &REJECTIONS_METHOD_NOT_ALLOWED,
+        405,
+        "method_not_allowed",
+        &format!("{} {}", method, clean),
+    );
+    let _ = send_error(
+        stream,
+        405,
+        &[("Allow", API_V1_ALLOW)],
+        &format!("method {} is not allowed on {}", method, clean),
+    );
+    true
+}
+
 fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: Option<&EngineHandle>) {
+    // 资源上限:头部/正文超限、畸形、超时都在这里统一拒绝并回写 JSON 错误。
     let req = match read_full_request(&mut stream) {
-        Some(r) => r,
-        None => return,
+        Ok(req) => req,
+        Err(reject) => {
+            let counter = match &reject {
+                Reject::HeaderTooLarge => &REJECTIONS_HEADER_TOO_LARGE,
+                Reject::BodyTooLarge => &REJECTIONS_BODY_TOO_LARGE,
+                Reject::Malformed(_) => &REJECTIONS_MALFORMED,
+                Reject::Timeout => &REJECTIONS_TIMEOUT,
+            };
+            log_rejection(counter, reject.status(), reject.reason(), "");
+            let _ = send_error(&mut stream, reject.status(), &[], &reject.message());
+            let _ = stream.flush();
+            // 必须排空再关闭:否则 Windows 会发 RST,把刚写出的 4xx 响应丢掉。
+            drain_before_close(&mut stream);
+            return;
+        }
     };
     // Native-only service: browsers must not mutate the local database via cross-origin forms.
-    if root.is_none() && req.lines().take_while(|line| !line.is_empty())
+    if root.is_none() && req.header_text.lines().take_while(|line| !line.is_empty())
         .any(|line| line.to_ascii_lowercase().starts_with("origin:")) {
         send_err(&mut stream, 403, "browser origins are not accepted by the native service");
         return;
     }
-    let first_line = req.lines().next().unwrap_or("");
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
-    let raw_path = parts.next().unwrap_or("/");
-    let (clean, query) = match raw_path.split_once('?') {
-        Some((c, q)) => (c, q),
-        None => (raw_path, ""),
-    };
+    let method = req.method.as_str();
+    let raw_path = req.raw_target.as_str();
+    let clean = req.path.as_str();
+    let query = req.query.as_str();
+    // L5-02: `/api/v1/*` 只允许 GET/POST;其余方法(favicon.ico、浏览器/脚本探测)一律 405。
+    if reject_disallowed_method(&mut stream, method, clean) {
+        return;
+    }
     if clean == "/api/service" && method == "GET" {
         if let Some(info) = &state.service_info {
             send_json(&mut stream, (**info).clone());
@@ -728,7 +1123,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
     }
     if clean.starts_with("/api/v1/") {
         if let Some(store) = &state.memory_store {
-            match store.lock().unwrap().route(method, clean, parse_json_body(&req)) {
+            match store.lock().unwrap().route(method, clean, parse_json_body(&req.body)) {
                 Ok(value) => send_json(&mut stream, value),
                 Err(error) => send_err(&mut stream, error.0, &error.1),
             }
@@ -745,7 +1140,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
 
     // ── 前端日志上报(诊断用) ──
     if clean == "/api/clientlog" && method == "POST" {
-        let body = parse_json_body(&req);
+        let body = parse_json_body(&req.body);
         let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
         let msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("");
         let src = body.get("src").and_then(|v| v.as_str()).unwrap_or("");
@@ -776,7 +1171,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
         return;
     }
     if clean == "/api/llm/config" && method == "POST" {
-        let body = parse_json_body(&req);
+        let body = parse_json_body(&req.body);
         let api_key = body.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
         let base_url = body.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
         let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -797,7 +1192,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
         return;
     }
     if clean == "/api/agents/connect" && method == "POST" {
-        let body = parse_json_body(&req);
+        let body = parse_json_body(&req.body);
         let agent_id = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
         let exe = body.get("exe").and_then(|v| v.as_str()).unwrap_or("");
         // 如果没传 exe,用当前进程目录下的 mcp_server.exe
@@ -815,7 +1210,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
         return;
     }
     if clean == "/api/agents/disconnect" && method == "POST" {
-        let body = parse_json_body(&req);
+        let body = parse_json_body(&req.body);
         let agent_id = body.get("agent").and_then(|v| v.as_str()).unwrap_or("");
         match crate::agent_connector::disconnect_agent(agent_id) {
             Ok(()) => send_json(&mut stream, serde_json::json!({"ok": true})),
@@ -826,7 +1221,7 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
 
     // ── 引擎 HTTP API(供 MCP server / 外部 agent 调用) ──
     if clean.starts_with("/api/") && eng.is_some() && clean != "/api/model_status" && clean != "/api/start_download" {
-        let body = parse_json_body(&req);
+        let body = parse_json_body(&req.body);
         if handle_engine_api(&mut stream, method, clean, query, body, eng.unwrap()) {
             return;
         }
@@ -989,10 +1384,17 @@ pub fn start_with_engine(root: PathBuf, state: ModelState, engine: Option<Engine
         for conn in listener.incoming() {
             match conn {
                 Ok(s) => {
+                    // 资源上限在接连接时统一执行(超限立即 503,不进入处理线程)。
+                    let Some((stream, permit)) = admit_connection(s) else {
+                        continue;
+                    };
                     let r = root.clone();
                     let st = state.clone();
                     let eng = engine.clone();
-                    std::thread::spawn(move || handle(s, Some(&r), &st, eng.as_ref()));
+                    std::thread::spawn(move || {
+                        let _permit = permit;
+                        handle(stream, Some(&r), &st, eng.as_ref());
+                    });
                 }
                 Err(e) => log::warn!("accept error: {}", e),
             }
@@ -1006,11 +1408,302 @@ pub fn start_with_engine(root: PathBuf, state: ModelState, engine: Option<Engine
 pub fn serve_api(listener: TcpListener, state: ModelState, engine: EngineHandle) -> std::io::Result<()> {
     for connection in listener.incoming() {
         let stream = connection?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+        // 资源上限:超时由 admit_connection 设置,并发超限立即 503 且不排队。
+        let Some((stream, permit)) = admit_connection(stream) else {
+            continue;
+        };
         let state = state.clone();
         let engine = engine.clone();
-        std::thread::spawn(move || handle(stream, None, &state, Some(&engine)));
+        std::thread::spawn(move || {
+            let _permit = permit;
+            handle(stream, None, &state, Some(&engine));
+        });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+    use std::io::Read;
+
+    /// 并发计数是**进程级**静态量:测试必须串行,否则一个测试占满名额会污染其他测试。
+    static TEST_GATE: Mutex<()> = Mutex::new(());
+
+    fn test_gate() -> std::sync::MutexGuard<'static, ()> {
+        TEST_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 起一个线程跑 API-only 监听器;返回端口。线程随测试结束由进程回收。
+    fn spawn_listener() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let state = ModelState::new();
+            let engine = EngineHandle {
+                engine: Arc::new(Mutex::new(
+                    crate::engine::GraphEngine::new(":memory:").expect("in-memory engine"),
+                )),
+            };
+            let _ = serve_api(listener, state, engine);
+        });
+        port
+    }
+
+    fn connect(port: u16) -> TcpStream {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("read timeout");
+        stream
+    }
+
+    /// 读到 headers 结束(或对端关闭),返回头部原文。
+    fn read_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn status_line(head: &str) -> &str {
+        head.split("\r\n").next().unwrap_or("")
+    }
+
+    /// 断言错误响应统一:JSON + charset + 有 Content-Length。
+    fn assert_json_error(head: &str, expected_status: u16) {
+        let status = format!("HTTP/1.1 {}", expected_status);
+        assert!(
+            status_line(head).starts_with(&status),
+            "expected {} but got {:?}",
+            status,
+            status_line(head)
+        );
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-type: application/json; charset=utf-8"),
+            "missing JSON content-type in {:?}",
+            head
+        );
+        assert!(
+            lower.contains("content-length:"),
+            "missing content-length in {:?}",
+            head
+        );
+    }
+
+    #[test]
+    fn oversized_headers_are_rejected_with_431() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        // 头部超过 32 KiB:一个 40 KiB 的自定义头。
+        let filler = "x".repeat(40 * 1024);
+        let request = format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Filler: {}\r\n\r\n", filler);
+        let _ = stream.write_all(request.as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 431);
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_with_413_while_reading() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        // 声明超过 1 MiB 的正文 → 读取阶段立即 413,不需要真的发送正文。
+        let request = format!(
+            "POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let _ = stream.write_all(request.as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 413);
+    }
+
+    #[test]
+    fn lying_content_length_is_rejected_with_413() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        // "谎报":声明巨大但只发几个字节 —— 声明阶段就直接 413,不读正文。
+        let request = "POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 999999999\r\n\r\n{}";
+        let _ = stream.write_all(request.as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 413);
+    }
+
+    /// 声明略超上限(只比 1 MiB 多 1 字节)也必须在读取阶段拒绝,
+    /// 而不是先 read_to_end 再检查。
+    #[test]
+    fn body_one_byte_over_limit_is_rejected_with_413() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let request = format!(
+            "POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let _ = stream.write_all(request.as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 413);
+    }
+
+    /// 不可解析的 Content-Length → 400(不 panic,不按 0 继续处理)。
+    #[test]
+    fn invalid_content_length_header_is_rejected_with_400() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let request = "POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: not-a-number\r\n\r\n{}";
+        let _ = stream.write_all(request.as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 400);
+    }
+
+    /// 头部行没有冒号(畸形 header)→ 400。
+    #[test]
+    fn malformed_header_line_is_rejected_with_400() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let _ = stream.write_all(b"GET /api/health HTTP/1.1\r\nBroken-Header\r\n\r\n");
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 400);
+    }
+
+    #[test]
+    fn disallowed_api_method_returns_405_with_allow_header() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let _ = stream.write_all(b"DELETE /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 405);
+        assert!(
+            head.to_ascii_lowercase().contains("allow: get, post"),
+            "405 must carry Allow header, got {:?}",
+            head
+        );
+    }
+
+    #[test]
+    fn garbage_request_line_returns_400_without_panicking() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        for request in [
+            "GARBAGE-NO-SPACES\r\n\r\n",
+            "GET\r\n\r\n",
+            "GET /ok\r\n\r\n",
+            "GET  HTTP/1.1\r\n\r\n",
+            "GET /x HTTP/2.0\r\n\r\n",
+        ] {
+            let mut stream = connect(port);
+            let _ = stream.write_all(request.as_bytes());
+            let head = read_head(&mut stream);
+            assert_json_error(&head, 400);
+        }
+    }
+
+    /// 并发闸门必须**立即** 503(不排队):先把 64 个名额全部占满(直接占闸门,
+    /// 避免依赖 15s 读超时带来的时序不确定),再走真实套接字验证第 65 条连接。
+    /// 释放一个名额后,同一路径必须立刻恢复 200(证明 503 只是限流,不是拒绝服务)。
+    #[test]
+    fn concurrency_limit_rejects_excess_connections_with_503() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut permits: Vec<ConnectionPermit> = Vec::new();
+        for index in 0..MAX_CONCURRENT_CONNECTIONS {
+            permits.push(
+                ConnectionGate::acquire()
+                    .unwrap_or_else(|| panic!("permit {} of the limit was refused", index)),
+            );
+        }
+        assert_eq!(ACTIVE_CONNECTIONS.load(Ordering::Acquire), MAX_CONCURRENT_CONNECTIONS);
+        // 名额已满:下一条真实连接必须在读取请求之前就被 503 拒绝。
+        let mut refused = connect(port);
+        let _ = refused.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let head = read_head(&mut refused);
+        assert_json_error(&head, 503);
+        drop(refused);
+        // 释放一个名额:服务必须马上恢复,而不是继续拒绝。
+        permits.pop();
+        let mut recovered = connect(port);
+        let _ = recovered.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let head = read_head(&mut recovered);
+        assert!(
+            status_line(&head).starts_with("HTTP/1.1 200"),
+            "service did not recover after a permit was released, got {:?}",
+            head
+        );
+        drop(recovered);
+        drop(permits);
+        for _ in 0..50 {
+            if ACTIVE_CONNECTIONS.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            ACTIVE_CONNECTIONS.load(Ordering::Acquire),
+            0,
+            "connection permits were not released"
+        );
+    }
+
+    #[test]
+    fn request_line_over_limit_returns_431() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let path = format!("/{}", "a".repeat(MAX_REQUEST_LINE_BYTES + 100));
+        let _ = stream.write_all(format!("GET {} HTTP/1.1\r\n\r\n", path).as_bytes());
+        let head = read_head(&mut stream);
+        assert_json_error(&head, 431);
+    }
+
+    /// 正常请求仍然工作:资源上限不能把合法流量挡掉。
+    #[test]
+    fn well_formed_request_still_succeeds() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let _ = stream.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let head = read_head(&mut stream);
+        assert!(
+            status_line(&head).starts_with("HTTP/1.1 200"),
+            "well-formed request must still succeed, got {:?}",
+            head
+        );
+        assert!(head.to_ascii_lowercase().contains("content-type: application/json"));
+    }
+
+    /// 连接建立后 15s 不发完整请求 → 408(真实等待,验证 socket 超时确实生效)。
+    #[test]
+    fn idle_connection_times_out_with_408() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let mut stream = connect(port);
+        let _ = stream.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Incomplete: 1\r\n");
+        let started = std::time::Instant::now();
+        let head = read_head(&mut stream);
+        let elapsed = started.elapsed();
+        assert_json_error(&head, 408);
+        assert!(
+            elapsed >= CONNECTION_TIMEOUT - Duration::from_secs(1),
+            "408 came back after {:?}, before the {}s deadline",
+            elapsed,
+            CONNECTION_TIMEOUT.as_secs()
+        );
+    }
 }
