@@ -19,9 +19,9 @@ description: 沉淀与复用跨会话个人经验及项目记录：检索、写�
 
 - `memory_projects`：列出项目，取得真实项目 ID。
 - `memory_context`：按当前任务取上下文，用于续接。返回按结论优先排列：未解决阻塞、下一步、最近决策在前，其后是当前项目记录与相关个人经验；`text` 字段可直接阅读。
-- `memory_search`：关键词检索，支持 scope、date_field、from/to、kind 与 limit/offset 分页。query 按空白切分词条并全部匹配；中文长句按字符 bigram 兜底，可用自然问句检索。结果按相关度（标题权重更高）排序，每条带 `score`，响应带 `ranked: true`。
+- `memory_search`：关键词检索，支持 scope、date_field、from/to、kind 与 limit/offset 分页。query 按空白切分词条并全部匹配；中文长句按字符 bigram 兜底，可用自然问句检索。结果按相关度（标题权重更高）排序，每条带 `score`，响应带 `ranked: true`。默认排除已撤回记录（另有 `retracted_excluded` 计数）；仅当明确要复核历史时传 `include_retracted=true`。
 - `memory_write`：写入记录；个人经验用 `memory_scope=personal` 且不填 project_id，项目进展用 `memory_scope=project` 并填写 project_id。可用 `evidence_type` 标注依据（默认 `user_or_agent_statement`）。
-- `memory_update`：用 id 与读取时的 expected_version 纠正已有记录；可同时修正 `evidence_type`。
+- `memory_update`：用 id 与读取时的 expected_version 纠正已有记录；可同时修正 `evidence_type`。传 `retract=true` 撤回被证伪的记录、`restore=true` 恢复（两者互斥）；撤回与恢复都会产生新版本并保留历史，不是删除。
 
 ### 记录类型与依据
 
@@ -35,6 +35,7 @@ description: 沉淀与复用跨会话个人经验及项目记录：检索、写�
 - 保留 source 与 conditions，不把单个案例升格为普遍规律。
 - 一次创建使用稳定 event_id；失败重试复用原 ID 与相同请求；收到超时不等于未写入。
 - 纠正冲突时重新读取、比较差异，不盲目覆盖。
+- 结论被证伪时用 `retract` 撤回而不是改写正文：撤回保留历史、默认检索不再返回，需要时可 `restore`。撤回要填真实原因。
 - 不写入密钥、凭证或与任务无关的私人信息。检索结果为陈述时，不声称已验证。
 
 ## 失败与不可用

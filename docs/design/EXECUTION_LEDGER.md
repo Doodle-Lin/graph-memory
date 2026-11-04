@@ -168,3 +168,24 @@ lead 最终验收（本轮）：
 - 独立复验缺陷修复：evidence_type v1→v2 后 export/restore/verify 均 exit 0，计数一致。
 
 边界与未完成：本批不是语义检索（无向量）；未被 Agent 显式要求时不会自动写入；恢复不是合并、无冲突预览；桌面无导出/恢复入口；软删除/撤回、occurred_at、真实宿主全链路矩阵仍属 L2/L3/L5。文档已同步：README、desktop/README、SKILL、AGENT_INSTRUCTIONS、docs/BACKUP。本批产物为 `artifacts/desktop-p0`，未替换用户正在运行的 `artifacts/desktop`。未提交、未推送。
+
+P0 后续：本批 13 个文件已提交为 5 个本地提交 `4f6f882`(引擎) / `9d4ea21`(恢复+格式修复) / `412767e`(桌面) / `814d3a8`(契约与验收脚本) / `13b9525`(文档)，分支 `codex/avalonia-mcp-memory`，**未推送**。
+
+## P1 数据生命周期批次（2026-11-04，团队并行，基线 13b9525）
+
+触发：P0 之后下一步是让"错误结论可撤回、可恢复"，即 L2-04。契约：[DATA_LIFECYCLE_P1.md](DATA_LIFECYCLE_P1.md)（唯一来源）。分工与 P0 相同：rust-core（P1-A + agent/call 转发）、data-restore（P1-B 备份兼容）、desktop-ux（P1-C 桌面入口）、verifier2（P1-D 独立验收）、lead（契约、集成、最终验收）。
+
+| 项 | 内容 | 结果 |
+|---|---|---|
+| P1-A | `retract`/`restore` 端点、`retracted_at`/`retract_reason`、search 默认排除 + `include_retracted`/`retracted_excluded`、context 始终排除并在 text 追加「已排除 N 条撤回记录」 | 45 项 Rust 全绿；真实 stdio 端到端：v1→v2 撤回、默认 0 命中、`include_retracted` 命中、v3 恢复、互斥 400、409 无新版本 |
+| P1-A2 | `/api/v1/agent/call` 完成 `memory_update` 的 `retract`/`restore` 转发（MCP 仍五工具） | schema + 转发均实测；互斥/非布尔 400 不写版本 |
+| P1-B | 撤回字段视为可变修订字段、随 body 原样往返 | 45+3 项；含 4 个撤回状态的库 export→verify→restore 计数与历史一致、再导出 `payload_sha256` 相同；旧包仍可解码 |
+| P1-C | 列表默认隐藏已撤回 + 「显示已撤回」开关 + 原因摘要；编辑器「撤回这条 / 恢复这条」；409 保留草稿 | Setup 102、Editor **73→86**（追加 13 项，0 删除） |
+| P1-D | 独立验收 `scripts/verify-usability.ps1`（新增 P1-01..P1-09） | **51 PASS / 0 FAIL / 0 SKIP**；证据 `artifacts/usability-verify/run-20261104-151219/`（report.json/txt、ACCEPTANCE.md、逐断言 argv + 原始 stdout/stderr、sqlite 只读核对） |
+
+独立验收过程中 verifier 首轮报 6 个 FAIL，lead 逐条用真实服务 + 真实 stdio 复现后判定**全部是验收脚本/宿主问题、产品无缺陷**：`P1HeadTitle` 未在 `[pscustomobject]` 声明导致连带崩溃；P1-02 把 `total` 与 `retracted_excluded` 混用（正确期望是排除后 `project_total=0`、`excluded=1`）；旧库夹具缺 v1 创建事件（既有校验 `missing creation event`）；PowerShell 5.1 按 GBK 解析无 BOM 脚本 + stdin 编码导致中文 JSON 损坏。lead 独立日志：`artifacts/usability-verify/lead-p1-mcp-check.log`。
+
+lead 最终验收（本轮，独立重跑 verifier 脚本）：`scripts/verify-usability.ps1 -Full` → exit 0、51 PASS / 0 FAIL，证据 `run-20261104-152041`；`tests/test_headless_service.py` 由 lead 追加撤回/恢复断言（21 行）后通过；自包含发布 `artifacts/desktop-p1` + 全新临时目录 smoke exit 0。
+P1 提交：`dd570b6`(契约) / `9b24f36`(引擎) / `15b42e7`(备份) / `c4682e5`(桌面)，均本地未推送。
+
+边界与未完成（P1）：撤回是状态标记而非物理删除，没有批量撤回、撤回审批、撤回原因强制或撤回统计；`retracted_at` 不做严格 RFC3339 校验（与既有宽松 serde 策略一致）；旧库兼容只覆盖"无撤回字段的 body"，不含历史遗留 schema；桌面恢复/导出入口、occurred_at 事件时间、真实宿主全链路矩阵仍属 L2-05/L3/L5。`artifacts/desktop-p1` 未替换用户正在运行的 `artifacts/desktop`。

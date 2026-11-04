@@ -28,11 +28,11 @@
 | `memory_context` | 任务开始或跨会话续接时获取上下文 |
 | `memory_search` | 关键词检索；支持 scope、时间区间、kind 与分页 |
 | `memory_write` | 写入个人经验或项目记录 |
-| `memory_update` | 按 id 与 expected_version 纠正已有记忆 |
+| `memory_update` | 按 id 与 expected_version 纠正已有记忆；`retract=true` 撤回、`restore=true` 恢复（都产生新版本，不删除记录） |
 
-日常踩坑和跨项目方法用 `memory_scope=personal`（不填 project_id）；项目进展、决策、阻塞用 `memory_scope=project` 并填写真实 project_id。阻塞、下一步、决策请如实标注 `kind`：`memory_context` 会把它们归入"未解决阻塞 / 下一步 / 最近决策"优先展示。依据用可选 `evidence_type` 标注（`user_or_agent_statement` 陈述默认、`user_confirmed`、`tool_result`、`inference`），缺少依据就保持陈述。`memory_search` 支持中文自然问句（按词条 + 字符 bigram 匹配）并按相关度排序，每条返回 `score`。
+日常踩坑和跨项目方法用 `memory_scope=personal`（不填 project_id）；项目进展、决策、阻塞用 `memory_scope=project` 并填写真实 project_id。阻塞、下一步、决策请如实标注 `kind`：`memory_context` 会把它们归入"未解决阻塞 / 下一步 / 最近决策"优先展示。依据用可选 `evidence_type` 标注（`user_or_agent_statement` 陈述默认、`user_confirmed`、`tool_result`、`inference`），缺少依据就保持陈述。`memory_search` 支持中文自然问句（按词条 + 字符 bigram 匹配）并按相关度排序，每条返回 `score`；默认隐藏已撤回记录（响应另有 `retracted_excluded` 计数），复核历史时才传 `include_retracted=true`。结论被证伪时用 `memory_update` 的 `retract=true` 撤回而不是改写正文：撤回保留全部版本、默认检索不再返回，需要时可 `restore=true` 恢复，并应填写真实原因。
 
-桌面端打开即自动加载最近记忆，不再需要先点"刷新记忆"；记录与编辑页显示依据标签，空库给出接入/记录引导。
+桌面端打开即自动加载最近记忆，不再需要先点"刷新记忆"；记录与编辑页显示依据标签，空库给出接入/记录引导；列表默认隐藏已撤回记录，勾选"显示已撤回"可查看原因摘要，编辑器提供"撤回这条 / 恢复这条"。
 
 ## 桌面端与 Agent 接入
 
@@ -54,7 +54,7 @@
 
 ## 边界
 
-这是可运行开发版，尚未完整发布：检索为词条 + 中文 bigram 匹配而非语义向量；依据可标注但仍需人工判断，不自动标记为已验证；旧数据迁移、软删除/恢复、桌面导出/恢复入口、完整证据生命周期与完整鉴权尚未完成。工作库已支持一致性备份、校验与**恢复到空目录**的 CLI（见[备份文档](docs/BACKUP.md)），恢复不是合并、也不会覆盖现有工作库。服务只监听本机并拒绝浏览器 Origin 请求，但本机其他进程仍属信任边界，调用统计不构成安全审计。工具失败时如实说明；成功读取也不等于本次任务已验证成功。
+这是可运行开发版，尚未完整发布：检索为词条 + 中文 bigram 匹配而非语义向量；依据可标注但仍需人工判断，不自动标记为已验证；旧数据迁移、桌面导出/恢复入口、批量撤回与撤回审批、完整证据生命周期与完整鉴权尚未完成。工作库已支持一致性备份、校验与**恢复到空目录**的 CLI（见[备份文档](docs/BACKUP.md)），恢复不是合并、也不会覆盖现有工作库。记录支持软撤回（`retract`/`restore`，产生新版本、不物理删除）。服务只监听本机并拒绝浏览器 Origin 请求，但本机其他进程仍属信任边界，调用统计不构成安全审计。工具失败时如实说明；成功读取也不等于本次任务已验证成功。
 
 ## License
 

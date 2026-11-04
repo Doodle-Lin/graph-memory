@@ -8,7 +8,7 @@
 - 依据用 evidence_type 标注：user_or_agent_statement（陈述，默认）、user_confirmed（用户确认）、tool_result（工具/命令/测试的真实输出）、inference（推断）。缺少依据时保持陈述，不要凭印象升级。
 - 日常踩坑和跨项目方法用 memory_scope=personal，不填 project_id；项目进展用 memory_scope=project 并填写 project_id。保留 source 和 conditions，不把单个案例升格为普遍规律。
 - 为一次创建生成稳定 event_id，失败重试必须复用原 ID 和相同请求。收到超时不能断言没有写入。
-- 纠正已有记忆使用 memory_update 的 id 和读取时 expected_version；冲突时重新读取、比较差异，不盲目覆盖。
+- 纠正已有记忆使用 memory_update 的 id 和读取时 expected_version；冲突时重新读取、比较差异，不盲目覆盖。结论被证伪时用 memory_update 的 retract=true 撤回（可 restore=true 恢复），撤回/恢复都产生新版本、保留历史且默认检索不再返回，应填真实 reason。
 - 返回依据是陈述时，不声称已经过工具验证。不要写入密钥、凭证或与任务无关的私人信息。
 - 工具失败时如实说明；成功读取也不等于本次任务已验证成功。
 
