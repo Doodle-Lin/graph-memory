@@ -89,13 +89,16 @@ pub(super) fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
             row.memory_id == body.id && row.version == body.version,
             "revision index differs from body",
         )?;
+        // Identity fields are immutable across revisions: scope, project
+        // ownership, creation time and the original-case reference. Everything
+        // else in the body (content, title, kind, source, conditions,
+        // updated_at and, since P0-A3, evidence_type) may change per version.
         check(
             body.version <= current.version
                 && body.memory_scope == current.memory_scope
                 && body.project_id == current.project_id
                 && body.origin_memory_id == current.origin_memory_id
-                && body.created_at == current.created_at
-                && body.evidence_type == current.evidence_type,
+                && body.created_at == current.created_at,
             "revision immutable fields differ",
         )?;
         check(

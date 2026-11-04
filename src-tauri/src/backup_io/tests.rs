@@ -17,9 +17,12 @@ impl Fixture {
         self.0.join("中文 backup.gmbackup")
     }
     fn no_staging(&self) -> bool {
-        fs::read_dir(&self.0)
-            .unwrap()
-            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
+        // No `.graph-memory-*.tmp` export staging file and no
+        // `.graph-memory-restore-*` restore staging directory may survive.
+        fs::read_dir(&self.0).unwrap().all(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().into_owned();
+            !name.starts_with(".graph-memory")
+        })
     }
 }
 impl Drop for Fixture {
@@ -216,4 +219,154 @@ fn verify_rejects_damage_and_does_not_change_input() {
     }
     assert_eq!(fs::read(fixture.output()).unwrap(), original);
     assert!(verify_file(&fixture.0).is_err());
+}
+
+/// A fresh empty directory beside the fixture workspace, uniquely named so
+/// repeated calls in one test do not collide.
+fn empty_target(fixture: &Fixture) -> PathBuf {
+    let target = fixture
+        .0
+        .join(format!("restored-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&target).unwrap();
+    target
+}
+
+fn entries(path: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn seed_workspace(fixture: &Fixture) -> Counts {
+    let mut writer = MemoryStore::open(&fixture.db()).unwrap();
+    let project = writer
+        .route(
+            "POST",
+            "/api/v1/projects",
+            json!({"name":"恢复测试项目","directory":"C:\\workspace\\restore"}),
+        )
+        .unwrap();
+    create(&mut writer, "first");
+    let second = create(&mut writer, "second");
+    writer
+        .route(
+            "POST",
+            "/api/v1/memories/update",
+            json!({"id":second["memory"]["id"],"expected_version":1,"content":"第二版内容"}),
+        )
+        .unwrap();
+    writer
+        .route(
+            "POST",
+            "/api/v1/memories",
+            json!({"memory_scope":"project","project_id":project["id"],"event_id":"project-memory",
+                "content":"项目范围内容"}),
+        )
+        .unwrap();
+    export_workspace(&fixture.0, &fixture.output()).unwrap()
+}
+
+#[test]
+fn restore_roundtrip_preserves_counts_and_opens_as_store() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    assert_eq!((exported.projects, exported.memories), (1, 3));
+    let target = empty_target(&fixture);
+
+    assert_eq!(
+        restore_workspace(&fixture.output(), &target, false).unwrap(),
+        exported
+    );
+
+    // Exactly one published database, no staging leftovers.
+    assert_eq!(entries(&target), vec!["work-memory.db".to_string()]);
+    assert!(fixture.no_staging());
+
+    // The logical snapshot of the restored file equals the exported one.
+    let restored = target.join("work-memory.db");
+    let snapshot = snapshot::read_snapshot(&restored).unwrap();
+    assert_eq!(counts(&snapshot), exported);
+    assert_eq!(snapshot.projects.len(), 1);
+    assert_eq!(snapshot.memories.len(), 3);
+    assert_eq!(snapshot.revisions.len(), 4);
+    assert_eq!(snapshot.events.len(), 3);
+
+    // And a real `MemoryStore` can open and query it.
+    let mut reader = MemoryStore::open(&restored).unwrap();
+    let listed = reader
+        .route("POST", "/api/v1/search", json!({"scope":"all"}))
+        .unwrap();
+    assert_eq!(listed["total"], exported.memories);
+}
+
+#[test]
+fn restore_refuses_non_empty_target_and_never_touches_it() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    let target = empty_target(&fixture);
+    let occupied = target.join("work-memory.db");
+    fs::write(&occupied, b"existing workspace").unwrap();
+
+    let error = restore_workspace(&fixture.output(), &target, false).unwrap_err();
+    assert_eq!(error, "restore requires an empty target directory");
+    assert_eq!(fs::read(&occupied).unwrap(), b"existing workspace");
+    assert_eq!(entries(&target), vec!["work-memory.db".to_string()]);
+    assert_eq!(
+        verify_file(&fixture.output()).unwrap(),
+        exported,
+        "rejected restore must not modify the backup"
+    );
+
+    // An absent target directory is an error and is not created.
+    let absent = fixture.0.join("absent-target");
+    assert!(restore_workspace(&fixture.output(), &absent, false).is_err());
+    assert!(!absent.exists());
+
+    // A plain file instead of a directory is rejected as well.
+    let file_target = fixture.0.join("not-a-dir");
+    fs::write(&file_target, b"x").unwrap();
+    assert!(restore_workspace(&fixture.output(), &file_target, false).is_err());
+    assert_eq!(fs::read(&file_target).unwrap(), b"x");
+}
+
+#[test]
+fn restore_dry_run_reports_counts_without_writing_files() {
+    let fixture = Fixture::new();
+    let exported = seed_workspace(&fixture);
+    let target = empty_target(&fixture);
+
+    assert_eq!(
+        restore_workspace(&fixture.output(), &target, true).unwrap(),
+        exported
+    );
+    assert!(entries(&target).is_empty());
+    // Dry-run must not even stage anything beside the target.
+    assert!(fixture.no_staging());
+    assert!(!target.join("work-memory.db").exists());
+}
+
+#[test]
+fn restore_rejects_damaged_backup_and_leaves_target_empty() {
+    let fixture = Fixture::new();
+    seed_workspace(&fixture);
+    let original = fs::read(fixture.output()).unwrap();
+    let mut corrupt: Value = serde_json::from_slice(&original).unwrap();
+    corrupt["manifest"]["payload_sha256"] = json!("0".repeat(64));
+
+    for bytes in [
+        original[..original.len() / 2].to_vec(),
+        serde_json::to_vec(&corrupt).unwrap(),
+        b"not a backup at all".to_vec(),
+    ] {
+        let target = empty_target(&fixture);
+        let bad = fixture.0.join(format!("bad-{}.gmbackup", uuid::Uuid::new_v4()));
+        fs::write(&bad, &bytes).unwrap();
+        assert!(restore_workspace(&bad, &target, false).is_err());
+        assert!(entries(&target).is_empty(), "damaged backup wrote files");
+        assert_eq!(fs::read(&bad).unwrap(), bytes);
+    }
+    assert!(fixture.no_staging());
 }

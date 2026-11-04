@@ -2,11 +2,12 @@ use graph_memory_lib::{backup_format::FORMAT_VERSION, backup_io};
 use serde_json::json;
 use std::path::PathBuf;
 
-const USAGE: &str = "graph-memory-backup export --data-dir DIR --output NEW_FILE.gmbackup\ngraph-memory-backup verify FILE.gmbackup\nNo default data directory. Export never overwrites a file. Restore is not implemented.";
+const USAGE: &str = "graph-memory-backup export --data-dir DIR --output NEW_FILE.gmbackup\ngraph-memory-backup verify FILE.gmbackup\ngraph-memory-backup restore --input FILE.gmbackup --data-dir EMPTY_DIR [--dry-run]\nNo default data directory. Export never overwrites a file. Restore requires an empty target directory.";
 
 enum Command {
     Export(PathBuf, PathBuf),
     Verify(PathBuf),
+    Restore(PathBuf, PathBuf, bool),
     Help,
 }
 
@@ -43,7 +44,35 @@ fn parse() -> Result<Command, String> {
                 output.ok_or("--output is required")?,
             ))
         }
-        _ => Err("expected export, verify or --help".into()),
+        Some("restore") => {
+            let (mut input, mut data, mut dry_run) = (None, None, false);
+            while let Some(arg) = args.next() {
+                match arg.to_str() {
+                    Some("--dry-run") if !dry_run => dry_run = true,
+                    Some("--input") if input.is_none() => {
+                        input = Some(PathBuf::from(
+                            args.next()
+                                .filter(|p| !p.is_empty())
+                                .ok_or("restore option needs a path")?,
+                        ));
+                    }
+                    Some("--data-dir") if data.is_none() => {
+                        data = Some(PathBuf::from(
+                            args.next()
+                                .filter(|p| !p.is_empty())
+                                .ok_or("restore option needs a path")?,
+                        ));
+                    }
+                    _ => return Err("unknown or duplicate restore option".into()),
+                }
+            }
+            Ok(Command::Restore(
+                input.ok_or("--input is required")?,
+                data.ok_or("--data-dir is required")?,
+                dry_run,
+            ))
+        }
+        _ => Err("expected export, verify, restore or --help".into()),
     }
 }
 
@@ -55,19 +84,31 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (operation, result) = match command {
+    let (operation, dry_run, result) = match command {
         Command::Help => {
             println!("{USAGE}");
             return;
         }
-        Command::Export(data, output) => ("export", backup_io::export_workspace(&data, &output)),
-        Command::Verify(path) => ("verify", backup_io::verify_file(&path)),
+        Command::Export(data, output) => ("export", None, backup_io::export_workspace(&data, &output)),
+        Command::Verify(path) => ("verify", None, backup_io::verify_file(&path)),
+        Command::Restore(input, data, dry_run) => (
+            "restore",
+            Some(dry_run),
+            backup_io::restore_workspace(&input, &data, dry_run),
+        ),
     };
     match result {
-        Ok(counts) => println!(
-            "{}",
-            json!({"status":"ok", "operation":operation, "format_version":FORMAT_VERSION,"counts":counts})
-        ),
+        Ok(counts) => match dry_run {
+            Some(dry_run) => println!(
+                "{}",
+                json!({"status":"ok", "operation":operation, "format_version":FORMAT_VERSION,
+                    "counts":counts, "dry_run":dry_run})
+            ),
+            None => println!(
+                "{}",
+                json!({"status":"ok", "operation":operation, "format_version":FORMAT_VERSION,"counts":counts})
+            ),
+        },
         Err(error) => {
             eprintln!("{operation} failed: {error}");
             std::process::exit(1);

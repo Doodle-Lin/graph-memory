@@ -356,6 +356,123 @@ fn preserves_additional_body_fields_and_raw_json_spacing() {
 }
 
 #[test]
+fn revision_allows_evidence_type_change_but_rejects_identity_change() {
+    let original = sample("依据可变合成样本");
+    let personal = original
+        .memories
+        .iter()
+        .find(|m| m.memory_scope == "personal")
+        .unwrap();
+    let current: Value = serde_json::from_str(&personal.body).unwrap();
+    assert_eq!(current["evidence_type"], "user_or_agent_statement");
+
+    // A revision may carry a different evidence_type than the current record.
+    let mut varied = original.clone();
+    let revision = varied
+        .revisions
+        .iter_mut()
+        .find(|r| r.version == 2)
+        .unwrap();
+    let mut body: Value = serde_json::from_str(&revision.body).unwrap();
+    body["evidence_type"] = json!("tool_result");
+    revision.body = body.to_string();
+
+    let decoded = decode(&encode(varied.clone(), DATE).unwrap()).unwrap();
+    let replayed: Value = serde_json::from_str(
+        &decoded
+            .revisions
+            .iter()
+            .find(|r| r.version == 2)
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(replayed["evidence_type"], "tool_result");
+    assert_eq!(replayed["created_at"], current["created_at"]);
+    assert_eq!(decoded.revisions.len(), 4);
+    assert!(decode(&unchecked(varied.clone())).is_ok());
+
+    // Identity fields stay immutable: scope and creation time may not drift.
+    for (key, value) in [
+        ("created_at", json!("2020-01-01T00:00:00+08:00")),
+        ("memory_scope", json!("project")),
+    ] {
+        let mut bad = varied.clone();
+        let revision = bad.revisions.iter_mut().find(|r| r.version == 2).unwrap();
+        let mut body: Value = serde_json::from_str(&revision.body).unwrap();
+        body[key] = value;
+        revision.body = body.to_string();
+        assert!(
+            encode(bad.clone(), DATE).is_err(),
+            "encoder accepted a mutated {key} in a revision"
+        );
+        assert!(
+            decode(&unchecked(bad)).is_err(),
+            "decoder trusted a recomputed checksum with a mutated {key}"
+        );
+    }
+}
+
+#[test]
+fn store_export_after_evidence_type_change_round_trips() {
+    let fixture = Fixture(
+        std::env::temp_dir().join(format!("gm-format-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&fixture.0).unwrap();
+    let path = fixture.0.join("work-memory.db");
+    let output = fixture.0.join("evidence-change.gmbackup");
+
+    let mut store = MemoryStore::open(&path).unwrap();
+    let created = store
+        .route(
+            "POST",
+            "/api/v1/memories",
+            json!({"memory_scope":"personal","event_id":"evidence-change","content":"v1 陈述"}),
+        )
+        .unwrap();
+    let id = created["memory"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["memory"]["evidence_type"], "user_or_agent_statement");
+    let updated = store
+        .route(
+            "POST",
+            "/api/v1/memories/update",
+            json!({"id":id,"expected_version":1,"content":"v2 工具结果","evidence_type":"tool_result"}),
+        )
+        .unwrap();
+    assert_eq!(updated["memory"]["evidence_type"], "tool_result");
+    drop(store);
+
+    // This is the exact operation that used to fail with
+    // "export failed: revision immutable fields differ".
+    let counts = crate::backup_io::export_workspace(&fixture.0, &output).unwrap();
+    assert_eq!(
+        (counts.projects, counts.memories, counts.revisions, counts.events),
+        (0, 1, 2, 1)
+    );
+    assert_eq!(crate::backup_io::verify_file(&output).unwrap(), counts);
+
+    let decoded = decode(&std::fs::read(&output).unwrap()).unwrap();
+    let revision = |version: u64| -> Value {
+        serde_json::from_str(
+            &decoded
+                .revisions
+                .iter()
+                .find(|r| r.version == version)
+                .unwrap()
+                .body,
+        )
+        .unwrap()
+    };
+    let first = revision(1);
+    let second = revision(2);
+    assert_eq!(first["evidence_type"], "user_or_agent_statement");
+    assert_eq!(second["evidence_type"], "tool_result");
+    assert_eq!(first["created_at"], second["created_at"]);
+    assert_eq!(first["content"], "v1 陈述");
+    assert_eq!(second["content"], "v2 工具结果");
+}
+
+#[test]
 fn rejects_unsorted_payload_and_oversize_input() {
     let mut payload = decode(&encode(sample("排序合成样本"), DATE).unwrap()).unwrap();
     payload.projects.reverse();
