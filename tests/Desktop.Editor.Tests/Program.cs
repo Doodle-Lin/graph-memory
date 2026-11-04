@@ -133,6 +133,30 @@ try {
     Check(!closed&&Control<TextBox>("ContentInput").Text=="network-failure-draft","network failure lost window/draft");
     window.Close();Click("CancelCloseClick");Check(!closed&&!PromptVisible(),"cancel after failure did not return to editing");
     window.Close();Click("DiscardAndCloseClick");Check(closed,"discard after network failure did not close");
+
+    // P1 软撤回 / 恢复：走既有控件与版本冲突流程，撤回不是删除。
+    OpenWindow();
+    var p1Id=Post("api/v1/memories",new{memory_scope="personal",event_id=Guid.NewGuid().ToString(),title="P1 retract",content="P1 retract body",kind="decision"})["memory"]!["id"]!.GetValue<string>();
+    Complete((Task)Invoke("LoadMemories")!);
+    Invoke("ApplyMemory",new MemoryItem(Post("api/v1/search",new{scope="all"})["memories"]!.AsArray().Single(x=>x!["id"]!.GetValue<string>()==p1Id)!.DeepClone()));
+    Check(Control<Button>("RetractButton").IsVisible,"retract action missing on a live record");
+    Check(!Control<Button>("RestoreButton").IsVisible,"restore action shown on a live record");
+    Control<TextBox>("RetractReasonInput").Text="P1 用例撤回";Click("RetractClick");
+    Check(Post("api/v1/search",new{query="P1 retract",scope="all"})["total"]!.GetValue<int>()==0,"retracted record still in the default search");
+    Check(Control<ListBox>("Memories").ItemsSource!.Cast<MemoryItem>().All(x=>x.Id!=p1Id),"retracted record still in the default list");
+    Check(Control<TextBlock>("RetractedBanner").IsVisible,"retracted banner missing");
+    Check(Control<Button>("RestoreButton").IsVisible&&!Control<Button>("RetractButton").IsVisible,"editor actions not switched after retract");
+    var p1Marked=Post("api/v1/search",new{query="P1 retract",scope="all",include_retracted=true})["memories"]!.AsArray().Single()!;
+    Check(p1Marked["retracted_at"]!=null&&p1Marked["retracted_at"]!.GetValue<string>().Length>0,"retracted_at not written");
+    Check(p1Marked["retract_reason"]!.GetValue<string>()=="P1 用例撤回","retract_reason not written");
+    Check(p1Marked["version"]!.GetValue<int>()==2,"retract did not produce version 2");
+    Control<CheckBox>("IncludeRetractedToggle").IsChecked=true;Click("IncludeRetractedClick");
+    Check(Control<ListBox>("Memories").ItemsSource!.Cast<MemoryItem>().Single(x=>x.Id==p1Id).IsRetracted,"include_retracted list item not marked retracted");
+    Click("RestoreClick");
+    Check(Post("api/v1/search",new{query="P1 retract",scope="all"})["total"]!.GetValue<int>()==1,"restored record not searchable again");
+    Check(Post("api/v1/search",new{scope="all",include_retracted=true})["memories"]!.AsArray().Single(x=>x!["id"]!.GetValue<string>()==p1Id)!["retracted_at"]==null,"restore did not clear retracted_at");
+    Check(Post("api/v1/memories/history",new{id=p1Id})["history"]!.AsArray().Count==3,"retract/restore history must keep all 3 versions");
+
     Console.WriteLine($"PASS {checks} editor checks using real XAML controls + isolated HTTP service");
 } finally {
     window?.Close();host.StopOwned();

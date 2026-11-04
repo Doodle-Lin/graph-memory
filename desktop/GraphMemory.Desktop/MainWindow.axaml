@@ -13,11 +13,13 @@
   <Grid Grid.Column="1" RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="26,22">
    <StackPanel Spacing="6"><TextBlock x:Name="ScopeTitle" Text="个人经验" FontSize="26" Foreground="{DynamicResource InkBrush}"/><TextBlock x:Name="ScopeHint" Text="踩过的坑、学到的方法，不必属于某个项目。" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/></StackPanel>
    <Border Grid.Row="1" Background="{DynamicResource SurfaceBrush}" CornerRadius="8" Padding="16" Margin="0,18,0,0"><Grid ColumnDefinitions="*,Auto"><StackPanel Spacing="6"><TextBlock x:Name="AgentStatus" Text="正在检查记忆服务…" FontWeight="SemiBold"/><TextBlock x:Name="AgentDetail" Text="Agent 负责检索与记录，这里查看和纠正记忆。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel><Button Grid.Column="1" Content="接入 Agent" Click="AgentSetupClick" Classes="primary" Margin="16,0,0,0" VerticalAlignment="Center"/></Grid></Border>
-   <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,22,0,18">
+   <Grid Grid.Row="2" RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto,Auto,Auto,Auto" Margin="0,22,0,18">
     <TextBox x:Name="Query" Watermark="搜索记忆"/>
     <Button Grid.Column="1" Content="搜索" Click="SearchClick" Margin="8,0,0,0"/>
     <Button x:Name="NewMemoryButton" Grid.Column="2" Content="记一条" Click="NewClick" Margin="8,0,0,0"/>
     <Button Grid.Column="3" Content="刷新记忆" Click="RefreshClick" Margin="8,0,0,0"/>
+    <CheckBox x:Name="IncludeRetractedToggle" Grid.Column="4" Content="显示已撤回" Click="IncludeRetractedClick" Margin="14,0,0,0" VerticalAlignment="Center"/>
+    <TextBlock x:Name="RetractedBanner" Grid.Row="1" Grid.ColumnSpan="5" IsVisible="False" TextWrapping="Wrap" FontSize="12" Foreground="{DynamicResource MutedBrush}" Margin="0,6,0,0"/>
    </Grid>
    <Grid Grid.Row="3">
     <Grid x:Name="HomePanel" RowDefinitions="Auto,Auto,Auto,*">
@@ -36,7 +38,7 @@
      <TextBlock Grid.Row="2" x:Name="ListHeading" Text="最近记忆" FontSize="18" Margin="0,0,0,14"/>
      <Grid Grid.Row="3">
       <ListBox x:Name="Memories" SelectionChanged="MemoryChanged" Background="Transparent">
-       <ListBox.ItemTemplate><DataTemplate><StackPanel Spacing="8" Margin="0,8"><TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"/><TextBlock Text="{Binding Preview}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/><StackPanel Orientation="Horizontal" Spacing="12"><TextBlock Text="{Binding ScopeLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/><TextBlock Text="{Binding EvidenceLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel></StackPanel></DataTemplate></ListBox.ItemTemplate>
+       <ListBox.ItemTemplate><DataTemplate><StackPanel Spacing="8" Margin="0,8"><TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextWrapping="Wrap"/><TextBlock Text="{Binding Preview}" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding RetractSummary}" IsVisible="{Binding IsRetracted}" Foreground="#B4553B" FontSize="12" TextWrapping="Wrap"/><StackPanel Orientation="Horizontal" Spacing="12"><TextBlock Text="{Binding ScopeLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/><TextBlock Text="{Binding EvidenceLabel}" Foreground="{DynamicResource MutedBrush}" FontSize="12"/></StackPanel></StackPanel></DataTemplate></ListBox.ItemTemplate>
       </ListBox>
       <Border x:Name="ListStatusPanel" IsVisible="False" Background="{DynamicResource SurfaceBrush}" CornerRadius="8" Padding="18" VerticalAlignment="Top"><TextBlock x:Name="ListStatus" TextWrapping="Wrap"/></Border>
       <StackPanel x:Name="EmptyState" IsVisible="False" Spacing="10" Margin="12,24"><TextBlock x:Name="EmptyHeading" Text="还没有记忆" FontSize="18"/><TextBlock x:Name="EmptyHint" Text="接入 Agent 后，记忆会在工具调用时沉淀；也可以手动记一条。" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/><StackPanel x:Name="EmptySteps" Spacing="8" Margin="0,6,0,0"><TextBlock Text="1. 接入 Agent：点左侧“Agent 接入”，让 Agent 在调用工具时自动沉淀记忆。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/><TextBlock Text="2. 记一条：点上方“记一条”，写下刚发生的事；只填内容也能保存。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/><TextBlock Text="3. 复制配置：在“Agent 接入 → 高级与手动接入”里复制配置，用于其他设备或项目。" TextWrapping="Wrap" Foreground="{DynamicResource MutedBrush}"/></StackPanel></StackPanel>
@@ -76,11 +78,15 @@
          <TextBox x:Name="SourceInput" Watermark="来源：会话、文档或测试记录"/>
          <TextBox x:Name="ConditionsInput" Watermark="适用条件，例如 Windows / PowerShell" AcceptsReturn="True" TextWrapping="Wrap"/>
          <TextBlock x:Name="EvidenceLabel" Text="陈述，尚未核实" Foreground="{DynamicResource MutedBrush}" FontSize="12" TextWrapping="Wrap"/>
+         <TextBlock x:Name="RetractStatus" IsVisible="False" Foreground="{DynamicResource MutedBrush}" FontSize="12" TextWrapping="Wrap"/>
+         <TextBlock Text="撤回原因（可留空）" FontSize="12" Foreground="{DynamicResource MutedBrush}"/>
+         <TextBox x:Name="RetractReasonInput" Watermark="例如：结论已被证伪、已被新版本取代"/>
+         <TextBlock Text="撤回只作标记，不删除记录；之后可再恢复。" FontSize="12" Foreground="{DynamicResource MutedBrush}" TextWrapping="Wrap"/>
          <Expander Header="版本历史"><StackPanel Spacing="8"><Button Content="加载历史" Click="HistoryClick"/><TextBlock x:Name="HistoryText" TextWrapping="Wrap"/></StackPanel></Expander>
         </StackPanel></Expander>
        </StackPanel>
       </ScrollViewer>
-      <WrapPanel Grid.Row="2" Margin="0,16,0,0"><Button Content="保存" Click="SaveClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="PromoteButton" Content="沉淀为个人经验" Click="PromoteClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="ReloadButton" Content="放弃草稿并加载最新" Click="ReloadClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="UndoButton" Content="撤销上次修改" Click="UndoClick" IsVisible="False"/></WrapPanel>
+      <WrapPanel Grid.Row="2" Margin="0,16,0,0"><Button Content="保存" Click="SaveClick" Classes="primary" Margin="0,0,12,0"/><Button x:Name="RestoreButton" Content="恢复这条" Click="RestoreClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="RetractButton" Content="撤回这条" Click="RetractClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="PromoteButton" Content="沉淀为个人经验" Click="PromoteClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="ReloadButton" Content="放弃草稿并加载最新" Click="ReloadClick" IsVisible="False" Margin="0,0,12,0"/><Button x:Name="UndoButton" Content="撤销上次修改" Click="UndoClick" IsVisible="False"/></WrapPanel>
      </Grid>
     </Border>
    </Grid>
