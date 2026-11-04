@@ -185,8 +185,10 @@ fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
     let body = json.to_string();
     // 不发 Access-Control-Allow-Origin: webview 同源(127.0.0.1:9121),
     // MCP server 用 reqwest(非浏览器),都不需要 CORS。放开 = 让任意网站可读写图谱。
+    // charset 必须显式声明: 正文是 UTF-8 中文,而 HTTP 默认字符集是 ISO-8859-1,
+    // 省略会让严格客户端(如 .NET HttpClient 的默认 JSON 读取)把中文解码成乱码。
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );    let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
@@ -195,7 +197,7 @@ fn send_json(stream: &mut TcpStream, json: serde_json::Value) {
 fn send_err(stream: &mut TcpStream, status: u16, msg: &str) {
     let body = serde_json::json!({"error": msg}).to_string();
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
         status, body.len()
     );
     let _ = stream.write_all(header.as_bytes());

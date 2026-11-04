@@ -47,6 +47,10 @@ class HeadlessServiceTest(unittest.TestCase):
                 self.assertFalse((cwd/'frontend').exists())
                 self.assertEqual(api(info,'/api/service')['instance_id'],info['instance_id'])
                 self.assertEqual(api(info,'/api/health')['status'],'ok')
+                # v1 responses are UTF-8 JSON; without an explicit charset a strict
+                # client decodes Chinese as Latin-1 and silently corrupts it.
+                with urllib.request.urlopen(urllib.request.Request(info['api_url']+'/api/v1/projects'),timeout=3) as response:
+                    self.assertEqual(response.headers.get('Content-Type'),'application/json; charset=utf-8')
                 # The read-only graph endpoint must not deadlock the engine mutex.
                 self.assertEqual(api(info,'/api/graph')['nodes'],[])
                 node=api(info,'/api/write',{'content':'ZX8397 diagnostic experience: check process lifetime first.','title':'ZX8397 experience','node_type':'knowledge','source':'test:isolated'})['node']
