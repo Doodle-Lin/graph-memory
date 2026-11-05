@@ -67,53 +67,96 @@ fn has_cjk(text: &str) -> bool {
     })
 }
 
-/// P0-A1: one query term. English/numeric terms and short CJK terms match as a plain
-/// case-insensitive substring; longer CJK terms also match when at least two of their
-/// character bigrams occur in the text.
-enum Term {
-    Plain(String),
-    Cjk { raw: String, bigrams: Vec<String> },
-}
+/// P4-A / L4-02: n-gram window for CJK pieces long enough to be split.
+const CJK_GRAM: usize = 2;
 
-impl Term {
-    fn parse(term: &str) -> Self {
-        let lower = term.to_lowercase();
+/// P4-A / L4-02 (P4-C tightening): split a query into matching units, grouped per
+/// whitespace-separated piece.
+///
+/// `split_whitespace` still defines the pieces (so ASCII words and numbers keep the
+/// existing semantics); the change is inside a piece: a long CJK piece is no longer a
+/// single term that must appear verbatim or share two bigrams, it contributes one unit
+/// per character n-gram, and *several* of those units may match the same record.
+/// ASCII/numeric pieces and short CJK pieces (`<= CJK_GRAM` chars) stay whole.
+fn query_piece_units(query: &str) -> Vec<Vec<String>> {
+    let mut pieces = Vec::new();
+    for piece in query.split_whitespace() {
+        let lower = piece.to_lowercase();
         let chars: Vec<char> = lower.chars().collect();
-        if has_cjk(&lower) && chars.len() > 2 {
-            let bigrams: Vec<String> = chars
-                .windows(2)
-                .map(|pair| pair.iter().collect::<String>())
-                .collect();
-            Term::Cjk {
-                raw: lower,
-                bigrams,
-            }
+        if has_cjk(&lower) && chars.len() > CJK_GRAM {
+            pieces.push(
+                chars
+                    .windows(CJK_GRAM)
+                    .map(|window| window.iter().collect::<String>())
+                    .collect(),
+            );
         } else {
-            Term::Plain(lower)
+            pieces.push(vec![lower]);
         }
     }
-    /// Whether this term occurs in `field`; `extra_bigrams` counts bigrams beyond the first
-    /// one that occur and is only used for the relevance score.
-    fn hits(&self, field: &str, extra_bigrams: &mut usize) -> bool {
-        match self {
-            Term::Plain(raw) => field.contains(raw.as_str()),
-            Term::Cjk { raw, bigrams } => {
-                if field.contains(raw.as_str()) {
-                    return true;
-                }
-                let matched = bigrams.iter().filter(|b| field.contains(b.as_str())).count();
-                *extra_bigrams += matched.saturating_sub(1);
-                matched >= 2
-            }
-        }
-    }
+    pieces
 }
 
-/// P0-A1: a record enters the result only when every term hits at least one indexed field.
-/// Score: 3 per term in the title, 1 per term in the content, 1 per term in the
-/// conditions, plus 0.5 per additional bigram hit.
-fn match_terms(body: &Value, terms: &[Term]) -> Option<f64> {
-    if terms.is_empty() {
+/// P0-A1 / P4-C: does one unit of a piece occur in `field`?
+fn unit_hits(field: &str, unit: &str) -> bool {
+    field.contains(unit)
+}
+
+/// P0-A1 / P4-C rule A: a piece hits a field when the piece itself occurs verbatim, or —
+/// for a long CJK piece split into n-grams — when at least two of its n-grams occur.
+/// Returns how many distinct n-grams matched, for scoring.
+fn piece_hits(field: &str, units: &[String]) -> (bool, usize) {
+    if units.is_empty() {
+        return (false, 0);
+    }
+    if units.len() == 1 {
+        let hit = unit_hits(field, &units[0]);
+        return (hit, if hit { 1 } else { 0 });
+    }
+    if unit_hits(field, &units.concat()) {
+        // The whole long CJK piece occurs verbatim (rare, but it is the strongest form).
+        return (true, units.len());
+    }
+    let matched = units.iter().filter(|unit| unit_hits(field, unit)).count();
+    (matched >= 2, matched)
+}
+
+/// P4-C: the longest suffix of the query's n-grams that the field contains and that ends
+/// where the field ends.
+///
+/// A record's free text is usually a statement whose *last* characters carry its result
+/// ("…延迟恢复到 5 分钟以内"), so a question ending in the same wording is real evidence
+/// of relevance. This is the one place a single n-gram is allowed to admit a record, and
+/// only when it sits at the end of the field — a lone n-gram in the middle of unrelated
+/// prose ("网络" inside "神经网络 都不相关") still never matches on its own.
+fn content_tail_grams(content: &str, units: &[String]) -> usize {
+    if units.len() < 2 || !content.ends_with(&units[units.len() - 1]) {
+        return 0;
+    }
+    let mut run = 1usize;
+    while run < units.len()
+        && content.contains(&units[units.len() - run - 1..].concat())
+    {
+        run += 1;
+    }
+    run
+}
+
+/// P4-C: a record enters the result as follows.
+///
+/// * Multi-piece query (rule A, unchanged P0-A1 contract): **every** piece must hit at
+///   least one indexed field (whole piece or >= 2 of its n-grams), otherwise the record
+///   is rejected. Relaxing this is what produced the false-recall regression on
+///   unrelated multi-topic probes, so rule A also ignores the content-tail signal.
+/// * Single long CJK piece (rule B): it is enough that the piece's n-grams hit at least
+///   two distinct positions, or that **one** n-gram lands in the `title`/`conditions`, or
+///   that the record's content ends with the query's n-gram run. A lone n-gram in the
+///   middle of the content (``网络`` inside ``神经网络 都不相关``) is still not evidence.
+///
+/// Score: 3 per unit in the title, 1 per unit in the content, 1 per unit in the
+/// conditions, plus 0.5 per additional n-gram hit beyond the first.
+fn match_terms(body: &Value, pieces: &[Vec<String>]) -> Option<f64> {
+    if pieces.is_empty() {
         return Some(0.0);
     }
     let lower = |s: &str| s.to_lowercase();
@@ -123,27 +166,47 @@ fn match_terms(body: &Value, terms: &[Term]) -> Option<f64> {
     let mut title_hits = 0usize;
     let mut content_hits = 0usize;
     let mut conditions_hits = 0usize;
-    let mut extra_bigrams = 0usize;
-    for term in terms {
-        let mut matched = false;
-        if term.hits(&title, &mut extra_bigrams) {
-            title_hits += 1;
-            matched = true;
-        }
-        if term.hits(&content, &mut extra_bigrams) {
-            content_hits += 1;
-            matched = true;
-        }
-        if term.hits(&conditions, &mut extra_bigrams) {
-            conditions_hits += 1;
-            matched = true;
-        }
-        if !matched {
+    let mut extra_grams = 0usize;
+    for units in pieces {
+        let (title_hit, title_grams) = piece_hits(&title, units);
+        let (content_hit, content_grams) = piece_hits(&content, units);
+        let (conditions_hit, conditions_grams) = piece_hits(&conditions, units);
+        // Rule B only relaxes a single, long CJK piece; rule A stays strict, so the
+        // content-tail signal is only consulted for a single-piece query.
+        let (tail_grams, lone_title, lone_conditions) = if pieces.len() == 1 && units.len() > 1 {
+            (
+                content_tail_grams(&content, units),
+                units.iter().any(|unit| unit_hits(&title, unit)),
+                units.iter().any(|unit| unit_hits(&conditions, unit)),
+            )
+        } else {
+            (0, false, false)
+        };
+        if !(title_hit || content_hit || conditions_hit || tail_grams > 0 || lone_title || lone_conditions)
+        {
             return None;
         }
+        if title_hit || lone_title {
+            title_hits += 1;
+        }
+        if content_hit || tail_grams > 0 {
+            content_hits += 1;
+        }
+        if conditions_hit || lone_conditions {
+            conditions_hits += 1;
+        }
+        extra_grams += title_grams
+            .max(content_grams)
+            .max(conditions_grams)
+            .max(tail_grams)
+            .saturating_sub(1);
     }
-    Some(3.0 * title_hits as f64 + content_hits as f64 + conditions_hits as f64
-        + 0.5 * extra_bigrams as f64)
+    Some(
+        3.0 * title_hits as f64
+            + content_hits as f64
+            + conditions_hits as f64
+            + 0.5 * extra_grams as f64,
+    )
 }
 
 /// P0-A2: owned clones of the records whose `kind` is one of `kinds`, newest first, capped at 10.
@@ -250,7 +313,7 @@ impl MemoryStore {
         }
         let mut st=self.db.prepare("SELECT body FROM work_memories WHERE ?2 OR memory_scope='personal' OR (memory_scope='project' AND project_id=?1)")?;
         let rows = st.query_map(params![project, all], |r| r.get::<_, String>(0))?;
-        let terms: Vec<Term> = query.split_whitespace().map(Term::parse).collect();
+        let pieces: Vec<Vec<String>> = query_piece_units(query);
         let parsed: Vec<Value> = rows
             .map(|row| {
                 row.map_err(ApiError::from)
@@ -260,7 +323,7 @@ impl MemoryStore {
         let mut result = Vec::new();
         let mut excluded = 0usize;
         for body in parsed {
-            if let Some(score) = match_terms(&body, &terms) {
+            if let Some(score) = match_terms(&body, &pieces) {
                 let memory = serde_json::from_value::<Memory>(body)?;
                 if memory.retracted_at.is_some() && !include_retracted {
                     excluded += 1;
@@ -976,9 +1039,22 @@ mod tests {
                 "title":"周末计划","kind":"note","content":"量子计算 区块链 神经网络 都不相关"}),
             )
             .unwrap();
+        let noise_id = store
+            .route(
+                "POST",
+                "/api/v1/memories",
+                json!({"memory_scope":"project","project_id":alpha,"event_id":"noise-2",
+                "title":"终端使用习惯","kind":"note","content":"平时只用终端记录待办。"}),
+            )
+            .unwrap()["memory"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(record, noise_id);
 
-        // Every term must hit: "PowerShell" is a substring, the long CJK term matches
-        // only through its bigrams (the raw phrase is not a substring).
+        // P4-A/P4-C: "PowerShell" is one piece and everything that follows it is a second
+        // piece; every piece must hit (rule A), while the long CJK piece is still split
+        // into bigrams so it can be reached through several of them.
         let question = store
             .search(&json!({"scope":"all","query":"PowerShell 会话退出后子进程会被终止吗"}))
             .unwrap();
@@ -994,25 +1070,112 @@ mod tests {
         assert_eq!(noise["total"], 0, "{noise}");
         assert_eq!(ids(&noise), Vec::<String>::new());
 
-        // A single shared bigram is not enough for a long CJK term.
+        // P4-C rule A: with two or more pieces the old "every piece must hit" contract is
+        // back, so a single shared bigram cannot smuggle a record in.
+        assert_eq!(
+            store.search(&json!({"scope":"all","query":"会话处理流程已经完全重构 别的东西"})).unwrap()
+                ["total"],
+            0
+        );
+        // P4-C rule B: a lone bigram cut out of a long piece is not evidence on its own.
         assert_eq!(
             store.search(&json!({"scope":"all","query":"会话处理流程已经完全重构"})).unwrap()["total"],
             0
         );
-        // Short CJK terms still require the raw substring.
+        // Two shared bigrams are enough to surface the record.
+        assert_eq!(
+            store.search(&json!({"scope":"all","query":"会话退出后子进程"})).unwrap()["total"],
+            1
+        );
+        // A lone bigram that lands in the *title* is strong evidence on its own.
+        assert_eq!(
+            store.search(&json!({"scope":"all","query":"子进程会被终止吗"})).unwrap()["total"],
+            1
+        );
+        // Short CJK pieces stay whole pieces and match as substrings.
         assert_eq!(
             store.search(&json!({"scope":"all","query":"进程"})).unwrap()["total"],
             1
         );
+        // ... and a short CJK piece matches the *other* record's title too.
         assert_eq!(
             store.search(&json!({"scope":"all","query":"终端"})).unwrap()["total"],
-            0
+            1
+        );
+        // A short CJK piece is a whole term, so it may match on its own.
+        assert_eq!(
+            store.search(&json!({"scope":"all","query":"子进程"})).unwrap()["total"],
+            1
         );
         // English matching stays case-insensitive.
         assert_eq!(
             store.search(&json!({"scope":"all","query":"powershell windows"})).unwrap()["total"],
             1
         );
+        // P0-A1 S-A1-04 shape: two unrelated topics must not recall anything.
+        assert_eq!(
+            store.search(&json!({"scope":"all","query":"中文 葡萄庄园天气预报"})).unwrap()["total"],
+            0
+        );
+    }
+
+    /// P4-A / L4-02 / P4-C: boundary cases for query splitting, the AND rule and scoring.
+    #[test]
+    fn query_pieces_cover_token_ngram_and_and_boundaries() {
+        // Empty and whitespace-only queries produce no pieces.
+        assert!(query_piece_units("").is_empty());
+        assert!(query_piece_units("   \t ").is_empty());
+
+        // Pure ASCII pieces stay whole and are lowercased.
+        let ascii = query_piece_units("PowerShell K8S 18080");
+        assert_eq!(ascii.len(), 3);
+        assert_eq!(
+            ascii.iter().map(|p| p.join("|")).collect::<Vec<_>>(),
+            vec!["powershell", "k8s", "18080"]
+        );
+
+        // A short CJK piece (<= CJK_GRAM) stays one whole term.
+        assert_eq!(query_piece_units("端口"), vec![vec!["端口".to_string()]]);
+
+        // A long CJK piece is split into character bigrams.
+        assert_eq!(
+            query_piece_units("端口冲突排查"),
+            vec![vec!["端口", "口冲", "冲突", "突排", "排查"]]
+        );
+
+        // Mixed CJK + ASCII keeps both behaviours per piece.
+        let mixed = query_piece_units("PowerShell 会话退出后");
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0], vec!["powershell".to_string()]);
+        assert_eq!(mixed[1], vec!["会话", "话退", "退出", "出后"]);
+
+        // Rule A: multi-piece queries require *every* piece to hit.
+        let full = json!({"title":"端口占用","content":"备份方案","conditions":""});
+        assert_eq!(match_terms(&full, &query_piece_units("端口 备份")), Some(4.0));
+        assert_eq!(match_terms(&full, &query_piece_units("端口 证书")), None);
+        assert_eq!(match_terms(&full, &query_piece_units("端口 证书 备份")), None);
+        // ... including a long CJK piece that only shares one bigram.
+        assert_eq!(match_terms(&full, &query_piece_units("端口 备份步骤说明")), None);
+        // Verbatim long CJK piece in the content: 3 title + 1 content + 0.5 * (3 - 1).
+        assert_eq!(match_terms(&full, &query_piece_units("端口 备份方案")), Some(5.0));
+
+        // Rule B: one long CJK piece needs >= 2 bigrams, or a title/conditions hit.
+        let content_hits = json!({"title":"","content":"端口冲突","conditions":""});
+        // 端口 / 口冲 / 冲突 all occur -> 1 content hit + 0.5 * (3 - 1).
+        assert_eq!(match_terms(&content_hits, &query_piece_units("端口冲突排查流程")), Some(2.0));
+        assert_eq!(match_terms(&content_hits, &query_piece_units("端口占用排查流程")), None);
+        assert_eq!(match_terms(&content_hits, &query_piece_units("端口规划")), None);
+        let title_only = json!({"title":"端口占用","content":"","conditions":""});
+        assert_eq!(match_terms(&title_only, &query_piece_units("口占")), Some(3.0));
+        let conditions_only = json!({"title":"","content":"","conditions":"Windows 11"});
+        assert_eq!(match_terms(&conditions_only, &query_piece_units("windows")), Some(1.0));
+        // A short CJK piece is a whole term and matches on its own ...
+        assert_eq!(match_terms(&content_hits, &query_piece_units("端口")), Some(1.0));
+        // ... but a lone bigram cut out of a long piece is not enough: this query piece
+        // shares exactly one bigram ("端口") and must be rejected.
+        assert_eq!(match_terms(&content_hits, &query_piece_units("查端口")), None);
+        // Exactly two bigrams are enough (端口 + 口冲).
+        assert_eq!(match_terms(&content_hits, &query_piece_units("查端口冲")), Some(1.0 + 0.5));
     }
 
     /// P0-A1: relevance comes before freshness; equal scores fall back to updated_at then id.
