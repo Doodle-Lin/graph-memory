@@ -327,7 +327,8 @@ function Invoke-Api {
         $Body = $null,
         [string]$EvidenceName = ''
     )
-    $url = $BaseUrl + $Path
+    if ([string]::IsNullOrWhiteSpace($BaseUrl)) { throw "Invoke-Api: live api_url 为空（method=$Method path=$Path）" }
+    $url = ([string]$BaseUrl).TrimEnd('/') + $Path
     Write-Step ("http-start $Method $Path")
     $req = [System.Net.HttpWebRequest]::Create($url)
     $req.Method = $Method
@@ -1887,7 +1888,7 @@ Register-Check 'P1-09' 'P1 /api/v1/agent/call 直连：memory_update 互斥 400 
 } 'live'
 
 # ── 既有套件（-Full / 对应开关）────────────────────────────────────────────
-Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 45 项）' {
+Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 62 项）' {
     if (-not ($script:Ctx.RunRust)) { return 'SKIP:not requested' }
     # 只跑 lib 单测，不 build bin：不触碰 owner 指定的最终二进制，也不动其它 target。
     # 使用 artifacts 下的持久 CARGO_TARGET_DIR：既避免与默认 target 目录互相干扰，
@@ -1908,7 +1909,7 @@ Register-Check 'SUITE-RUST' 'cargo test --no-default-features --lib（基线 45 
     $script:Ctx.RustPassed = $passed
     $script:Ctx.RustResultLine = ($m.Value.Trim())
     Need ($failed -eq 0) "cargo 失败 $failed 项"
-    Need ($passed -ge 45) "cargo 通过 $passed 项，低于基线 45"
+    Need ($passed -ge 62) "cargo 通过 $passed 项，低于基线 62"
     "passed=$passed failed=0（CARGO_TARGET_DIR=$altTarget）"
 } 'suites'
 
@@ -1924,7 +1925,7 @@ Register-Check 'SUITE-SETUP' 'dotnet run tests/Desktop.Setup.Tests（基线 102 
     "checks=$n"
 } 'suites'
 
-Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 86 项）' {
+Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 215 项）' {
     if (-not ($script:Ctx.RunDesktop)) { return 'SKIP:not requested' }
     if ([string]::IsNullOrWhiteSpace($script:DotnetExe)) { return 'SKIP:dotnet SDK 不可用' }
     $r = Invoke-Native -Exe $script:DotnetExe -Arguments @('run', '--project', 'tests/Desktop.Editor.Tests', '-c', 'Release') -LogName 'suite-editor' -TimeoutSec $NativeTimeoutSec -WorkDir $script:Ctx.RepoRoot
@@ -1932,7 +1933,7 @@ Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 86
     $m = [regex]::Match($r.StdOut, 'PASS (\d+) editor checks')
     Need ($m.Success) '未找到 PASS N editor checks'
     $n = [int]$m.Groups[1].Value
-    Need ($n -ge 86) "editor checks=$n，低于基线 86"
+    Need ($n -ge 215) "editor checks=$n，低于基线 215"
     "checks=$n"
 } 'suites'
 
@@ -1977,6 +1978,304 @@ Register-Check 'SUITE-SMOKE' '自包含桌面 smoke（发布 + --smoke-test）' 
 } 'suites'
 
 # ════════════════════════════════════════════════════════════════════════════
+#  P3 新增断言（task-19 / verifier3 第三批独立验收）
+#  这些断言是 verifier3 在 artifacts/usability-verify/p3-verifier3/** 下先独立跑通、
+#  再固化进本脚本的：协议加固、D1 restore 拒绝任何非空目标、LF-only 请求体、
+#  草稿不进记忆库、eval 基线锚点。
+# ════════════════════════════════════════════════════════════════════════════
+
+$script:RawDeadlineMs = 20000
+
+# 原生 socket 客户端：用于构造 LF-only 请求体，以及读取 405 的 Allow 头。
+# 读取方式：先按 Content-Length 精确收正文，再用带 ReadTimeout 的阻塞 Read 收尾部；
+# 不做 DataAvailable 忙等（在被拒连接的重连节奏下会读到残缺响应）。
+function Send-P3RawRequest {
+    param(
+        [int]$Port, [string]$Method, [string]$Path, [string]$Body,
+        [bool]$LfOnly = $false, [string]$ContentType = 'application/json'
+    )
+    $eol = if ($LfOnly) { "`n" } else { "`r`n" }
+    $bodyBytes = @()
+    if ($null -ne $Body) { $bodyBytes = [Text.Encoding]::UTF8.GetBytes($Body) }
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.Append("$Method $Path HTTP/1.1$eol")
+    [void]$sb.Append("Host: 127.0.0.1:$Port$eol")
+    if ($null -ne $Body) {
+        [void]$sb.Append("Content-Type: $ContentType$eol")
+        [void]$sb.Append("Content-Length: $($bodyBytes.Length)$eol")
+    }
+    [void]$sb.Append($eol)
+    $headBytes = [Text.Encoding]::ASCII.GetBytes($sb.ToString())
+    $client = New-Object Net.Sockets.TcpClient
+    $raw = $null
+    try {
+        $client.Connect('127.0.0.1', $Port)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $script:RawDeadlineMs
+        $stream.Write($headBytes, 0, $headBytes.Length)
+        if ($bodyBytes.Length -gt 0) { $stream.Write($bodyBytes, 0, $bodyBytes.Length) }
+        $stream.Flush()
+        $raw = Read-P3FramedResponse -Stream $stream
+    } finally { $client.Close() }
+    if (-not $raw.Ok) { throw ("raw response incomplete for {0} {1}: {2}" -f $Method, $Path, $raw.Note) }
+    $headText = $raw.HeadText
+    $headers = @{}
+    foreach ($l in ($headText -split "`r`n")) {
+        $m = [regex]::Match($l, '^([^:]+):\s*(.*)$')
+        if ($m.Success) { $headers[$m.Groups[1].Value.ToLowerInvariant()] = $m.Groups[2].Value.Trim() }
+    }
+    return [pscustomobject]@{
+        Status = [int]([regex]::Match($headText, 'HTTP/1\.[01] (\d{3})').Groups[1].Value)
+        Headers = $headers
+        Head = $headText
+        BodyBytes = $raw.BodyBytes
+        Body = [Text.Encoding]::UTF8.GetString([byte[]]$raw.BodyBytes)
+        RequestHead = $sb.ToString()
+    }
+}
+
+# 阻塞 Read，不做 DataAvailable 忙等；返回 {Ok,HeadText,BodyBytes,Status,Note}。
+function Read-P3FramedResponse {
+    param($Stream)
+    $buf = New-Object byte[] 16384
+    $acc = New-Object System.Collections.Generic.List[byte]
+    $head = ''
+    $length = -1
+    $headEnd = -1
+    $deadline = (Get-Date).AddMilliseconds($script:RawDeadlineMs)
+    while ($headEnd -lt 0 -and (Get-Date) -lt $deadline) {
+        try { $n = $Stream.Read($buf, 0, $buf.Length) } catch { return [pscustomobject]@{ Ok = $false; Note = "read failed before headers: $($_.Exception.Message)" } }
+        if ($n -le 0) { return [pscustomobject]@{ Ok = $false; Note = "EOF before headers (bytes=$($acc.Count))" } }
+        for ($i = 0; $i -lt $n; $i++) { [void]$acc.Add($buf[$i]) }
+        $s = [Text.Encoding]::ASCII.GetString($acc.ToArray())
+        $headEnd = $s.IndexOf("`r`n`r`n")
+    }
+    if ($headEnd -lt 0) { return [pscustomobject]@{ Ok = $false; Note = "no header terminator after $($acc.Count) bytes" } }
+    $head = [Text.Encoding]::ASCII.GetString($acc.ToArray(), 0, $headEnd)
+    $mCl = [regex]::Match($head, '(?im)^Content-Length:\s*(\d+)\s*$')
+    if ($mCl.Success) { $length = [int]$mCl.Groups[1].Value }
+    $body = New-Object System.Collections.Generic.List[byte]
+    for ($i = $headEnd + 4; $i -lt $acc.Count; $i++) { [void]$body.Add($acc[$i]) }
+    if ($length -ge 0) {
+        while ($body.Count -lt $length -and (Get-Date) -lt $deadline) {
+            try { $n = $Stream.Read($buf, 0, [Math]::Min($buf.Length, $length - $body.Count)) } catch { break }
+            if ($n -le 0) { break }
+            for ($i = 0; $i -lt $n; $i++) { [void]$body.Add($buf[$i]) }
+        }
+        if ($body.Count -lt $length) { return [pscustomobject]@{ Ok = $false; HeadText = $head; BodyBytes = $body.ToArray(); Note = "truncated body: got $($body.Count) of $length bytes" } }
+    } else {
+        while ((Get-Date) -lt $deadline) {
+            try { $n = $Stream.Read($buf, 0, $buf.Length) } catch { break }
+            if ($n -le 0) { break }
+            for ($i = 0; $i -lt $n; $i++) { [void]$body.Add($buf[$i]) }
+        }
+    }
+    return [pscustomobject]@{ Ok = $true; HeadText = $head; BodyBytes = $body.ToArray(); Note = '' }
+}
+
+# 从服务端落盘的 HTTP 证据里取回请求体文件路径（live 写入只在 http\*.json 里留痕）
+function Get-P3ArtifactFile {
+    param([string]$EvidenceName)
+    $p = Join-Path $script:Ctx.EvidenceDir ("http\{0}.json" -f $EvidenceName)
+    Need (Test-Path -LiteralPath $p) "缺少 HTTP 证据 $p"
+    $m = [regex]::Match([IO.File]::ReadAllText($p, $script:Utf8), '"file"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    Need ($m.Success) "证据 $p 中没有 file 字段"
+    return ($m.Groups[1].Value -replace '\\\\', '\')
+}
+
+# 逐字节比对：哈希与文档中的十六进制字符串大小写无关
+# （Get-FileHash 返回大写，RECALL_BASELINE.md / report.json 写作小写）。
+function Test-ShaInText {
+    param([string]$Text, [string]$Hash)
+    return $Text.ToLowerInvariant().Contains($Hash.ToLowerInvariant())
+}
+
+Register-Check 'P3-01' 'P3 协议加固：/api/v1/* 只允许 GET/POST，其它方法 405 + Allow' {
+    $base = [string]$script:Ctx.LiveInfo.api_url
+    Need (-not [string]::IsNullOrWhiteSpace($base)) 'P3-01 前置：live api_url 为空'
+    $base = $base.TrimEnd('/')
+    $cases = @(
+        @{ m = 'PUT'; p = '/api/v1/context' },
+        @{ m = 'DELETE'; p = '/api/v1/context' },
+        @{ m = 'PUT'; p = '/api/v1/memories' },
+        @{ m = 'PATCH'; p = '/api/v1/search' }
+    )
+    $detail = New-Object System.Collections.ArrayList
+    foreach ($c in $cases) {
+        $r = Invoke-Api $base $c.m $c.p @{ probe = 'p3' } ('p3-method-' + $c.m.ToLowerInvariant() + ($c.p -replace '[^A-Za-z]', '-'))
+        Need ($r.Status -eq 405) "$($c.m) $($c.p) 期望 405，实际 $($r.Status)"
+        [void]$detail.Add("$($c.m) $($c.p)=$($r.Status)")
+    }
+    $port = [int]([Uri]$base).Port
+    Need ($port -gt 0) "P3-01 前置：无法从 [$base] 取端口"
+    $raw = Send-P3RawRequest -Port $port -Method 'PUT' -Path '/api/v1/context' -Body '{"probe":"p3"}'
+    Need ($raw.Status -eq 405) "原生 PUT 期望 405，实际 $($raw.Status)"
+    Need ($raw.Headers.ContainsKey('allow')) "405 响应缺少 Allow 头：$($raw.Headers.Keys -join ',')"
+    Need ($raw.Headers['allow'] -eq 'GET, POST') "Allow=[$($raw.Headers['allow'])]，期望 [GET, POST]"
+    Need ($raw.Body -match 'not allowed') "405 响应体未说明原因：[$(($raw.Body -replace '\s+', ' ').Trim())]"
+    $nope = Invoke-Api $base 'GET' '/api/v1/nope' $null 'p3-unknown-path'
+    Need ($nope.Status -eq 404) "未知路径 GET 期望 404，实际 $($nope.Status)"
+    (@($detail) -join '; ') + "；原生 Allow=[$($raw.Headers['allow'])]；未知路径 404（base=$base）"
+} 'live'
+
+Register-Check 'P3-02' 'P3 协议加固：超大请求体/头部被拒且服务存活（413 必须可读）' {
+    $port = [int]([Uri]$script:Ctx.LiveInfo.api_url).Port
+    # 三次独立发送超限正文：本轮 task-21 前的实现存在 RST 竞态，客户端会只收到残缺响应，
+    # 因此这里连发三轮，任意一轮读不到可解析的 413 都算失败。
+    $body413 = '{"error":"request body must not exceed 1048576 bytes"}'
+    # 注意：Windows PowerShell 5.1 的 @() 数组字面量会把元素统一强制转换，
+    # `@(1048640, 2 * 1024 * 1024, 8 * 1024 * 1024)` 会直接抛
+    # "Cannot convert the System.Object[] ... to System.UInt32"，因此先算好变量。
+    $size1 = 1048640
+    $size2 = 2 * 1024 * 1024
+    $size3 = 8 * 1024 * 1024
+    foreach ($size in @($size1, $size2, $size3)) {
+        $payload = '{"query":"' + ('x' * ($size - 13)) + '"}'
+        $r = Send-P3RawRequest -Port $port -Method 'POST' -Path '/api/v1/search' -Body $payload
+        Need ($r.Status -eq 413) "$size 字节正文期望可读的 413，实际 $($r.Status)（body=[$(($r.Body -replace '\s+', ' ').Trim())]）"
+        Need ($r.Body -eq $body413) "$size 字节正文的 413 响应体=[$(($r.Body -replace '\s+', ' ').Trim())]"
+    }
+    # 谎报 Content-Length：头部声称 99999999 字节，实际只发少量字节
+    $client = New-Object Net.Sockets.TcpClient
+    try {
+        $client.Connect('127.0.0.1', $port)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $script:RawDeadlineMs
+        $head = "POST /api/v1/search HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Type: application/json`r`nContent-Length: 99999999`r`n`r`n"
+        $hb = [Text.Encoding]::ASCII.GetBytes($head)
+        $stream.Write($hb, 0, $hb.Length)
+        $bb = [Text.Encoding]::UTF8.GetBytes('{"query":"p3"}')
+        $stream.Write($bb, 0, $bb.Length)
+        $stream.Flush()
+        $lying = Read-P3FramedResponse -Stream $stream
+    } finally { $client.Close() }
+    Need ($lying.Ok) "谎报 Content-Length 的响应不可解析：$($lying.Note)"
+    $lyingStatus = [int]([regex]::Match($lying.HeadText, 'HTTP/1\.[01] (\d{3})').Groups[1].Value)
+    Need ($lyingStatus -eq 413) "谎报 Content-Length 期望 413，实际 $lyingStatus"
+    Need ([Text.Encoding]::UTF8.GetString([byte[]]$lying.BodyBytes) -eq $body413) "谎报 Content-Length 的 413 响应体不符"
+    $bigHeader = 'X-Probe: ' + ('h' * (40 * 1024))
+    $c2 = New-Object Net.Sockets.TcpClient
+    try {
+        $c2.Connect('127.0.0.1', $port)
+        $s2 = $c2.GetStream()
+        $s2.ReadTimeout = $script:RawDeadlineMs
+        $h2 = [Text.Encoding]::ASCII.GetBytes("GET /api/v1/service HTTP/1.1`r`nHost: 127.0.0.1:$port`r`n$bigHeader`r`n`r`n")
+        $s2.Write($h2, 0, $h2.Length); $s2.Flush()
+        $hdr = Read-P3FramedResponse -Stream $s2
+    } finally { $c2.Close() }
+    Need ($hdr.Ok) "40KiB 请求头的响应不可解析：$($hdr.Note)"
+    $status2 = [int]([regex]::Match($hdr.HeadText, 'HTTP/1\.[01] (\d{3})').Groups[1].Value)
+    Need ($status2 -eq 431) "40KiB 请求头期望 431，实际 $status2"
+    Need (([Text.Encoding]::UTF8.GetString([byte[]]$hdr.BodyBytes)) -match 'must not exceed 32768') "431 响应体不符：[$(($hdr.HeadText).Split("`r`n")[0])]"
+    # 存活探针必须打一个真实存在的 GET 路由（/api/v1/service 不存在，会返回 404）
+    $alive = Invoke-Api $script:Ctx.LiveInfo.api_url 'GET' '/api/v1/agent/status' $null 'p3-after-bad-requests'
+    Need ($alive.Status -eq 200) "恶意请求后服务不再可用：$($alive.Status)"
+    "413 可读×3（1MiB/2MiB/8MiB）+ 谎报 413 + 431 均可解析，服务随后 GET=200"
+} 'live'
+
+Register-Check 'P3-03' 'P3 LF-only 请求体（Content-Type: application/json，纯 \n）内容不被截断' {
+    $port = [int]([Uri]$script:Ctx.LiveInfo.api_url).Port
+    $title = '纯LF行尾记录'
+    $content = '纯LF行尾正文'
+    $createBody = (@{ memory_scope = 'personal'; event_id = [guid]::NewGuid().ToString(); title = $title; content = $content; kind = 'note'; source = 'P3验收' } | ConvertTo-Json -Depth 8 -Compress)
+    $r = Send-P3RawRequest -Port $port -Method 'POST' -Path '/api/v1/memories' -Body $createBody -LfOnly $true
+    Need ($r.Status -eq 200) "LF-only 写入期望 200，实际 $($r.Status)：$($r.Body)"
+    $created = $r.Body | ConvertFrom-Json
+    $mid = [string](Get-JsonProp (Get-JsonProp $created 'memory') 'id')
+    Need (-not [string]::IsNullOrWhiteSpace($mid)) 'LF-only 写入未返回 memory.id'
+    $searchBody = (@{ scope = 'personal'; query = $content; limit = 5 } | ConvertTo-Json -Compress)
+    $s = Send-P3RawRequest -Port $port -Method 'POST' -Path '/api/v1/search' -Body $searchBody -LfOnly $true
+    Need ($s.Status -eq 200) "LF-only 检索期望 200，实际 $($s.Status)"
+    $sb = $s.Body | ConvertFrom-Json
+    $hit = @(Get-JsonProp $sb 'memories' | Where-Object { [string](Get-JsonProp $_ 'id') -eq $mid })
+    Need ($hit.Count -eq 1) "LF-only 正文不可检索：total=$([int](Get-JsonProp $sb 'total'))"
+    Need (([string](Get-JsonProp $hit[0] 'content')) -eq $content) "读回正文=[$([string](Get-JsonProp $hit[0] 'content'))]，期望 [$content]（空或截断即回归）"
+    # CRLF 路径同样可用（引用本次 LF 写入的记录，避免依赖 live 相位语料记录数）
+    $crlfBody = (@{ scope = 'personal'; query = $content; limit = 5 } | ConvertTo-Json -Compress)
+    $c = Send-P3RawRequest -Port $port -Method 'POST' -Path '/api/v1/search' -Body $crlfBody -LfOnly $false
+    Need ($c.Status -eq 200) "CRLF 检索期望 200，实际 $($c.Status)"
+    $cb = $c.Body | ConvertFrom-Json
+    $chit = @(Get-JsonProp $cb 'memories' | Where-Object { [string](Get-JsonProp $_ 'id') -eq $mid })
+    Need ($chit.Count -eq 1) 'CRLF 路径检索结果与 LF 路径不一致'
+    "LF 写入 id=$mid 并可检索、正文逐字节一致；CRLF 路径同样命中"
+} 'live'
+
+Register-Check 'P3-04' 'P3 数据目录纯净：服务不写入草稿/临时文件，导出只含记忆记录' {
+    $junk = @(Get-ChildItem -LiteralPath $script:Ctx.LiveDir -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'draft|草稿' -or $_.Name -like '*.tmp' })
+    Need ($junk.Count -eq 0) "活数据目录内出现草稿/临时文件：$((@($junk | ForEach-Object FullName)) -join ', ')"
+    $out = Join-Path $script:Ctx.TempRoot 'p3-purity.gmbackup'
+    $e = Invoke-Cli @('export', '--data-dir', $script:Ctx.LiveDir, '--output', $out) 'p3-purity-export'
+    Need ($e.ExitCode -eq 0) "export exit=$($e.ExitCode) stderr=$($e.StdErr)"
+    $v = Invoke-Cli @('verify', $out) 'p3-purity-verify'
+    Need ($v.ExitCode -eq 0) "verify exit=$($v.ExitCode) stderr=$($v.StdErr)"
+    $bytes = [IO.File]::ReadAllBytes($out)
+    $text = [Text.Encoding]::UTF8.GetString($bytes)
+    foreach ($token in @('desktop-drafts', 'GM_DRAFT_DIR')) {
+        Need (-not $text.Contains($token)) "导出内容出现草稿标记 $token"
+    }
+    $counts = (Get-JsonProp ($v.StdOut | ConvertFrom-Json) 'counts')
+    "数据目录无 draft/*.tmp；导出 verify=0 且不含草稿标记（memories=$((Get-JsonProp $counts 'memories'))）"
+} 'offline'
+
+Register-Check 'P3-05' 'P3 D1：restore 拒绝任何非空目标目录（六种形态）且目标零改动' {
+    $lfExport = Join-Path $script:Ctx.TempRoot 'p3-d1.gmbackup'
+    $e = Invoke-Cli @('export', '--data-dir', $script:Ctx.LiveDir, '--output', $lfExport) 'p3-d1-export'
+    Need ($e.ExitCode -eq 0) "export exit=$($e.ExitCode) stderr=$($e.StdErr)"
+    $cases = @(
+        @{ name = 'foreign-file'; setup = { param($d) Write-Utf8File -Path (Join-Path $d 'keep.txt') -Text 'unrelated' } },
+        @{ name = 'workspace-db'; setup = { param($d) Write-Utf8File -Path (Join-Path $d 'work-memory.db') -Text 'sentinel' } },
+        @{ name = 'both'; setup = { param($d) Write-Utf8File -Path (Join-Path $d 'keep.txt') -Text 'unrelated'; Write-Utf8File -Path (Join-Path $d 'work-memory.db') -Text 'sentinel' } },
+        @{ name = 'empty-subdir'; setup = { param($d) New-Item -ItemType Directory -Force -Path (Join-Path $d 'sub') | Out-Null } },
+        @{ name = 'foreign-file-dryrun'; dry = $true; setup = { param($d) Write-Utf8File -Path (Join-Path $d 'keep.txt') -Text 'unrelated' } },
+        @{ name = 'workspace-db-dryrun'; dry = $true; setup = { param($d) Write-Utf8File -Path (Join-Path $d 'work-memory.db') -Text 'sentinel' } }
+    )
+    $checked = 0
+    foreach ($c in $cases) {
+        $t = Join-Path $script:Ctx.TempRoot ('p3-d1-' + $c.name)
+        New-Item -ItemType Directory -Force -Path $t | Out-Null
+        & $c.setup $t
+        $before = @(Get-ChildItem -LiteralPath $t -Recurse -Force | Sort-Object FullName | ForEach-Object { ($_.FullName.Substring($t.Length) + ':' + $(if ($_.PSIsContainer) { 'dir' } else { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })) })
+        $argv = @('restore', '--input', $lfExport, '--data-dir', $t)
+        if ($c.dry) { $argv += '--dry-run' }
+        $r = Invoke-Cli $argv ('p3-d1-' + $c.name)
+        Need ($r.ExitCode -ne 0) "$($c.name)：期望非 0 退出，实际 $($r.ExitCode) stdout=$($r.StdOut)"
+        Need ($r.StdErr.Contains('empty target directory')) "$($c.name)：stderr 未包含拒绝原因（收到 [$($r.StdErr.Trim())]，若为空说明走了另一条分支）"
+        $after = @(Get-ChildItem -LiteralPath $t -Recurse -Force | Sort-Object FullName | ForEach-Object { ($_.FullName.Substring($t.Length) + ':' + $(if ($_.PSIsContainer) { 'dir' } else { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })) })
+        Need (($before -join '|') -eq ($after -join '|')) "$($c.name)：目标目录被改动"
+        $checked++
+    }
+    $empty = Join-Path $script:Ctx.TempRoot 'p3-d1-truly-empty'
+    New-Item -ItemType Directory -Force -Path $empty | Out-Null
+    $ok = Invoke-Cli @('restore', '--input', $lfExport, '--data-dir', $empty) 'p3-d1-empty-ok'
+    Need ($ok.ExitCode -eq 0) "空目录 restore 期望成功，实际 $($ok.ExitCode)：$($ok.StdErr)"
+    Need (Test-Path -LiteralPath (Join-Path $empty 'work-memory.db')) '空目录 restore 后缺少 work-memory.db'
+    $missing = Join-Path $script:Ctx.TempRoot 'p3-d1-missing'
+    Remove-Item -LiteralPath $missing -Recurse -Force -ErrorAction SilentlyContinue
+    $mr = Invoke-Cli @('restore', '--input', $lfExport, '--data-dir', $missing) 'p3-d1-missing'
+    Need ($mr.ExitCode -ne 0) "缺失目录期望非 0，实际 $($mr.ExitCode)"
+    Need (-not (Test-Path -LiteralPath $missing)) '被拒绝的缺失目录被创建了出来'
+    Need ($mr.StdErr.Contains('existing directory')) "缺失目录 stderr 未包含 [existing directory]：[$($mr.StdErr.Trim())]"
+    "非空目标 $checked/6 全部拒绝且零改动；真空目录可恢复；缺失目录拒绝且不创建"
+} 'offline'
+
+Register-Check 'P3-06' 'P3 eval 基线锚点：数据集/夹具哈希与文档一致，关键指标可复算' {
+    $dataset = Join-Path $script:Ctx.RepoRoot 'tests\eval\dataset.json'
+    $fixture = Join-Path $script:Ctx.RepoRoot 'tests\eval\fixture.json'
+    $doc = Join-Path $script:Ctx.RepoRoot 'docs\design\RECALL_BASELINE.md'
+    foreach ($f in @($dataset, $fixture, $doc)) { Need (Test-Path -LiteralPath $f) "缺少 $f" }
+    $dsHash = (Get-FileHash -LiteralPath $dataset -Algorithm SHA256).Hash
+    $fxHash = (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
+    $docText = [IO.File]::ReadAllText($doc, $script:Utf8)
+    Need (Test-ShaInText $docText $dsHash) "文档中的 dataset SHA256 与实测 $dsHash 不一致"
+    Need (Test-ShaInText $docText $fxHash) "文档中的 fixture SHA256 与实测 $fxHash 不一致"
+    foreach ($n in @('0.7959183673469388', '0.761904761904762')) {
+        Need ($docText.Contains($n)) "文档缺少基线指标 $n"
+    }
+    "dataset=$($dsHash.Substring(0,12))… fixture=$($fxHash.Substring(0,12))… 均与 RECALL_BASELINE.md 一致"
+} 'suites'
+
+# ════════════════════════════════════════════════════════════════════════════
 #  5. 自检（-SyntaxOnly）
 # ════════════════════════════════════════════════════════════════════════════
 function Invoke-SelfTest {
@@ -1986,7 +2285,7 @@ function Invoke-SelfTest {
     if ($script:Checks.Count -lt 25) { [void]$problems.Add("注册断言只有 $($script:Checks.Count) 条，少于 25") }
     $liveCount = 0; $offlineCount = 0; $suiteCount = 0
     foreach ($id in @($script:Checks.Keys)) {
-        if ($id -notmatch '^(S-[A-Z0-9]+-\d+[A-Z]?|ADV-\d+[A-Z]?|SUITE-[A-Z]+|P1-\d+[A-Z]?)$') { [void]$problems.Add("断言 id 格式异常：$id") }
+        if ($id -notmatch '^(S-[A-Z0-9]+-\d+[A-Z]?|ADV-\d+[A-Z]?|SUITE-[A-Z]+|P1-\d+[A-Z]?|P3-\d+[A-Z]?)$') { [void]$problems.Add("断言 id 格式异常：$id") }
         if ([string]::IsNullOrWhiteSpace($script:Checks[$id].Title)) { [void]$problems.Add("断言 $id 缺少标题") }
         if ($null -eq $script:Checks[$id].Body) { [void]$problems.Add("断言 $id 缺少函数体") }
         switch (Get-CheckPhase $script:Checks[$id]) {
@@ -1999,15 +2298,17 @@ function Invoke-SelfTest {
     if ($liveCount -lt 15) { [void]$problems.Add("live 相位断言只有 $liveCount 条") }
     if ($offlineCount -lt 8) { [void]$problems.Add("offline 相位断言只有 $offlineCount 条") }
     if ($suiteCount -lt 5) { [void]$problems.Add("suites 相位断言为 $suiteCount 条，期望至少 5") }
+    # P3-06 是 suites 相位的基线锚点断言（P3-04 属于 offline，见下方清单）
+    if ((Get-CheckPhase $script:Checks['P3-06']) -ne 'suites') { [void]$problems.Add('P3-06 相位不是 suites') }
     # 防止将来再出现"函数体写了却没带相位参数"（5.1 下会静默变成 offline）
     $expectedSuites = @{ 'SUITE-RUST' = 'suites'; 'SUITE-SETUP' = 'suites'; 'SUITE-EDITOR' = 'suites'; 'SUITE-PY' = 'suites'; 'SUITE-SMOKE' = 'suites' }
     foreach ($key in $expectedSuites.Keys) {
         if ((Get-CheckPhase $script:Checks[$key]) -ne $expectedSuites[$key]) { [void]$problems.Add("$key 相位不是 suites") }
     }
-    foreach ($key in @('S-B-01', 'S-B-02', 'S-B-03', 'S-B-04', 'S-B-05', 'S-B-06', 'S-B-07', 'S-B-08', 'S-B-09', 'S-B-01A', 'ADV-04', 'ADV-04A')) {
+    foreach ($key in @('S-B-01', 'S-B-02', 'S-B-03', 'S-B-04', 'S-B-05', 'S-B-06', 'S-B-07', 'S-B-08', 'S-B-09', 'S-B-01A', 'ADV-04', 'ADV-04A', 'P3-04', 'P3-05')) {
         if ((Get-CheckPhase $script:Checks[$key]) -ne 'offline') { [void]$problems.Add("$key 相位不是 offline") }
     }
-    foreach ($key in @('P1-01', 'P1-02', 'P1-03', 'P1-04', 'P1-05', 'P1-08', 'P1-09')) {
+    foreach ($key in @('P1-01', 'P1-02', 'P1-03', 'P1-04', 'P1-05', 'P1-08', 'P1-09', 'P3-01', 'P3-02', 'P3-03')) {
         if ((Get-CheckPhase $script:Checks[$key]) -ne 'live') { [void]$problems.Add("$key 相位不是 live") }
     }
     foreach ($key in @('P1-06A', 'P1-06B', 'P1-07')) {
