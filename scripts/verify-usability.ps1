@@ -443,7 +443,15 @@ function Wait-ServiceInfo {
         if (Test-Path -LiteralPath $jsonPath) {
             $info = $null
             try { $info = (Get-Content -LiteralPath $jsonPath -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $info = $null }
-            if ($null -ne $info -and (Get-JsonProp $info 'instance_id') -and ((Get-JsonProp $info 'instance_id') -ne $OldInstanceId)) {
+            # P4-D（verifier3）：同一数据目录二次启动时，上一个实例遗留的 service.json 会先于
+            # 新进程写入；只按 instance_id 判断会读到陈旧文件（端口已失效），导致紧接着的
+            # P1-08/P1-09 连不上服务。这里要求 service.json 的 mtime 不早于本次进程启动时间。
+            $fresh = $true
+            $jsonItem = Get-Item -LiteralPath $jsonPath -ErrorAction SilentlyContinue
+            if ($null -ne $jsonItem -and $null -ne $Instance.Process) {
+                try { $fresh = ($jsonItem.LastWriteTime -ge $Instance.Process.StartTime.AddSeconds(-2)) } catch { $fresh = $true }
+            }
+            if ($null -ne $info -and $fresh -and (Get-JsonProp $info 'instance_id') -and ((Get-JsonProp $info 'instance_id') -ne $OldInstanceId)) {
                 return $info
             }
         }
