@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env pwsh
+#!/usr/bin/env pwsh
 <#
     P0-D 独立端到端验收脚本（黑盒）。
     契约：docs/design/USABILITY_P0.md（唯一来源）。
@@ -1933,7 +1933,7 @@ Register-Check 'SUITE-SETUP' 'dotnet run tests/Desktop.Setup.Tests（基线 102 
     "checks=$n"
 } 'suites'
 
-Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 215 项）' {
+Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 319 项，P5-C 后）' {
     if (-not ($script:Ctx.RunDesktop)) { return 'SKIP:not requested' }
     if ([string]::IsNullOrWhiteSpace($script:DotnetExe)) { return 'SKIP:dotnet SDK 不可用' }
     $r = Invoke-Native -Exe $script:DotnetExe -Arguments @('run', '--project', 'tests/Desktop.Editor.Tests', '-c', 'Release') -LogName 'suite-editor' -TimeoutSec $NativeTimeoutSec -WorkDir $script:Ctx.RepoRoot
@@ -1941,7 +1941,7 @@ Register-Check 'SUITE-EDITOR' 'dotnet run tests/Desktop.Editor.Tests（基线 21
     $m = [regex]::Match($r.StdOut, 'PASS (\d+) editor checks')
     Need ($m.Success) '未找到 PASS N editor checks'
     $n = [int]$m.Groups[1].Value
-    Need ($n -ge 215) "editor checks=$n，低于基线 215"
+    Need ($n -ge 319) "editor checks=$n，低于基线 319"
     "checks=$n"
 } 'suites'
 
