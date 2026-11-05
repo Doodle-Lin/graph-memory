@@ -170,6 +170,10 @@ try {
 
     if (-not $PackageDir) { $PackageDir = Join-Path $RepoRoot "artifacts/release/graph-memory-$version-win-x64" }
     if (-not $ZipPath) { $ZipPath = Join-Path $RepoRoot "artifacts/release/graph-memory-$version-win-x64.zip" }
+    # 先解析成绝对路径：下面的收录检查用 $PackageDir.Length 从 FullName 里切相对路径，
+    # 传相对路径时前缀长度对不上，会把正常文件误报成 "unlisted"（实测 19/20 假失败）。
+    if (Test-Path -LiteralPath $PackageDir) { $PackageDir = (Resolve-Path -LiteralPath $PackageDir).Path }
+    if (Test-Path -LiteralPath $ZipPath) { $ZipPath = (Resolve-Path -LiteralPath $ZipPath).Path }
 
     # ------------------------------------------------------------ completeness
     Write-Host ""
