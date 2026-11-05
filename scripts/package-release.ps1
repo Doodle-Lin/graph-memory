@@ -188,6 +188,17 @@ foreach ($bin in $RustBins) {
 # README.md: copy the repository README and append the release notes.
 $readme = Join-Path $staging 'README.md'
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'README.md') -Destination $readme -Force
+# The repository README links to docs/ and desktop/ files; those only exist in a
+# source checkout, so rewrite the links that a release package cannot satisfy.
+$readmeText = [IO.File]::ReadAllText($readme, [Text.Encoding]::UTF8)
+$readmeText = $readmeText -replace '\]\(docs/design/RECALL_BASELINE\.md\)', '](RECALL_BASELINE.md)'
+$readmeText = $readmeText -replace '\]\(docs/design/([A-Z_]+\.md)\)', '](https://github.com/Doodle-Lin/graph-memory/blob/main/docs/design/$1)'
+$readmeText = $readmeText -replace '\]\(docs/([A-Z_]+\.md)\)', '](https://github.com/Doodle-Lin/graph-memory/blob/main/docs/$1)'
+$readmeText = $readmeText -replace '\]\(desktop/([A-Za-z_]+\.md)\)', '](https://github.com/Doodle-Lin/graph-memory/blob/main/desktop/$1)'
+$readmeText = $readmeText -replace '\]\(docs/legacy/README\.md\)', '](https://github.com/Doodle-Lin/graph-memory/blob/main/docs/legacy/README.md)'
+$readmeText = $readmeText -replace '\]\(SKILL\.md\)', '](https://github.com/Doodle-Lin/graph-memory/blob/main/SKILL.md)'
+[IO.File]::WriteAllText($readme, $readmeText, (New-Object Text.UTF8Encoding($false)))
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\design\RECALL_BASELINE.md') -Destination (Join-Path $staging 'RECALL_BASELINE.md') -Force
 $readmeTail = @'
 
 ---
