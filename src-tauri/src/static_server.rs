@@ -256,19 +256,33 @@ fn send_err(stream: &mut TcpStream, status: u16, msg: &str) {
     send_error(stream, status, &[], msg);
 }
 
-/// 拒绝响应写出后,尽量把对端已送达的字节排空再关闭连接。
+/// 写完拒绝响应后,让对端能完整读到它,再关闭连接(P3-F)。
 ///
 /// Windows 上如果关闭时接收缓冲里仍有未读数据,内核发的是 RST 而不是 FIN,
-/// 对端可能因此丢掉刚写出的错误响应(实测:431 + 40KB 头部时客户端收不到 431)。
-/// 这里用短超时 + 上限排空:既避免 RST,也不给滥用者留下无界读取。
+/// RST 会丢弃对端接收队列里**已经写好的**错误响应:实测 2 MiB/8 MiB 超限正文
+/// 只有部分轮次能读到 413,其余只剩 `ECONNRESET`(竞态,同一二进制同一轮内时好时坏)。
+///
+/// 因此关闭顺序固定为:
+/// 1. `shutdown(Write)` 半关闭:发 FIN,对端立刻能读到完整响应并看到 EOF,不再等我们;
+/// 2. 排空直到 **EOF**(对端发完 FIN)/ 空闲超时 / 总量上限;
+/// 3. 再 `shutdown(Both)` 关闭。
+///
+/// 上限与超时都必须保留:谎报 `Content-Length: 999999999` 只发几字节的客户端
+/// 不能让我们无限读(它不发 FIN 时由 250 ms 空闲超时结束)。
 fn drain_before_close(stream: &mut TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-    let mut scratch = [0u8; 8 * 1024];
+    const IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+    const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
+    // 半关闭必须先做:响应已 flush,对端读走响应后就能看到 EOF 并发回 FIN。
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
+    let mut scratch = [0u8; 64 * 1024];
     let mut drained = 0usize;
-    while drained < 256 * 1024 {
+    while drained < MAX_DRAIN_BYTES {
         match stream.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => drained += n,
+            // 空闲超时/连接已断:没有更多在途数据,可以安全关闭。
             Err(_) => break,
         }
     }
@@ -1055,6 +1069,10 @@ fn admit_connection(mut stream: TcpStream) -> Option<(TcpStream, ConnectionPermi
                 ),
             );
             let _ = stream.flush();
+            // 名额拒绝时对端还没发过任何请求字节(连接是空闲占满的),因此直接
+            // 半关闭写端即可:拿走响应和 FIN,再关闭。若这里改用排空,64 个空闲
+            // 连接会因为对端不关闭而各占用 250 ms 空闲超时。
+            let _ = stream.shutdown(std::net::Shutdown::Write);
             let _ = stream.shutdown(std::net::Shutdown::Both);
             None
         }
@@ -1096,7 +1114,10 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
             log_rejection(counter, reject.status(), reject.reason(), "");
             let _ = send_error(&mut stream, reject.status(), &[], &reject.message());
             let _ = stream.flush();
-            // 必须排空再关闭:否则 Windows 会发 RST,把刚写出的 4xx 响应丢掉。
+            // 必须"半关闭 + 排空"再关闭:否则 Windows 会发 RST,把刚写出的
+            // 4xx 响应丢掉。413 时客户端可能正在推送大量正文字节,排空会一直
+            // 读到对端 FIN 或 250 ms 空闲超时(谎报 Content-Length 时无人发送,
+            // 立即超时返回,不会变慢)。
             drain_before_close(&mut stream);
             return;
         }
@@ -1557,6 +1578,110 @@ mod limits_tests {
         let _ = stream.write_all(request.as_bytes());
         let head = read_head(&mut stream);
         assert_json_error(&head, 413);
+    }
+
+    /// 响应头结束且正文字节数达到 Content-Length 时视为读完整。
+    fn response_is_complete(buf: &[u8]) -> bool {
+        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+        let declared = head
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        matches!(declared, Some(len) if buf.len() >= end + 4 + len)
+    }
+
+    /// 真实客户端场景(P3-F):声明**并实际发送**远超 1 MiB 的正文,正文在独立
+    /// 线程里推送。服务端在读取中途就 413,然后半关闭写端并排空;客户端必须能
+    /// 读到完整 413,而不是 `ECONNRESET`。发送线程的 write 可能因为服务端停止
+    /// 接收而失败,这正是不稳定行为的表现,不影响"响应是否可读"的断言。
+    fn oversized_body_response(port: u16, size: usize) -> String {
+        let mut stream = connect(port);
+        let request = format!(
+            "POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            size
+        );
+        let mut writer = stream.try_clone().expect("clone stream for sender");
+        let sender = std::thread::spawn(move || {
+            let mut payload = request.into_bytes();
+            payload.resize(payload.len() + size, b'a');
+            let _ = writer.write_all(&payload);
+            let _ = writer.shutdown(std::net::Shutdown::Write);
+        });
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 64 * 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if response_is_complete(&buf) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = sender.join();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// P3-F 回归:声明并实际发送 1 MiB + 3 / 2 MiB / 8 MiB 正文时,**每一轮**都必须
+    /// 收到可读的 413 全文(此前同一二进制会在部分轮次只发 RST,客户端 `ECONNRESET`)。
+    #[test]
+    fn oversized_bodies_always_answer_with_a_readable_413() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        let expected = format!(
+            r#"{{"error":"request body must not exceed {} bytes"}}"#,
+            MAX_BODY_BYTES
+        );
+        for size in [MAX_BODY_BYTES + 3, 2 * MAX_BODY_BYTES, 8 * MAX_BODY_BYTES] {
+            for round in 1..=3 {
+                let response = oversized_body_response(port, size);
+                assert!(
+                    response.starts_with("HTTP/1.1 413 Payload Too Large"),
+                    "size={} round={} expected a readable 413, got {:?}",
+                    size,
+                    round,
+                    &response[..response.len().min(120)]
+                );
+                assert!(
+                    response.contains(&expected),
+                    "size={} round={} missing JSON error body in {:?}",
+                    size,
+                    round,
+                    &response[..response.len().min(200)]
+                );
+            }
+        }
+    }
+
+    /// 同一监听端口连续多轮(等价于连接池/客户端复用服务端)都必须拿到可读的 413,
+    /// 且中途插入的正常请求不受影响。
+    #[test]
+    fn repeated_oversized_requests_stay_readable_and_service_recovers() {
+        let _gate = test_gate();
+        let port = spawn_listener();
+        for round in 1..=6 {
+            let response = oversized_body_response(port, 2 * MAX_BODY_BYTES);
+            assert!(
+                response.starts_with("HTTP/1.1 413"),
+                "round {} expected 413, got {:?}",
+                round,
+                &response[..response.len().min(120)]
+            );
+        }
+        let mut stream = connect(port);
+        let _ = stream.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let head = read_head(&mut stream);
+        assert!(
+            status_line(&head).starts_with("HTTP/1.1 200"),
+            "service did not recover: {:?}",
+            status_line(&head)
+        );
     }
 
     /// 不可解析的 Content-Length → 400(不 panic,不按 0 继续处理)。

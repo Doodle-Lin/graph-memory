@@ -414,5 +414,74 @@ class ProtocolLimitsTest(unittest.TestCase):
             time.sleep(.25)
         self.fail('service did not recover after the concurrency burst')
 
+    def _oversized_response(self,size,declared=None):
+        """Send an over-limit request body and return (raw response, reset, errors).
+
+        The body is pushed from a background thread, like a real client streaming a
+        large payload: the server answers 413 mid-read. P3-F: the response used to
+        be discarded by an RST in some rounds, so only ``ECONNRESET`` was visible.
+        """
+        import threading
+        declared=size if declared is None else declared
+        sock=socket.create_connection(('127.0.0.1',self.port),timeout=5)
+        sock.settimeout(25)
+        prefix=('POST /api/v1/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                'Content-Type: application/json\r\nContent-Length: %d\r\n\r\n'%declared).encode()
+        payload=(prefix+b'{"name":"x"}'+b'a'*size)[:len(prefix)+size]
+        errors=[]
+        def sender():
+            try:
+                sock.sendall(payload)
+            except OSError as error:
+                # The sender may lose the race against the server's rejection; that
+                # is expected and must not hide the response.
+                errors.append(type(error).__name__)
+        thread=threading.Thread(target=sender,daemon=True)
+        thread.start()
+        data=b''
+        reset=None
+        try:
+            while b'\r\n\r\n' not in data:
+                chunk=sock.recv(65536)
+                if not chunk:
+                    break
+                data+=chunk
+            if b'\r\n\r\n' in data:
+                head,rest=data.split(b'\r\n\r\n',1)
+                length=None
+                for line in head.decode('latin-1').split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        length=int(line.split(':',1)[1])
+                while length is not None and len(rest)<length:
+                    chunk=sock.recv(65536)
+                    if not chunk:
+                        break
+                    rest+=chunk
+                data=head+b'\r\n\r\n'+rest
+        except (ConnectionResetError,ConnectionAbortedError) as error:
+            reset=type(error).__name__
+        finally:
+            sock.close()
+        thread.join(timeout=3)
+        return data,reset,errors
+
+    def test_oversized_body_always_answers_with_readable_413(self):
+        # Every round must yield a fully readable 413, for a range of oversizes.
+        for size in [1024*1024+3,2*1024*1024,8*1024*1024,2*1024*1024,8*1024*1024]:
+            data,reset,errors=self._oversized_response(size)
+            self.assertTrue(
+                data.startswith(b'HTTP/1.1 413 Payload Too Large'),
+                'size=%d reset=%s sender_errors=%s response=%r'%(size,reset,errors,data[:160]))
+            body=data.split(b'\r\n\r\n',1)[1]
+            self.assertEqual(body,b'{"error":"request body must not exceed 1048576 bytes"}',
+                'size=%d truncated or wrong body: %r'%(size,body))
+        # Lying Content-Length with only a couple of bytes still gets a readable 413.
+        data,reset,errors=self._oversized_response(2,declared=99999999)
+        self.assertTrue(data.startswith(b'HTTP/1.1 413'),'lying: reset=%s data=%r'%(reset,data[:160]))
+        self.assertEqual(data.split(b'\r\n\r\n',1)[1],b'{"error":"request body must not exceed 1048576 bytes"}')
+        # The listener must still serve normal traffic afterwards.
+        status,headers,_=self.raw(b'GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+        self.assertEqual(status,200,headers)
+
 if __name__=='__main__':
     unittest.main()
