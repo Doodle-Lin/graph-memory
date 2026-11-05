@@ -121,37 +121,21 @@ fn piece_hits(field: &str, units: &[String]) -> (bool, usize) {
     (matched >= 2, matched)
 }
 
-/// P4-C: the longest suffix of the query's n-grams that the field contains and that ends
-/// where the field ends.
-///
-/// A record's free text is usually a statement whose *last* characters carry its result
-/// ("…延迟恢复到 5 分钟以内"), so a question ending in the same wording is real evidence
-/// of relevance. This is the one place a single n-gram is allowed to admit a record, and
-/// only when it sits at the end of the field — a lone n-gram in the middle of unrelated
-/// prose ("网络" inside "神经网络 都不相关") still never matches on its own.
-fn content_tail_grams(content: &str, units: &[String]) -> usize {
-    if units.len() < 2 || !content.ends_with(&units[units.len() - 1]) {
-        return 0;
-    }
-    let mut run = 1usize;
-    while run < units.len()
-        && content.contains(&units[units.len() - run - 1..].concat())
-    {
-        run += 1;
-    }
-    run
-}
-
-/// P4-C: a record enters the result as follows.
+/// P4-D: a record enters the result as follows.
 ///
 /// * Multi-piece query (rule A, unchanged P0-A1 contract): **every** piece must hit at
 ///   least one indexed field (whole piece or >= 2 of its n-grams), otherwise the record
 ///   is rejected. Relaxing this is what produced the false-recall regression on
-///   unrelated multi-topic probes, so rule A also ignores the content-tail signal.
+///   unrelated multi-topic probes.
 /// * Single long CJK piece (rule B): it is enough that the piece's n-grams hit at least
-///   two distinct positions, or that **one** n-gram lands in the `title`/`conditions`, or
-///   that the record's content ends with the query's n-gram run. A lone n-gram in the
-///   middle of the content (``网络`` inside ``神经网络 都不相关``) is still not evidence.
+///   two distinct positions, or that **one** n-gram lands in the `title`/`conditions`.
+///   A lone n-gram in the content — wherever it sits — is not evidence on its own
+///   (``网络`` inside ``神经网络 都不相关`` must never admit the record).
+///
+/// P4-C 曾额外放宽过一条"bigram 连续段正好落在 `content` 末尾"（rule 3）。task-25 的
+/// 独立复核用对抗语料证伪：5 条以常见二元词收尾的记录 + 10 条句尾同形的无关问句，
+/// 真实服务 10/10 误召回（去掉该规则后 3/10），且在官方 68 条 / 自建 53 条 / 专项 17 条
+/// 三套语料上**召回与名次逐位不变**（tail 命中次数为 0）。故已整条删除。
 ///
 /// Score: 3 per unit in the title, 1 per unit in the content, 1 per unit in the
 /// conditions, plus 0.5 per additional n-gram hit beyond the first.
@@ -171,25 +155,22 @@ fn match_terms(body: &Value, pieces: &[Vec<String>]) -> Option<f64> {
         let (title_hit, title_grams) = piece_hits(&title, units);
         let (content_hit, content_grams) = piece_hits(&content, units);
         let (conditions_hit, conditions_grams) = piece_hits(&conditions, units);
-        // Rule B only relaxes a single, long CJK piece; rule A stays strict, so the
-        // content-tail signal is only consulted for a single-piece query.
-        let (tail_grams, lone_title, lone_conditions) = if pieces.len() == 1 && units.len() > 1 {
+        // Rule B only relaxes a single, long CJK piece; rule A stays strict.
+        let (lone_title, lone_conditions) = if pieces.len() == 1 && units.len() > 1 {
             (
-                content_tail_grams(&content, units),
                 units.iter().any(|unit| unit_hits(&title, unit)),
                 units.iter().any(|unit| unit_hits(&conditions, unit)),
             )
         } else {
-            (0, false, false)
+            (false, false)
         };
-        if !(title_hit || content_hit || conditions_hit || tail_grams > 0 || lone_title || lone_conditions)
-        {
+        if !(title_hit || content_hit || conditions_hit || lone_title || lone_conditions) {
             return None;
         }
         if title_hit || lone_title {
             title_hits += 1;
         }
-        if content_hit || tail_grams > 0 {
+        if content_hit {
             content_hits += 1;
         }
         if conditions_hit || lone_conditions {
@@ -198,7 +179,6 @@ fn match_terms(body: &Value, pieces: &[Vec<String>]) -> Option<f64> {
         extra_grams += title_grams
             .max(content_grams)
             .max(conditions_grams)
-            .max(tail_grams)
             .saturating_sub(1);
     }
     Some(
@@ -1176,6 +1156,18 @@ mod tests {
         assert_eq!(match_terms(&content_hits, &query_piece_units("查端口")), None);
         // Exactly two bigrams are enough (端口 + 口冲).
         assert_eq!(match_terms(&content_hits, &query_piece_units("查端口冲")), Some(1.0 + 0.5));
+
+        // P4-D: a lone bigram in the content is never enough — *wherever* it sits,
+        // including at the very end of the content. This is the direct regression guard
+        // for the deleted rule 3 (task-25 proved it produced tail-shaped false recalls).
+        let tail_content =
+            json!({"title":"","content":"巡检排班改为两班倒，新排班从下周一开始","conditions":""});
+        // "开始" is both the content's last bigram and the query's last bigram: rejected.
+        assert_eq!(match_terms(&tail_content, &query_piece_units("城市马拉松报名开始")), None);
+        // Same position, but two bigrams hit (新排 + 排班 + 开始) -> admitted.
+        assert_eq!(match_terms(&tail_content, &query_piece_units("新排班开始")), Some(2.0));
+        // A lone bigram in the middle stays rejected too (unchanged rule).
+        assert_eq!(match_terms(&tail_content, &query_piece_units("查排班")), None);
     }
 
     /// P0-A1: relevance comes before freshness; equal scores fall back to updated_at then id.

@@ -143,22 +143,22 @@ HTTP 200
 
 ---
 
-# 7. P4-A / P4-C 之后（task-22 / task-24）：检索策略收紧
+# 7. P4-A / P4-C / P4-D 之后（task-22 / task-24 / task-25）：检索策略收紧
 
 **上面第 1~6 节的数字全部保留**，测的是基线二进制
 `artifacts/eval/frozen/graph-memory-service.exe`（SHA256 `1A946287…7847`）。
-本节追加后续两次实测；每次都在**同一数据集/夹具**（哈希仍为 `0b67686e…da1b` / `0cd5ee55…8441`）上，
+本节追加后续实测；每次都在**同一数据集/夹具**（哈希仍为 `0b67686e…da1b` / `0cd5ee55…8441`）上，
 用 `python -X utf8 tests/eval/run_eval.py` 产出 `report.json`。
 
 ## 7.1 测的是哪个二进制
 
-| 版本 | 二进制（本次构建，隔离 target） | SHA256 | report |
+| 版本 | 二进制（隔离 target 构建） | SHA256 | report |
 | --- | --- | --- | --- |
 | P4-A（放宽匹配，**已判不合入**） | `artifacts/p4-cargo-target/debug/graph-memory-service.exe` | `060C407A7F936A0EDFF9264441FFFCA47FC360AF3367241D26E15AB2A00263E7` | `artifacts/eval/p4a-2/` |
-| **P4-C（收紧后，当前）** | 同上路径 | `54F1F3C10D3E71295A8017B57E45BAA17D58C085B1FAA767992D496148B4DFE2` | `artifacts/eval/p4b-7/`、`artifacts/eval/p4b-8/`（另有中间构建 `p4b-3/4/5/6`，指标相同） |
+| P4-C（收紧后，规则③曾暂留） | 同上路径 | `54F1F3C10D3E71295A8017B57E45BAA17D58C085B1FAA767992D496148B4DFE2` | `artifacts/eval/p4b-7/`、`p4b-8/`（中间构建 `p4b-3/4/5/6` 指标相同） |
+| **P4-D（规则③已删除，当前）** | 同上路径 | `116E340A42949C9D84D5A36AA1ACC84E88FA96AD491D66EDD80A1DA835B016D9` | `artifacts/eval/p4d-1/` |
 
-六次 P4-C 运行（p4b-3 ~ p4b-8）指标逐位相同；基线 run-1 / run-2 亦完全相同。
-（它们是同一策略的几个构建；p4b-7/8 为最终代码的二进制，哈希见上。）
+各版本多次运行指标逐位相同；基线 run-1 / run-2 亦完全相同。
 
 ## 7.2 逐指标对照
 
@@ -200,15 +200,22 @@ HTTP 200
   （`scripts/verify-usability.ps1` 的 S-A1-04 FAIL）。
 - P4-C 的规则（已写入 `docs/design/USABILITY_P0.md` 的 A1）：
   1. 片段数 ≥ 2 时**恢复 AND**（每个片段都要命中）；
-  2. 只有"单片段且是长 CJK"才放宽：≥2 个 bigram 命中，或单个 bigram 命中 `title`/`conditions`，
-     或 bigram 连续段正好落在 `content` 末尾；正文中部的孤立 bigram 不放行。
+  2. 只有"单片段且是长 CJK"才放宽：≥2 个 bigram 命中，或单个 bigram 命中 `title`/`conditions`；
+     正文里落单的一个 bigram 不放行（无论位置）。
 - 结果：召回收益**完全保住**（R@5 0.8571、不照抄类 0.5333），MRR 还比 P4-A 高（0.8469 vs 0.8367），
   误召回与违约代价**全部消失**（30 条同形探针 9/30 → 0/30，S-A1-04 恢复 PASS，
   `returned_total` 144 → 131）。
-- 规则 3（正文尾部连续段）是本次唯一超出复核者建议的放宽，收益是 2 条查询
-  （P4 名次 2 → 1、P13 漏召回 → 命中），代价为 0（探针仍 0/30、无答案仍 0/10）。
-  **必须如实说明**：它是对 `content` 末尾措辞的利用，在不同语料上可能带来新的假阳性，
-  目前的证据只能支持"在这两个语料上无误召回"。
+- P4-C 期间还暂留过一条**规则③**（"bigram 连续段正好落在 `content` 末尾"）。task-25 独立复核
+  （`artifacts/usability-verify/p4-verifier3/p4c-followup/`）判定**必须删除**，理由：
+  1）它在官方 68 条（42/49）、复核者自建 53 条（37/41）、专项 17 条（11/11）三套语料上
+  **从未触发**——rule3 开/关的召回与名次逐位相同，尾部命中次数为 0，故先前归因给它的
+  "P4 名次 2→1、P13 命中"属**错误归因**；
+  2）对抗语料（5 条以常见二元词收尾的记录 + 10 条句尾同形的无关问句）真实服务 **10/10 误召回**。
+- **P4-D**：删除规则③后，官方指标**逐位不变**（R@5 0.8571428571 / MRR 0.8469387755 /
+  不照抄类 0.5333 / returned_total 131 / 无答案 0/10），30 条同形探针仍 **0/30**，
+  而 rule3 专项对抗探针由 **10/10** 降到 **3/10**（余下 3 条来自规则 2.2 单 bigram 命中 `title`，
+  与规则③无关，也是复核者给出的 rule3-off 基线）。
+  证据：`artifacts/eval/p4d-1/`、`artifacts/p4-recall/false-recall-p4d.json`、`rule3-after.json`。
 
 ## 7.4 精度回归资产（永久）
 
@@ -216,7 +223,7 @@ HTTP 200
   的同形探针（与官方 `no_answer` 类同形）。
 - `tests/eval/check_false_recall.py`：在真实服务上逐条查询并断言 `total == 0`。
   实测：冻结基线 **0/30**（returned_total=0），P4-A **9/30**（returned_total=28），
-  P4-C **0/30**（returned_total=0）。以后每次改动都必须重跑这条断言。
+  P4-C **0/30**（returned_total=0），P4-D **0/30**（returned_total=0）。以后每次改动都必须重跑这条断言。
 
 ## 7.5 验收记录（P4-C）
 
