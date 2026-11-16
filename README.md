@@ -64,6 +64,7 @@
 - [中文检索基线](docs/design/RECALL_BASELINE.md)
 - [长期规划](docs/design/LONG_TERM_PLAN.md)
 - [执行账本](docs/design/EXECUTION_LEDGER.md)
+- [项目端到端验证技能](.agents/skills/verify-graph-memory/SKILL.md)
 - [旧版入口说明](docs/legacy/README.md)
 
 ## 边界
