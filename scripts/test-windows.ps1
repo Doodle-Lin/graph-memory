@@ -93,13 +93,29 @@ try {
         '-X', 'utf8', 'tests/test_backup_cli.py'
     )
 
+    Invoke-Native -Label 'P4 recall quality gate' -FilePath $Python -CommandArgs @(
+        '-X', 'utf8', 'tests/eval/run_eval.py', '--exe', 'src-tauri/target/debug/graph-memory-service.exe',
+        '--out-dir', 'artifacts/ci-eval', '--check-p4'
+    )
+    Invoke-Native -Label 'False recall probes' -FilePath $Python -CommandArgs @(
+        '-X', 'utf8', 'tests/eval/check_false_recall.py', '--exe', 'src-tauri/target/debug/graph-memory-service.exe'
+    )
+
     Invoke-Native -Label 'Setup console tests' -FilePath $Dotnet -CommandArgs @(
         'run', '--project', $setupTestProject, '-c', 'Release'
     )
 
-    Invoke-Native -Label 'Editor console tests' -FilePath $Dotnet -CommandArgs @(
-        'run', '--project', $editorTestProject, '-c', 'Release'
+    Invoke-Native -Label 'Build editor test harness' -FilePath $Dotnet -CommandArgs @(
+        'build', $editorTestProject, '-c', 'Release', '--nologo'
     )
+    # Run the built harness directly and require its terminal completion marker.
+    # A zero launcher exit alone must not count as completion of the UI suite.
+    $editorOutput = & $Dotnet (Join-Path $repo 'tests/Desktop.Editor.Tests/bin/Release/net10.0/Desktop.Editor.Tests.dll') 2>&1
+    $editorExit = $LASTEXITCODE
+    $editorOutput | ForEach-Object { Write-Host $_ }
+    if ($editorExit -ne 0 -or (($editorOutput -join "`n") -notmatch 'PASS [0-9]+ editor checks')) {
+        throw "Editor suite did not complete successfully (exit $editorExit)"
+    }
 
     if (-not (Test-Path -LiteralPath $desktopExe -PathType Leaf)) {
         throw "Published desktop executable not found: $desktopExe"

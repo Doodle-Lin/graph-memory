@@ -487,6 +487,7 @@ def main():
     parser.add_argument("--out-dir", default=os.path.join(REPO, "artifacts", "eval"))
     parser.add_argument("--label", default=None)
     parser.add_argument("--keep-data", action="store_true")
+    parser.add_argument("--check-p4", action="store_true", help="Fail below accepted P4 quality floors or on scope/retraction leakage")
     args = parser.parse_args()
 
     exe = os.path.abspath(args.exe)
@@ -555,6 +556,17 @@ def main():
         summary = {"out_dir": out_dir, "metrics": metrics, "seed_failures": seed_failures,
                    "exe_sha256": exe_sha, "per_category": per_category}
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if args.check_p4:
+            failures = []
+            for key, minimum in {"recall_at_5": 0.8571428571, "mrr": 0.8469387755}.items():
+                if metrics[key] + 1e-9 < minimum:
+                    failures.append(f"{key}: {metrics[key]} < {minimum}")
+            for key in ("cross_project_returned", "no_answer_false_recall", "retracted_leaks_default_search"):
+                if metrics[key] != 0:
+                    failures.append(f"{key}: expected 0, got {metrics[key]}")
+            if failures:
+                raise RuntimeError("P4 quality gate failed: " + "; ".join(failures))
+
     finally:
         if proc is not None and proc.poll() is None:
             proc.terminate()

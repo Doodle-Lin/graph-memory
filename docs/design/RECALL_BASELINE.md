@@ -1,5 +1,7 @@
 # 中文检索基线（L4-01 / P3 task-17）
 
+本文保留P3历史基线。当前P4复测为 Recall@5 0.857143 / MRR 0.846939，详情及执行命令见[治理记录](GOVERNANCE_20261116.md)。不要将下面的P3数字当成当前交付指标。
+
 本文件只记录**实测**数字。每个数字都能在 `artifacts/eval/run-1/report.json` 与
 `artifacts/eval/run-2/report.json` 里找到来源；同夹具下两次运行的指标完全相同。
 
