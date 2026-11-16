@@ -51,6 +51,8 @@ fn log_rejection(counter: &AtomicU64, status: u16, reason: &str, detail: &str) {
 pub struct ModelState {
     pub memory_store: Option<Arc<Mutex<crate::memory_store::MemoryStore>>>,
     pub service_info: Option<Arc<serde_json::Value>>,
+    /// P5: shared bounded-semantic runtime (status/`prepare`); offline by default.
+    pub semantic: Option<Arc<crate::semantic::SemanticRuntime>>,
     pub downloading: Arc<AtomicBool>,
     pub done: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
@@ -65,6 +67,7 @@ impl ModelState {
         Self {
             service_info: None,
             memory_store: None,
+            semantic: None,
             downloading: Arc::new(AtomicBool::new(false)),
             done: Arc::new(AtomicBool::new(false)),
             error: Arc::new(Mutex::new(None)),
@@ -1143,6 +1146,23 @@ fn handle(mut stream: TcpStream, root: Option<&Path>, state: &ModelState, eng: O
         }
     }
     if clean.starts_with("/api/v1/") {
+        // P5 §3.3: `POST /api/v1/models/prepare` must work even when the experimental
+        // service has no memory DB; it is the only entry point that may use the network.
+        if method == "POST" && clean == "/api/v1/models/prepare" {
+            match state.memory_store.as_ref() {
+                Some(store) => match store.lock().unwrap().route(method, clean, parse_json_body(&req.body)) {
+                    Ok(value) => send_json(&mut stream, value),
+                    Err(error) => send_err(&mut stream, error.0, &error.1),
+                },
+                None => match &state.semantic {
+                    Some(runtime) => {
+                        send_json(&mut stream, serde_json::json!({"semantic": runtime.prepare()}))
+                    }
+                    None => send_err(&mut stream, 503, "semantic runtime unavailable in this mode"),
+                },
+            }
+            return;
+        }
         if let Some(store) = &state.memory_store {
             match store.lock().unwrap().route(method, clean, parse_json_body(&req.body)) {
                 Ok(value) => send_json(&mut stream, value),

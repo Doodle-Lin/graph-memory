@@ -65,7 +65,7 @@ public partial class MainWindow : Window {
         }catch{Find<TextBlock>("AgentStatus").Text="接入状态暂不可用";Find<TextBlock>("AgentDetail").Text="请刷新或重试连接；未将服务可用推断为 Agent 已接入。";}
         finally{checkingActivity=false;}
     }
-    async void RefreshClick(object? s,RoutedEventArgs e)=>await Run(async()=>{await RefreshWorkspaceDirectoryAsync();await LoadProjects();await LoadMemories();await RestoreDraftsAfterLoad();await LoadAgentStatus();});
+    async void RefreshClick(object? s,RoutedEventArgs e)=>await Run(async()=>{await RefreshWorkspaceDirectoryAsync();await LoadProjects();await LoadMemories();await RestoreDraftsAfterLoad();await LoadAgentStatus();await RefreshSemanticStatusAsync();});
     readonly Dictionary<string,(DispatcherTimer timer,object? label)> copyFeedback=new();
     // Restart the acknowledgement on repeat clicks; timers never hold the busy gate.
     void ShowCopied(string name){
@@ -171,6 +171,14 @@ public partial class MainWindow : Window {
         Find<Button>("ConfirmRestoreButton").IsEnabled=restorable;
     }
     void CloseDataPanelClick(object? s,RoutedEventArgs e){Find<Border>("DataPanel").IsVisible=false;Find<Grid>("HomePanel").IsVisible=true;Find<StackPanel>("EmptyState").IsVisible=false;}
+    // P5-C：语义入口与数据面板同级；打开时同步一次真实状态（旧服务缺字段只会显示“未知”，不报错、不阻塞）。
+    async void SemanticPanelClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
+        ShowEditor(false);Find<Grid>("HomePanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=false;Find<Border>("SemanticPanel").IsVisible=true;
+        RenderSemanticPanel();
+        await RefreshSemanticStatusAsync();
+        if(semanticStatus.IsBusy)StartSemanticPolling();
+    });
+    void CloseSemanticPanelClick(object? s,RoutedEventArgs e){Find<Border>("SemanticPanel").IsVisible=false;Find<Grid>("HomePanel").IsVisible=true;RenderSemanticPanel();}
     async void DataPanelClick(object? s,RoutedEventArgs e)=>await Run(async()=>{
         ShowEditor(false);Find<Grid>("HomePanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=true;
         RefreshDataPanel();
@@ -269,14 +277,14 @@ public partial class MainWindow : Window {
     bool HasDraft()=>selected==null
         ? !string.IsNullOrWhiteSpace(Text("TitleInput")+Text("ContentInput")+Text("SourceInput")+Text("ConditionsInput")) || SelectedEvidence()!=EvidenceTags.Statement
         : Text("TitleInput")!=selected.Title || Text("ContentInput")!=selected.Text("content") || Text("SourceInput")!=selected.Text("source") || Text("ConditionsInput")!=selected.Text("conditions") || SelectedKind()!=selected.Text("kind") || SelectedEvidence()!=selected.EvidenceType;
-    void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
+    void ShowEditor(bool show){Find<Border>("SetupPanel").IsVisible=false;Find<Border>("DataPanel").IsVisible=false;Find<Border>("SemanticPanel").IsVisible=false;if(!show)Find<ListBox>("Memories").SelectedItem=null;Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";Find<Border>("EditorPanel").IsVisible=show;Find<Grid>("HomePanel").IsVisible=!show;}
     void CloseEditorClick(object? s,RoutedEventArgs e){if(busy)return;if(!HasDraft())ClearEditor();ShowEditor(false);Find<Button>("NewMemoryButton").Content=HasDraft()?"继续编辑":"记一条";}
     void StatusMessage(string text)=>Find<TextBlock>("Status").Text=text;
     // 列表区的加载/失败状态：加载中与失败都可见，失败文案包含可执行动作。
     void ShowListStatus(string text){Find<Border>("ListStatusPanel").IsVisible=true;Find<TextBlock>("ListStatus").Text=text;}
     void HideListStatus(){Find<Border>("ListStatusPanel").IsVisible=false;Find<TextBlock>("ListStatus").Text="";}
     static string? FailureNote(Exception e)=>e is AggregateException aggregate&&aggregate.InnerException!=null?aggregate.InnerException.Message:e.Message;
-    public MainWindow(){AvaloniaXamlLoader.Load(this);InitializeKinds();InitializeDraftPersistence();Closing+=WindowClosing;KeyDown+=WindowKeyDown;Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();draftTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
+    public MainWindow(){AvaloniaXamlLoader.Load(this);InitializeKinds();InitializeDraftPersistence();InitializeSemantic();Closing+=WindowClosing;KeyDown+=WindowKeyDown;Opened+=async (_,_)=>{await Connect();activityTimer.Start();};activityTimer.Tick+=async (_,_)=>await LoadAgentStatus();Closed+=(_,_)=>{activityTimer.Stop();draftTimer.Stop();semanticTimer.Stop();foreach(var feedback in copyFeedback.Values)feedback.timer.Stop();copyFeedback.Clear();client?.Dispose();};}
     async Task Run(Func<Task> action){if(busy)return;busy=true;try{await action();}catch(Exception e){bool conflict=e.Message.Contains("HTTP 409");Find<Button>("ReloadButton").IsVisible=conflict&&selected!=null;Find<Button>("ReconnectButton").IsVisible=!conflict;var note=conflict?"记录已被其他会话修改，草稿仍保留。可加载历史核对；放弃草稿后再载入最新版本。":e.Message;if(closeSaveNote!=""){note+=" "+closeSaveNote;closeSaveNote="";}StatusMessage(note);}finally{busy=false;}}
     async Task Connect()=>await Run(async()=>{
         StatusMessage("正在连接本地服务…");ShowListStatus("正在加载记忆列表…");EmptyStateOff();
@@ -285,6 +293,7 @@ public partial class MainWindow : Window {
             await RefreshWorkspaceDirectoryAsync();
             await LoadProjects();await LoadMemories();await LoadAgentStatus();
             LoadPersistedDrafts();
+            await RefreshSemanticStatusAsync();
             Find<Button>("ReconnectButton").IsVisible=false;RefreshDataPanel();StatusMessage("");
         }catch(Exception e){
             // 连接阶段失败也要给出可操作状态；随后重抛，保留 Run 既有的状态栏与“重试连接”反馈。
@@ -302,7 +311,7 @@ public partial class MainWindow : Window {
     async Task LoadMemories(){
         ShowListStatus("正在加载记忆列表…");EmptyStateOff();
         JsonNode response;
-        try{response=await Api().PostAsync("api/v1/search",new {project_id=project?.Id,query=Text("Query"),include_retracted=ShowRetracted()});}
+        try{response=await Api().PostAsync("api/v1/search",BuildSearchBody(project?.Id,Text("Query"),ShowRetracted(),settings.SearchEnabled));}
         catch(Exception e){
             Find<ListBox>("Memories").ItemsSource=null;
             Find<Button>("ReconnectButton").IsVisible=true;
@@ -327,6 +336,7 @@ public partial class MainWindow : Window {
         banner.IsVisible=ShowRetracted()||excluded>0;
         banner.Text=ShowRetracted()?$"已显示撤回记录 {shown} 条；默认不显示时服务端排除了 {excluded} 条。":$"另有 {excluded} 条已撤回记录未显示，可勾选“显示已撤回”查看。";
         await LoadContinuation();
+        ApplySemanticFromResponse(response);
     }
     // 续接区：仅当续接摘要里出现阻塞或下一步时才显示，检查的是服务端返回的 memory.kind，而不是 text 里的自然语言。
     async Task LoadContinuation(){

@@ -5,6 +5,7 @@ mod llm_extract;
 pub mod static_server;
 pub mod service;
 pub mod memory_store;
+pub mod semantic;
 pub mod backup_format;
 pub mod backup_io;
 

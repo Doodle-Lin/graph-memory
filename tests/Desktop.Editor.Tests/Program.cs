@@ -9,6 +9,9 @@ using System.Text.Json.Nodes;
 
 // P3-A：同一个可执行文件既是套件，也是“进程 A 写草稿后被 Kill / 进程 B 读回”的探针端。
 if(args.Length>0&&args[0]=="--draft-probe"){DraftProbe.Run(args);return;}
+// P5-C：GUI 冒烟探针——用真实 MainWindow 打开“语义检索（模型）”面板并打印它看到的状态，
+// 用于“没有 fake 注入、直接连真实服务”的手工验证证据。
+if(args.Length>0&&args[0]=="--p5-probe"){P5Probe.Run(args);return;}
 
 var binary=Path.GetFullPath(args.Length>0?args[0]:"src-tauri/target/debug/graph-memory-service.exe");
 var directory=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-editor-"+Guid.NewGuid().ToString("N"));
@@ -269,7 +272,10 @@ try {
     Trace("start");
     // 探针子进程写完后会停住等父进程 Kill(整棵树) 来模拟崩溃，整段必须有硬超时，否则失败会留下孤儿进程。
     var draftDeadline=DateTime.UtcNow.AddMinutes(4);
-    var draftWatchdog=new Thread(()=>{while(DateTime.UtcNow<draftDeadline)Thread.Sleep(500);Trace("watchdog timeout");Environment.Exit(4);}){IsBackground=true};
+    // 看门狗必须在 P3 段正常结束后“退出而不杀进程”：P3 之后还追加了 P5 用例，
+    // 原来的写法只要 deadline 被 finally 提前到当前时刻就会立刻 Environment.Exit(4)，把后续用例一起杀掉。
+    var draftFinished=0;
+    var draftWatchdog=new Thread(()=>{while(Volatile.Read(ref draftFinished)==0&&DateTime.UtcNow<draftDeadline)Thread.Sleep(500);if(Volatile.Read(ref draftFinished)==0){Trace("watchdog timeout");Environment.Exit(4);}}){IsBackground=true};
     draftWatchdog.Start();
     try{
         Trace("host service");
@@ -554,6 +560,7 @@ try {
             Console.WriteLine("OK stale baseline warns, 409 keeps the persisted draft, reload clears it");
         } finally { otherHost.StopOwned(); }
     } finally {
+        Volatile.Write(ref draftFinished,1);   // 先标记已结束，看门狗不会再杀进程
         draftDeadline=DateTime.UtcNow;
         draftWindow?.Close();
         draftHost.StopOwned();
@@ -561,6 +568,283 @@ try {
         try{System.IO.Directory.Delete(draftHostDirectory,true);}catch{}
         Trace("done");
     }
+
+
+
+    // ===================== P5-C 语义检索桌面体验（本机离线模型） =====================
+    // 契约：docs/design/P5_SEMANTIC_CONTRACT.md §2.2（降级最小惊讶）/ §3.2（semantic 响应对象）/
+    //       §3.3 + v1.1（state 与 progress 进度字段）/ §5（只在显式触发时下载）。
+    // 这一段只用真实控件 + 真实落盘 + 可注入的假服务；真实旧服务（0.3.0，无 semantic 字段）
+    // 也在这里跑一遍，用来证明“模型未就绪 / 服务不支持时，桌面端一切照旧”。
+    {
+        var p5Root=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-p5-drafts-"+Guid.NewGuid().ToString("N"));
+        var p5Data=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-p5-data-"+Guid.NewGuid().ToString("N"));
+        var p5HostDirectory=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-p5-host-"+Guid.NewGuid().ToString("N"));
+        var p5Trace=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-p5-trace-"+Guid.NewGuid().ToString("N")+".log");
+        void P5Trace(string stage){try{System.IO.File.AppendAllText(p5Trace,DateTime.UtcNow.ToString("HH:mm:ss.fff")+" "+stage+"\n");}catch{}}
+        var previousDraftDir=Environment.GetEnvironmentVariable("GM_DRAFT_DIR");
+        Environment.SetEnvironmentVariable("GM_DRAFT_DIR",p5Root);
+        var p5Host=new ServiceHost();
+        try {
+            P5Trace("start");
+            var p5Url=Task.Run(()=>p5Host.EnsureAsync(["--data-dir",p5Data,"--service-exe",binary])).GetAwaiter().GetResult();
+            P5Trace("host up "+p5Url);
+            using var p5Client=new ServiceClient(p5Url);
+            object? P5Invoke(MainWindow target,string name,params object?[] parameters)=>typeof(MainWindow).GetMethod(name,flags)!.Invoke(target,parameters);
+            MainWindow P5Window(ISemanticService? semantics){
+                typeof(MainWindow).Assembly.GetType("GraphMemory.Desktop.Program")!.GetField("Arguments",BindingFlags.Static|BindingFlags.Public)!.SetValue(null,new[]{"--service-url",p5Url});
+                var created=new MainWindow();
+                typeof(MainWindow).GetField("client",flags)!.SetValue(created,new ServiceClient(p5Url));
+                if(semantics!=null)P5Invoke(created,"UseSemanticServiceForTests",semantics);
+                return created;
+            }
+            void P5Complete(MainWindow target,string method)=>Complete((Task)P5Invoke(target,method)!);
+            void P5Click(MainWindow target,string method){P5Invoke(target,method,null,null);Pump(()=>!(bool)typeof(MainWindow).GetField("busy",flags)!.GetValue(target)!);}
+            SemanticModelStatus P5State(MainWindow target)=>(SemanticModelStatus)P5Invoke(target,"get_SemanticModelState")!;
+            string P5Notice(MainWindow target)=>(string)P5Invoke(target,"get_SemanticNoticeText")!;
+            T P5Control<T>(MainWindow target,string name) where T:Control=>target.FindControl<T>(name)!;
+            string P5SettingsFile()=>System.IO.Path.Combine(p5Root,SemanticSettings.FileName);
+
+            // —— A. 开关的持久化（沿用草稿的落盘目录与原子写，不新造存储体系） ——
+            P5Trace("settings");
+            System.IO.Directory.CreateDirectory(p5Root);
+            var missing=SemanticSettings.Load(out var missingNote);
+            Check(!missing.SearchEnabled&&missingNote==null,"no settings file must mean semantic search is off");
+            Check(SemanticSettings.Save(new SemanticSettings(true))==null,"saving semantic settings failed");
+            Check(System.IO.File.Exists(P5SettingsFile()),"semantic settings file was not written next to the drafts");
+            Check(SemanticSettings.Load(out var enabledNote).SearchEnabled&&enabledNote==null,"saved semantic setting did not round-trip");
+            Check(SemanticSettings.Save(new SemanticSettings(false))==null,"saving the off state failed");
+            Check(!SemanticSettings.Load(out _).SearchEnabled,"turning semantic search off did not persist");
+            System.IO.File.WriteAllText(P5SettingsFile(),"{\"format\":1,\"search_enabled\":true");
+            var halfJson=SemanticSettings.Load(out var halfNote);
+            Check(!halfJson.SearchEnabled&&!string.IsNullOrEmpty(halfNote),"half-written settings must fall back to off with a readable note: "+halfNote);
+            System.IO.File.WriteAllText(P5SettingsFile(),"");
+            var emptyJson=SemanticSettings.Load(out var emptyNote);
+            Check(!emptyJson.SearchEnabled&&!string.IsNullOrEmpty(emptyNote),"empty settings file must fall back to off with a readable note");
+            System.IO.File.WriteAllText(P5SettingsFile(),"{\"format\":99,\"search_enabled\":true}");
+            var wrongFormat=SemanticSettings.Load(out var formatNote);
+            Check(!wrongFormat.SearchEnabled&&!string.IsNullOrEmpty(formatNote),"unknown settings format must not silently enable semantic search");
+            System.IO.File.WriteAllText(P5SettingsFile(),"{\"format\":1,\"search_enabled\":\"yes\"}");
+            var wrongType=SemanticSettings.Load(out var typeNote);
+            Check(!wrongType.SearchEnabled&&!string.IsNullOrEmpty(typeNote),"non-boolean search_enabled must fall back to off with a readable note");
+            System.IO.File.Delete(P5SettingsFile());
+
+            // —— B. 契约字段解析：state / progress / bytes_*（v1.1），缺失与异常一律安全降级 ——
+            P5Trace("contract");
+            var legacy=SemanticModelStatus.FromAgentStatus(new JsonObject{["activity"]=new JsonArray()});
+            Check(legacy.State==SemanticModelStatus.Unknown&&!legacy.IsReady&&!string.IsNullOrEmpty(legacy.Detail),"a status without semantic must be unknown, never ready");
+            Check(SemanticModelStatus.FromAgentStatus(null).State==SemanticModelStatus.Unknown,"null status must not throw and must be unknown");
+            var absent=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Absent,"没有模型"));
+            Check(absent.IsAbsent&&!absent.IsReady&&!absent.HasProgress,"absent must not report progress");
+            var downloading=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"正在下载",0.42));
+            Check(downloading.IsBusy&&downloading.HasProgress&&Math.Abs(downloading.Progress!.Value-0.42)<1e-9,"downloading progress was not parsed");
+            var bytesOnly=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"正在下载",null,15728640,104857600));
+            Check(!bytesOnly.HasProgress&&bytesOnly.HasBytes,"bytes-only progress must be usable without a fabricated percentage");
+            var noFields=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"正在下载"));
+            Check(!noFields.HasProgress&&!noFields.HasBytes,"missing progress fields must stay indeterminate instead of guessing");
+            Check(SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Verifying)).State==SemanticModelStatus.Verifying,"verifying state was not parsed");
+            var ready=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Ready,"就绪",0.9,10,10));
+            Check(ready.IsReady&&!ready.HasProgress&&!ready.HasBytes,"ready must not keep stale progress fields");
+            var failed=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Failed,"校验失败",0.5));
+            Check(failed.IsFailed&&!failed.HasProgress,"failed must not keep stale progress fields");
+            Check(SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson("training")).State==SemanticModelStatus.Unknown,"an unknown state value must degrade to unknown");
+            var clamped=SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"下载",1.7));
+            Check(clamped.Progress.HasValue&&Math.Abs(clamped.Progress.Value-1d)<1e-9,"out-of-range progress must be clamped, not trusted");
+            var badProgress=SemanticModelStatus.FromAgentStatus(new JsonObject{["semantic"]=new JsonObject{["state"]=SemanticModelStatus.Downloading,["progress"]="half"}});
+            Check(!badProgress.HasProgress&&badProgress.IsBusy,"a non-numeric progress must not throw and must degrade to indeterminate");
+            Check(!SemanticModelStatus.FromAgentStatus(FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"下载",null,5,0)).HasBytes,"bytes_total = 0 must not be shown as a usable ratio");
+
+            // —— C. 真实控件上的状态机：未启用 → 下载中（有/无进度）→ 校验中 → 已就绪 / 失败 / 服务不支持 ——
+            P5Trace("ui machine");
+            var fake=new FakeSemanticService();
+            var p5Window=P5Window(fake);
+            Check(!P5Control<CheckBox>(p5Window,"SemanticToggle").IsEnabled,"the toggle must be disabled before any status is known");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5State(p5Window).State==SemanticModelStatus.Unknown,"an empty status payload must degrade to unknown");
+            Check(P5Control<CheckBox>(p5Window,"SemanticToggle").IsEnabled==false,"unknown status must keep the toggle disabled");
+            Check(P5Control<TextBlock>(p5Window,"SemanticStatus").Text!.Contains("未知"),"the sidebar entry must show the current state: "+P5Control<TextBlock>(p5Window,"SemanticStatus").Text);
+            Check(P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("0.4.0"),"an old service must be explained as a version issue, not as a failure");
+            P5Click(p5Window,"SemanticPanelClick");
+            Check(P5Control<Border>(p5Window,"SemanticPanel").IsVisible&&!P5Control<Grid>(p5Window,"HomePanel").IsVisible,"the semantic panel must be reachable from the sidebar");
+            Check(P5Control<CheckBox>(p5Window,"SemanticToggle").IsTabStop!=false,"the toggle must stay keyboard reachable");
+            Check(P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("100~150 MB"),"the model size must be stated up front");
+            Check(P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("完全离线")||P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("不点"),"the copy must say it is offline after the first download");
+
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Absent,"尚未下载");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5State(p5Window).IsAbsent,"absent status was not applied to the window");
+            Check(P5Control<Button>(p5Window,"SemanticPrepareButton").IsVisible&&!P5Control<Button>(p5Window,"SemanticRetryButton").IsVisible,"absent must offer one-click prepare without a retry button");
+            Check(P5Control<Button>(p5Window,"SemanticPrepareButton").Content!.ToString()!.Contains("100~150 MB"),"the prepare button must state the download size");
+            Check(!P5Control<CheckBox>(p5Window,"SemanticToggle").IsEnabled,"the toggle must stay disabled while the model is absent");
+            Check(P5Control<ProgressBar>(p5Window,"SemanticProgress").IsVisible==false,"an idle state must not show a progress bar");
+
+            // 未就绪时点“获取模型”：状态停在下载中，进度可见（这里是结构化 progress 字段）。
+            fake.PrepareResult=new JsonObject{["status"]="started"};
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"正在下载模型文件",0.5);
+            P5Click(p5Window,"SemanticPrepareClick");
+            Check(fake.PrepareCalls==1,"clicking prepare must call POST /api/v1/models/prepare exactly once");
+            Check(P5State(p5Window).State==SemanticModelStatus.Downloading,"the panel must follow the service state after prepare");
+            Check(P5Control<TextBlock>(p5Window,"SemanticState").Text!.Contains("下载中"),"the state line must say downloading: "+P5Control<TextBlock>(p5Window,"SemanticState").Text);
+            Check(P5Control<TextBlock>(p5Window,"SemanticState").Text!.Contains("50%"),"a real progress field must be shown as a percentage: "+P5Control<TextBlock>(p5Window,"SemanticState").Text);
+            Check(P5Control<ProgressBar>(p5Window,"SemanticProgress").IsVisible&&!P5Control<ProgressBar>(p5Window,"SemanticProgress").IsIndeterminate,"a measured progress must use the determinate bar");
+            Check(Math.Abs(P5Control<ProgressBar>(p5Window,"SemanticProgress").Value-0.5)<1e-9,"the progress bar must track the measured value");
+            Check(P5Control<Button>(p5Window,"SemanticPrepareButton").IsEnabled==false,"prepare must not be clickable while a download is running");
+
+            // 没有 progress 字段时：必须显示“不确定进度”，而不是编一个百分比。
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Downloading,"正在下载模型文件");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5Control<ProgressBar>(p5Window,"SemanticProgress").IsIndeterminate,"a missing progress field must show an indeterminate bar");
+            Check(P5Control<TextBlock>(p5Window,"SemanticState").Text!.Contains("具体进度未知"),"a missing progress field must be stated honestly: "+P5Control<TextBlock>(p5Window,"SemanticState").Text);
+            Check(P5Control<TextBlock>(p5Window,"SemanticState").Text!.Contains("下载中"),"downloading state text was lost");
+
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Verifying,"正在校验文件");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5Control<TextBlock>(p5Window,"SemanticState").Text!.Contains("校验中"),"the verifying stage must be visible: "+P5Control<TextBlock>(p5Window,"SemanticState").Text);
+            Check(P5Control<ProgressBar>(p5Window,"SemanticProgress").IsVisible,"verifying must still show an activity indicator");
+
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Ready,"模型已就绪");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5State(p5Window).IsReady,"ready status was not applied");
+            Check(P5Control<CheckBox>(p5Window,"SemanticToggle").IsEnabled,"the toggle must become usable once the model is ready");
+            Check(P5Control<Button>(p5Window,"SemanticPrepareButton").IsVisible==false&&P5Control<Button>(p5Window,"SemanticRetryButton").IsVisible==false,"ready must hide the download actions");
+            Check(P5Control<ProgressBar>(p5Window,"SemanticProgress").IsVisible==false,"ready must not keep a progress bar");
+
+            // 失败：可读原因 + 重试按钮 + 其它功能照旧。
+            // 先区分两种“坏消息”：状态查询失败（服务暂时不可用）不能谎称“模型失败”；
+            // 只有服务明确报 state=failed 才算模型失败。
+            fake.StatusError=new InvalidOperationException("Request failed: HTTP 500 (Internal Server Error): status unavailable");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5State(p5Window).State==SemanticModelStatus.Unknown,"a failing status query must not be reported as a model failure");
+            Check(P5Notice(p5Window).Contains("无法读取模型状态"),"a failing status query must say so: "+P5Notice(p5Window));
+            Check(P5Notice(p5Window).Contains("其余功能不受影响"),"a status query failure must promise no collateral damage: "+P5Notice(p5Window));
+            fake.StatusError=null;
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Failed,"模型文件校验失败");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            Check(P5State(p5Window).IsFailed,"a failed model state was not applied");
+            Check(P5Control<Button>(p5Window,"SemanticRetryButton").IsVisible,"a failure must offer a retry action");
+            Check(P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("检索仍按字面进行"),"a failure must promise no collateral damage");
+            Check(P5Control<TextBlock>(p5Window,"SemanticReason").Text!.Contains("重试"),"a failure must be actionable");
+            Check(P5Control<CheckBox>(p5Window,"SemanticToggle").IsEnabled==false,"a failed model must keep the toggle disabled");
+            fake.PrepareError=new InvalidOperationException("Request failed: HTTP 404 (Not Found).");
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Absent,"尚未下载");
+            P5Click(p5Window,"SemanticPrepareClick");
+            Check(fake.PrepareCalls==2,"retry must call prepare again");
+            Check(P5State(p5Window).State==SemanticModelStatus.Unknown,"a missing prepare endpoint (old service) must not be reported as a model failure");
+            Check(P5Notice(p5Window).Contains("升级本地服务"),"a 404 on prepare must tell the user to upgrade, not to retry forever: "+P5Notice(p5Window));
+            Check(P5Control<Button>(p5Window,"SemanticRetryButton").IsVisible==false,"an unsupported endpoint must not pretend a retry will help");
+
+            // —— D. 开关：默认关、未就绪不能打开、就绪后才能打开且状态持久化 ——
+            P5Trace("toggle");
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Absent,"尚未下载");
+            fake.PrepareError=null;
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked=true;
+            typeof(MainWindow).GetMethod("SemanticToggleClick",flags)!.Invoke(p5Window,[null,null]);
+            Check(P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked==false,"the toggle must snap back while the model is not ready");
+            Check(!(bool)P5Invoke(p5Window,"get_SemanticSearchEnabled")!,"a refused toggle must not turn semantic search on");
+            Check(P5Notice(p5Window).Contains("模型还没有就绪"),"a refused toggle must explain why: "+P5Notice(p5Window));
+            Check(!SemanticSettings.Load(out _).SearchEnabled,"a refused toggle must not be persisted as on");
+            fake.Status=FakeSemanticService.StatusJson(SemanticModelStatus.Ready,"模型已就绪");
+            P5Complete(p5Window,"RefreshSemanticStatusAsync");
+            P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked=true;
+            typeof(MainWindow).GetMethod("SemanticToggleClick",flags)!.Invoke(p5Window,[null,null]);
+            Check((bool)P5Invoke(p5Window,"get_SemanticSearchEnabled")!,"a ready model must allow turning semantic search on");
+            Check(SemanticSettings.Load(out _).SearchEnabled,"turning semantic search on must be persisted immediately");
+            Check(P5Control<TextBlock>(p5Window,"SemanticSearchHint").Text!.Contains("可能相关（语义）"),"the search hint must explain what will change");
+            P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked=false;
+            typeof(MainWindow).GetMethod("SemanticToggleClick",flags)!.Invoke(p5Window,[null,null]);
+            Check(!(bool)P5Invoke(p5Window,"get_SemanticSearchEnabled")!&&!SemanticSettings.Load(out _).SearchEnabled,"turning it off must persist too");
+
+            // 重启验证：同一 GM_DRAFT_DIR 下新窗口必须读回上次的开关状态。
+            System.IO.File.WriteAllText(P5SettingsFile(),"{\"format\":1,\"search_enabled\":true}");
+            var restarted=P5Window(fake);
+            Check((bool)P5Invoke(restarted,"get_SemanticSearchEnabled")!,"the switch state must survive a restart");
+            Check(P5Control<CheckBox>(restarted,"SemanticToggle").IsChecked==true,"a restored switch must be reflected in the control");
+            Check(P5Control<CheckBox>(restarted,"SemanticToggle").IsEnabled==false,"a restored switch must still be greyed out until the model is ready");
+            Check(P5Control<TextBlock>(restarted,"SemanticSearchHint").Text!.Contains("未就绪"),"a restored switch with no model must say the run stays literal: "+P5Control<TextBlock>(restarted,"SemanticSearchHint").Text);
+            restarted.Close();
+            System.IO.File.WriteAllText(P5SettingsFile(),"{\"format\":1,\"search_enabled\":false}");
+
+            // —— E. 请求体：关闭时与 0.3.0 逐字节一致（没有 semantic 字段） ——
+            P5Trace("request body");
+            var literalBody=MainWindow.BuildSearchBody("p-1","查询",false,false);
+            Check(!literalBody.ContainsKey("semantic"),"semantic=off must not send a semantic field at all");
+            Check(literalBody["project_id"]!.GetValue<string>()=="p-1"&&literalBody["query"]!.GetValue<string>()=="查询"&&literalBody["include_retracted"]!.GetValue<bool>()==false,"the legacy search body changed");
+            Check(literalBody.Count==3,"the legacy search body must keep exactly its three fields");
+            var semanticBody=MainWindow.BuildSearchBody(null,"查询",true,true);
+            Check(semanticBody["semantic"]!.GetValue<bool>()&&semanticBody.Count==4,"semantic=on must add exactly one field");
+
+            // —— F. 语义分组：与字面结果同屏时视觉可区分，且绝不把不可用结果显示成证据 ——
+            P5Trace("semantic group");
+            // 先打开开关：语义关闭时本来就不该为语义相关的事打扰用户（这也是“与 0.3.0 一致”的一部分）。
+            P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked=true;
+            typeof(MainWindow).GetMethod("SemanticToggleClick",flags)!.Invoke(p5Window,[null,null]);
+            Check((bool)P5Invoke(p5Window,"get_SemanticSearchEnabled")!,"semantic search must be on before asserting the semantic group copy");
+            var hybrid=new JsonObject{
+                ["semantic"]=new JsonObject{
+                    ["available"]=true,["mode"]="hybrid",["model"]="bge-small-zh-v1.5",["min_similarity"]=0.42,
+                    ["memories"]=new JsonArray(new JsonObject{["id"]="m-1",["score"]=0.71,["title"]="提交前必须先跑回归",["content"]=null}),
+                    ["note"]="模型未就绪：语义通道已跳过",
+                }};
+            typeof(MainWindow).GetMethod("ApplySemanticFromResponse",flags)!.Invoke(p5Window,[hybrid]);
+            Check(P5Control<Border>(p5Window,"SemanticGroup").IsVisible,"a hybrid response must show the semantic group");
+            Check(((System.Collections.IList)P5Control<ListBox>(p5Window,"SemanticMemories").ItemsSource!).Count==1,"the semantic group must list the returned candidates");
+            Check(P5Control<TextBlock>(p5Window,"SemanticGroupHint").Text!.Contains("不是原话命中"),"semantic results must be marked as meaning-based matches");
+            Check(P5Control<TextBlock>(p5Window,"SemanticGroupHint").Text!.Contains("可信度低于"),"semantic results must not be presented as equally trustworthy");
+            var firstItem=(SemanticItem)((System.Collections.IList)P5Control<ListBox>(p5Window,"SemanticMemories").ItemsSource!)[0]!;
+            Check(firstItem.ScoreLabel.Contains("语义相似度 0.71"),"the semantic score must be shown next to the item: "+firstItem.ScoreLabel);
+            Check(firstItem.CanOpen==false,"a candidate without full record fields must not be openable");
+            var degraded=new JsonObject{["semantic"]=new JsonObject{["available"]=false,["mode"]="literal",["memories"]=new JsonArray(),["note"]="模型未就绪：语义通道已跳过"}};
+            typeof(MainWindow).GetMethod("ApplySemanticFromResponse",flags)!.Invoke(p5Window,[degraded]);
+            Check(P5Control<Border>(p5Window,"SemanticGroup").IsVisible==false,"a degraded response must hide the semantic group");
+            Check(P5Notice(p5Window).Contains("语义通道已跳过"),"a degraded response must be explained, not silently ignored");
+            var lying=new JsonObject{["semantic"]=new JsonObject{["available"]=false,["mode"]="literal",["memories"]=new JsonArray(new JsonObject{["id"]="m-2",["score"]=0.9})}};
+            typeof(MainWindow).GetMethod("ApplySemanticFromResponse",flags)!.Invoke(p5Window,[lying]);
+            Check(P5Control<Border>(p5Window,"SemanticGroup").IsVisible==false,"available=false must never be rendered as semantic evidence, even if memories are present");
+            var oldService=new JsonObject{["memories"]=new JsonArray()};
+            typeof(MainWindow).GetMethod("ApplySemanticFromResponse",flags)!.Invoke(p5Window,[oldService]);
+            Check(P5Control<Border>(p5Window,"SemanticGroup").IsVisible==false,"a response without the semantic object must hide the group");
+            Check(P5Notice(p5Window).Contains("0.4.0"),"an old service must be explained in the UI");
+            var badScore=new JsonObject{["semantic"]=new JsonObject{["available"]=true,["mode"]="hybrid",["memories"]=new JsonArray(new JsonObject{["id"]="m-3",["score"]="high"})}};
+            typeof(MainWindow).GetMethod("ApplySemanticFromResponse",flags)!.Invoke(p5Window,[badScore]);
+            Check(((SemanticItem)((System.Collections.IList)P5Control<ListBox>(p5Window,"SemanticMemories").ItemsSource!)[0]!).ScoreLabel.Contains("0.00"),"a malformed score must degrade to 0.00 instead of throwing");
+            // 恢复为默认关闭：下一段要在“全新安装”的前提下证明未就绪时行为不变。
+            P5Control<CheckBox>(p5Window,"SemanticToggle").IsChecked=false;
+            typeof(MainWindow).GetMethod("SemanticToggleClick",flags)!.Invoke(p5Window,[null,null]);
+            Check(!SemanticSettings.Load(out _).SearchEnabled,"the switch must be off for the legacy run");
+            p5Window.Close();
+
+            // —— G. “模型未就绪时一切照旧”：真实旧服务（没有 semantic 字段）上跑完整流程 ——
+            P5Trace("legacy unchanged");
+            var legacyWindow=P5Window(null);   // 不注入假服务：走真实 /api/v1/agent/status
+            var listBefore=(bool)P5Invoke(legacyWindow,"get_SemanticSearchEnabled")!;   // 读取开关（默认关）
+            Check(!listBefore,"semantic search must default to off on a fresh install");
+            Complete((Task)P5Invoke(legacyWindow,"LoadMemories")!);
+            Check(legacyWindow.FindControl<ListBox>("Memories")!.ItemsSource!=null,"the memory list must load normally without any semantic support");
+            Check(P5Control<Border>(legacyWindow,"SemanticGroup").IsVisible==false,"the semantic group must stay hidden while semantic search is off");
+            Check(P5Control<TextBlock>(legacyWindow,"SemanticSearchHint").Text!.Contains("0.3.0"),"the UI must state that off means 0.3.0 behaviour");
+            P5Complete(legacyWindow,"RefreshSemanticStatusAsync");
+            Check(P5State(legacyWindow).State==SemanticModelStatus.Unknown,"a 0.3.0 service must leave the status unknown, not failed");
+            var title="P5 未就绪证据";
+            var createdMemory=p5Client.PostAsync("api/v1/memories",new{memory_scope="personal",event_id=Guid.NewGuid().ToString(),title,content="模型未就绪时仍然可以正常写入与检索"}).GetAwaiter().GetResult()["memory"]!.DeepClone();
+            Check(createdMemory["id"]!=null,"writing a memory must work while the model is absent");
+            var found=p5Client.PostAsync("api/v1/search",MainWindow.BuildSearchBody(null,title,false,false)).GetAwaiter().GetResult()["memories"]!.AsArray();
+            Check(found.Count==1&&found[0]!["id"]!.GetValue<string>()==createdMemory["id"]!.GetValue<string>(),"literal search must still find the record while the model is absent");
+            Check(found[0]!["title"]!.GetValue<string>()==title,"the literal result must carry the real record");
+            P5Click(legacyWindow,"RefreshClick");
+            Check(P5Control<Border>(legacyWindow,"SemanticPanel").IsVisible==false&&legacyWindow.FindControl<ListBox>("Memories")!.ItemsSource!=null,"refresh must keep working after a semantic-related failure");
+            legacyWindow.Close();
+            P5Trace("done");
+            Console.WriteLine("OK P5-C semantic model entry: state machine, progress, retry, persisted switch, semantic grouping, unchanged when absent");
+        } finally {
+            Environment.SetEnvironmentVariable("GM_DRAFT_DIR",previousDraftDir);
+            p5Host.StopOwned();
+            try{System.IO.Directory.Delete(p5Root,true);}catch{}
+            try{System.IO.Directory.Delete(p5Data,true);}catch{}
+            try{System.IO.Directory.Delete(p5HostDirectory,true);}catch{}
+        }
+    }
+
     Console.WriteLine($"PASS {checks} editor checks using real XAML controls + isolated HTTP service");
 } finally {
     window?.Close();host.StopOwned();
@@ -635,5 +919,84 @@ static class DraftProbe {
                 ["conditions"]=value?.Conditions,["kind"]=value?.Kind,["evidence"]=value?.Evidence,["is_new"]=value?.IsNew,
             }.ToJsonString());
         } catch(Exception e) { Console.WriteLine("DRAFT_PROBE_FAILED "+e.Message); }
+    }
+}
+
+// P5-C 假服务：把“未就绪 / 接口缺失 / 失败 / 进度”变成可复现的默认路径。
+// 它只实现桌面端自己的 ISemanticService 接缝，不碰产品代码，也不发起任何真实请求。
+sealed class FakeSemanticService : ISemanticService {
+    public JsonNode? Status;
+    public Exception? StatusError;
+    public JsonNode? PrepareResult = new JsonObject { ["status"] = "started" };
+    public Exception? PrepareError;
+    public int StatusCalls;
+    public int PrepareCalls;
+
+    public static JsonObject StatusJson(string state, string? detail = null, double? progress = null, long? downloaded = null, long? total = null) {
+        var node = new JsonObject { ["state"] = state };
+        if (detail != null) node["detail"] = detail;
+        if (progress.HasValue) node["progress"] = progress.Value;
+        if (downloaded.HasValue) node["bytes_downloaded"] = downloaded.Value;
+        if (total.HasValue) node["bytes_total"] = total.Value;
+        return new JsonObject { ["semantic"] = node };
+    }
+
+    public Task<JsonNode> AgentStatusAsync() {
+        StatusCalls++;
+        if (StatusError != null) return Task.FromException<JsonNode>(StatusError);
+        return Task.FromResult<JsonNode>(Status ?? new JsonObject());
+    }
+
+    public Task<JsonNode> PrepareModelAsync() {
+        PrepareCalls++;
+        if (PrepareError != null) return Task.FromException<JsonNode>(PrepareError);
+        return Task.FromResult<JsonNode>(PrepareResult ?? new JsonObject());
+    }
+}
+
+// P5-C GUI 冒烟探针：`--p5-probe <service-url>`。
+// 不做任何注入，直接连真实服务，按用户的操作顺序走一遍语义面板，并打印它真的看到了什么。
+static class P5Probe {
+    public static void Run(string[] args) {
+        if(args.Length<2){Console.WriteLine("P5_PROBE_FAILED usage: --p5-probe <service-url>");return;}
+        var url=args[1];
+        var flags=BindingFlags.Instance|BindingFlags.NonPublic;
+        var previous=Environment.GetEnvironmentVariable("GM_DRAFT_DIR");
+        var dir=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"gm-p5-probe-"+Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("GM_DRAFT_DIR",dir);
+        try {
+            System.IO.Directory.CreateDirectory(dir);
+            typeof(MainWindow).Assembly.GetType("GraphMemory.Desktop.Program")!.GetField("Arguments",BindingFlags.Static|BindingFlags.Public)!.SetValue(null,new[]{"--service-url",url});
+            AppBuilder.Configure<App>().UseHeadless(new AvaloniaHeadlessPlatformOptions()).SetupWithoutStarting();
+            var window=new MainWindow();
+            void DrainUntil(Func<bool> done){var deadline=DateTime.UtcNow.AddSeconds(30);while(!done()){Dispatcher.UIThread.RunJobs();if(DateTime.UtcNow>deadline)throw new TimeoutException("UI timeout");Thread.Sleep(5);}Dispatcher.UIThread.RunJobs();}
+            window.Show();
+            DrainUntil(()=>!(bool)typeof(MainWindow).GetField("busy",flags)!.GetValue(window)!);
+            string Text(string name)=>window.FindControl<TextBlock>(name)?.Text??"";
+            string Toggle()=>$"enabled={window.FindControl<CheckBox>("SemanticToggle")!.IsEnabled} checked={window.FindControl<CheckBox>("SemanticToggle")!.IsChecked}";
+            Console.WriteLine("P5_PROBE sidebar: "+Text("SemanticStatus"));
+            Console.WriteLine("P5_PROBE search hint: "+Text("SemanticSearchHint"));
+            Console.WriteLine("P5_PROBE toggle (before opening the panel): "+Toggle());
+            typeof(MainWindow).GetMethod("SemanticPanelClick",flags)!.Invoke(window,[null,null]);
+            DrainUntil(()=>!(bool)typeof(MainWindow).GetField("busy",flags)!.GetValue(window)!);
+            Console.WriteLine("P5_PROBE panel visible: "+window.FindControl<Border>("SemanticPanel")!.IsVisible);
+            Console.WriteLine("P5_PROBE state: "+Text("SemanticState"));
+            Console.WriteLine("P5_PROBE reason: "+Text("SemanticReason"));
+            Console.WriteLine("P5_PROBE progress bar visible: "+window.FindControl<ProgressBar>("SemanticProgress")!.IsVisible);
+            Console.WriteLine("P5_PROBE prepare button visible: "+window.FindControl<Button>("SemanticPrepareButton")!.IsVisible+" content="+window.FindControl<Button>("SemanticPrepareButton")!.Content);
+            Console.WriteLine("P5_PROBE retry button visible: "+window.FindControl<Button>("SemanticRetryButton")!.IsVisible);
+            Console.WriteLine("P5_PROBE toggle (in panel): "+Toggle());
+            Console.WriteLine("P5_PROBE semantic group visible after a search: "+window.FindControl<Border>("SemanticGroup")!.IsVisible);
+            var search=(Task)typeof(MainWindow).GetMethod("LoadMemories",flags)!.Invoke(window,null)!;
+            DrainUntil(()=>search.IsCompleted);
+            Console.WriteLine("P5_PROBE after search: group visible="+window.FindControl<Border>("SemanticGroup")!.IsVisible+" memory list items="+(window.FindControl<ListBox>("Memories")!.ItemsSource is System.Collections.ICollection c?c.Count:-1));
+            Console.WriteLine("P5_PROBE_OK");
+            window.Close();
+        } catch(Exception e) {
+            Console.WriteLine("P5_PROBE_FAILED "+e.GetType().Name+" "+e.Message);
+        } finally {
+            Environment.SetEnvironmentVariable("GM_DRAFT_DIR",previous);
+            try{System.IO.Directory.Delete(dir,true);}catch{}
+        }
     }
 }

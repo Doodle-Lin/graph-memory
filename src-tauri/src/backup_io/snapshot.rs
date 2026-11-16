@@ -40,6 +40,10 @@ const TABLE_EVENTS: &str = "work_events";
 /// Optional telemetry table. Its presence is tolerated, but it is excluded from
 /// the snapshot and never introspected beyond its identity as a table.
 const TABLE_ACTIVITY: &str = "agent_activity";
+/// P5: derived embedding index. Also tolerated and excluded from the snapshot —
+/// vectors are rebuildable from the record text, so they are never exported and
+/// their absence in older databases stays valid (contract §4).
+const TABLE_VECTORS: &str = "memory_vectors";
 
 /// Tables whose rows end up in the snapshot, and which must all be present.
 const SNAPSHOT_TABLES: [&str; 4] = [
@@ -239,7 +243,7 @@ fn validate_user_version(db: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepts exactly the known tables plus the optional telemetry table.
+/// Accepts exactly the known tables plus the optional telemetry and vector tables.
 ///
 /// Views are rejected; indexes and triggers are not data-bearing and are
 /// ignored, as are SQLite's own `sqlite_*` bookkeeping objects.
@@ -264,7 +268,11 @@ fn inspect_tables(db: &Connection) -> Result<(), String> {
         if name.starts_with("sqlite_") {
             continue;
         }
-        if kind == "table" && (SNAPSHOT_TABLES.contains(&name.as_str()) || name == TABLE_ACTIVITY) {
+        if kind == "table"
+            && (SNAPSHOT_TABLES.contains(&name.as_str())
+                || name == TABLE_ACTIVITY
+                || name == TABLE_VECTORS)
+        {
             present.insert(name);
         } else {
             // Unknown application table, or a view: not part of the format.
@@ -283,7 +291,8 @@ fn inspect_tables(db: &Connection) -> Result<(), String> {
 /// Verifies `table_xinfo` for every snapshotted table: same column count, same
 /// order, same names, same declared types, and no hidden columns.
 ///
-/// `agent_activity` is excluded telemetry and is deliberately not introspected.
+/// `agent_activity` and `memory_vectors` are excluded and deliberately not
+/// introspected.
 fn validate_columns(db: &Connection) -> Result<(), String> {
     for table in SNAPSHOT_TABLES {
         let expected = expected_columns(table).ok_or_else(|| ERR_SCHEMA.to_string())?;

@@ -39,11 +39,22 @@ pub fn run(data_dir: &Path, port: u16) -> Result<()> {
     std::fs::rename(&temporary, data_dir.join("service.json")).context("publish discovery")?;
     let mut state = ModelState::new();
     state.service_info = Some(Arc::new(info.clone()));
+    // P5: one semantic runtime shared between the HTTP layer (`/models/prepare`,
+    // `/agent/status`) and the store (bounded semantic recall).
+    let semantic = Arc::new(crate::semantic::SemanticRuntime::new());
+    state.semantic = Some(Arc::clone(&semantic));
     state.memory_store = Some(Arc::new(Mutex::new(
-        crate::memory_store::MemoryStore::open(&data_dir.join("work-memory.db"))
-            .map_err(|e| anyhow::anyhow!("{}", e.1))?,
+        crate::memory_store::MemoryStore::open_with_semantic(
+            &data_dir.join("work-memory.db"),
+            Arc::clone(&semantic),
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e.1))?,
     )));
     println!("{}", info);
+    // P5: build the ONNX session once, on a background thread, so no later HTTP request
+    // ever pays for it. This stays entirely offline: it only reads the local model
+    // directory and does nothing when the model has not been downloaded.
+    semantic.warmup();
     let result = static_server::serve_api(
         listener,
         state,

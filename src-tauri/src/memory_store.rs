@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct ApiError(pub u16, pub String);
@@ -57,6 +58,59 @@ fn optional_flag(body: &Value, key: &str, default: bool) -> ApiResult<bool> {
         Some(Value::Bool(value)) => Ok(*value),
         Some(_) => Err(ApiError(400, format!("{key} must be a boolean"))),
     }
+}
+
+/// P5 §3.1: validate the optional semantic request fields.
+fn semantic_options(body: &Value) -> ApiResult<crate::semantic::MatchOptions> {
+    let semantic = optional_flag(body, "semantic", false)?;
+    let min_similarity = match body.get("semantic_min_similarity") {
+        None | Some(Value::Null) => crate::semantic::default_min_similarity(),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .filter(|v| (0.0..=1.0).contains(v))
+            .ok_or_else(|| {
+                ApiError(
+                    400,
+                    "semantic_min_similarity must be a number in 0.0..=1.0".into(),
+                )
+            })?,
+        Some(_) => {
+            return Err(ApiError(
+                400,
+                "semantic_min_similarity must be a number in 0.0..=1.0".into(),
+            ))
+        }
+    };
+    let limit = match body.get("semantic_limit") {
+        None | Some(Value::Null) => 5usize,
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|v| (1..=crate::semantic::MAX_SEMANTIC_LIMIT).contains(v))
+            .ok_or_else(|| {
+                ApiError(
+                    400,
+                    format!(
+                        "semantic_limit must be an integer between 1 and {}",
+                        crate::semantic::MAX_SEMANTIC_LIMIT
+                    ),
+                )
+            })?,
+        Some(_) => {
+            return Err(ApiError(
+                400,
+                format!(
+                    "semantic_limit must be an integer between 1 and {}",
+                    crate::semantic::MAX_SEMANTIC_LIMIT
+                ),
+            ))
+        }
+    };
+    Ok(crate::semantic::MatchOptions {
+        semantic,
+        semantic_min_similarity: min_similarity,
+        semantic_limit: limit,
+    })
 }
 
 fn has_cjk(text: &str) -> bool {
@@ -121,7 +175,73 @@ fn piece_hits(field: &str, units: &[String]) -> (bool, usize) {
     (matched >= 2, matched)
 }
 
-/// P4-D: a record enters the result as follows.
+/// P5 §2.1 v1.4: hard ceiling for a synchronous vector rebuild inside one request. The
+/// index is built **whole or not at all** — a half-built index would make the same query
+/// answer differently depending on call order. 1200 records take ~2.5 s here, so this is
+/// ~4x headroom; beyond it the request degrades to `available=false` + `note`.
+const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// Embedding batch size while recovering the index.
+const REFRESH_BATCH: usize = 16;
+
+/// P5: does this record belong to the request's scope pool? Mirrors the SQL filter in
+/// `search_scored_opts` so semantic candidates can never cross a project boundary.
+fn scope_pool_eligible(memory: &Memory, project: Option<&str>, all: bool) -> bool {
+    if all {
+        return true;
+    }
+    if memory.memory_scope == "personal" {
+        return true;
+    }
+    match project {
+        Some(p) => memory.project_id.as_deref() == Some(p),
+        None => false,
+    }
+}
+
+/// P5 §2.1 (v1.2) + §6.0: the semantic channel is a *suggestion*, offered only when the
+/// literal side returned nothing at all and the caller is not running an audit view.
+fn should_offer_semantic(
+    options: &crate::semantic::MatchOptions,
+    literal_hits_any: bool,
+    include_retracted: bool,
+) -> bool {
+    options.semantic && !literal_hits_any && !include_retracted
+}
+
+/// P5: pure ranking half of [`MemoryStore::semantic_candidates`] — cosine desc, threshold
+/// and limit applied, deterministic tie-break. Suggestions never enter literal ranking.
+fn rank_semantic_hits(
+    query_vec: &[f32],
+    known: &std::collections::HashMap<String, Vec<f32>>,
+    pool: &[(Memory, String)],
+    options: &crate::semantic::MatchOptions,
+) -> Vec<crate::semantic::SemanticHit> {
+    let mut scored: Vec<crate::semantic::SemanticHit> = pool
+        .iter()
+        .filter_map(|(memory, _)| {
+            let vec = known.get(&memory.id)?;
+            let score = crate::semantic::cosine(query_vec, vec);
+            if score >= options.semantic_min_similarity {
+                Some(crate::semantic::SemanticHit {
+                    id: memory.id.clone(),
+                    score,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    scored.truncate(options.semantic_limit.min(crate::semantic::MAX_SEMANTIC_LIMIT));
+    scored
+}
+
+/// P5: P4-D: a record enters the result as follows.
 ///
 /// * Multi-piece query (rule A, unchanged P0-A1 contract): **every** piece must hit at
 ///   least one indexed field (whole piece or >= 2 of its n-grams), otherwise the record
@@ -226,9 +346,19 @@ pub struct Memory {
 }
 pub struct MemoryStore {
     db: Connection,
+    /// P5: shared semantic runtime. Offline by default; only `prepare` downloads.
+    semantic: Arc<crate::semantic::SemanticRuntime>,
 }
 impl MemoryStore {
     pub fn open(path: &Path) -> ApiResult<Self> {
+        Self::open_with_semantic(path, Arc::new(crate::semantic::SemanticRuntime::new()))
+    }
+    /// P5: share one runtime between the HTTP server and the store so `/models/prepare`
+    /// and search observe the same model state.
+    pub fn open_with_semantic(
+        path: &Path,
+        semantic: Arc<crate::semantic::SemanticRuntime>,
+    ) -> ApiResult<Self> {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL;
@@ -238,8 +368,13 @@ impl MemoryStore {
         CREATE INDEX IF NOT EXISTS memory_scope_project ON work_memories(memory_scope,project_id);
         CREATE TABLE IF NOT EXISTS work_revisions(memory_id TEXT NOT NULL,version INTEGER NOT NULL,body TEXT NOT NULL,PRIMARY KEY(memory_id,version));
         CREATE TABLE IF NOT EXISTS agent_activity(tool TEXT PRIMARY KEY,calls INTEGER NOT NULL,successes INTEGER NOT NULL,last_at TEXT NOT NULL,last_ok INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS work_events(event_id TEXT PRIMARY KEY,request TEXT NOT NULL,response TEXT NOT NULL);")?;
-        Ok(Self { db })
+        CREATE TABLE IF NOT EXISTS work_events(event_id TEXT PRIMARY KEY,request TEXT NOT NULL,response TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS memory_vectors(id TEXT PRIMARY KEY,model TEXT NOT NULL,dim INTEGER NOT NULL,content_sha256 TEXT NOT NULL,vec BLOB NOT NULL,updated_at TEXT NOT NULL);")?;
+        Ok(Self { db, semantic })
+    }
+    /// P5: the shared runtime (used by the HTTP layer for `/models/prepare`).
+    pub fn semantic_runtime(&self) -> Arc<crate::semantic::SemanticRuntime> {
+        Arc::clone(&self.semantic)
     }
     fn project_exists(&self, id: &str) -> ApiResult<()> {
         if self
@@ -288,6 +423,24 @@ impl MemoryStore {
         all: bool,
         include_retracted: bool,
     ) -> ApiResult<(Vec<(Memory, f64)>, usize)> {
+        let (result, excluded, _) =
+            self.search_scored_opts(project, query, all, include_retracted, &Default::default())?;
+        Ok((result, excluded))
+    }
+    /// P5: literal scoring is unchanged; `options.semantic` only adds a bounded
+    /// candidate list (see `semantic_candidates`).
+    fn search_scored_opts(
+        &self,
+        project: Option<&str>,
+        query: &str,
+        all: bool,
+        include_retracted: bool,
+        options: &crate::semantic::MatchOptions,
+    ) -> ApiResult<(
+        Vec<(Memory, f64)>,
+        usize,
+        Vec<(Memory, String)>,
+    )> {
         if let Some(p) = project {
             self.project_exists(p)?;
         }
@@ -302,10 +455,24 @@ impl MemoryStore {
             .collect::<ApiResult<Vec<Value>>>()?;
         let mut result = Vec::new();
         let mut excluded = 0usize;
+        let mut scope_pool: Vec<(Memory, String)> = Vec::new();
         for body in parsed {
-            if let Some(score) = match_terms(&body, &pieces) {
-                let memory = serde_json::from_value::<Memory>(body)?;
-                if memory.retracted_at.is_some() && !include_retracted {
+            let memory = serde_json::from_value::<Memory>(body)?;
+            let retracted_excluded = memory.retracted_at.is_some() && !include_retracted;
+            let matched = match_terms(
+                &serde_json::to_value(&memory)?,
+                &pieces,
+            );
+            if scope_pool_eligible(&memory, project, all) && !retracted_excluded {
+                let text = crate::semantic::record_text(
+                    &memory.title,
+                    &memory.content,
+                    &memory.conditions,
+                );
+                scope_pool.push((memory.clone(), text));
+            }
+            if let Some(score) = matched {
+                if retracted_excluded {
                     excluded += 1;
                     continue;
                 }
@@ -318,7 +485,221 @@ impl MemoryStore {
                 .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        Ok((result, excluded))
+        // Contract §2.1 (v1.2): semantic candidates are only produced when the literal hit
+        // set is **empty** — a user who already got literal hits is not "missing the word".
+        // The caller decides, because it still has to drop filtered-out literals.
+        let _ = options;
+        Ok((result, excluded, scope_pool))
+    }
+    /// Bounded semantic candidates (contract §2.1 v1.4 / §6.0): suggestions only, never
+    /// mixed into literal ranking nor into `total`, scope/retraction filtered *before*
+    /// comparison, `cosine >= min_similarity`, `limit` capped at 10.
+    ///
+    /// Determinism (§2.1 v1.4): the vector index for the whole requested scope is built
+    /// **before** any score is computed, so the same store and query always yield the same
+    /// suggestions regardless of call order. If the rebuild cannot finish inside
+    /// [`REBUILD_BUDGET`], this returns `Ok(None)` and the caller degrades to
+    /// `available=false` + `note` instead of returning half-built advice.
+    ///
+    /// The caller must only invoke this when [`should_offer_semantic`] is true.
+    fn semantic_candidates(
+        &self,
+        query: &str,
+        pool: &[(Memory, String)],
+        options: &crate::semantic::MatchOptions,
+    ) -> ApiResult<Option<Vec<crate::semantic::SemanticHit>>> {
+        if !options.semantic || query.trim().is_empty() || pool.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        // §2.1 v1.5: bounded wait for the background warm-up instead of an immediate
+        // degrade. A request never *starts* the session (that would stall retrieval), but
+        // it does wait for a warm-up that is already running, so "same query, different
+        // answer depending on when you asked" cannot happen.
+        if !self.semantic.embedder_ready() {
+            self.semantic.wait_ready(crate::semantic::SESSION_WAIT);
+        }
+        if !self.semantic.embedder_ready() {
+            return Ok(Some(Vec::new()));
+        }
+        self.flush_staged_vectors();
+        let Some(known) = self.load_vectors(pool)? else {
+            return Ok(None);
+        };
+        let Some(query_vec) =
+            self.semantic
+                .embed_query(crate::semantic::normalize_text(query).as_str())
+        else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(rank_semantic_hits(&query_vec, &known, pool, options)))
+    }
+    /// Read the stored vectors for `pool`, recomputing (and persisting) any that are
+    /// missing or whose `content_sha256` no longer matches the record text. This is also
+    /// the on-demand rebuild path after a `restore` (vectors are not exported).
+    ///
+    /// Returns `Ok(None)` when the rebuild exceeds [`REBUILD_BUDGET`]: a partial index must
+    /// never be turned into advice (§2.1 v1.4).
+    fn load_vectors(
+        &self,
+        pool: &[(Memory, String)],
+    ) -> ApiResult<Option<std::collections::HashMap<String, Vec<f32>>>> {
+        let mut known: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut stored: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        if let Ok(mut st) = self
+            .db
+            .prepare("SELECT id,dim,content_sha256,vec FROM memory_vectors WHERE model=?")
+        {
+            if let Ok(rows) = st.query_map([crate::semantic::MODEL_ID], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            }) {
+                for (id, dim, hash, blob) in rows.flatten() {
+                    stored.insert(id.clone(), (dim, hash));
+                    if let Some(vec) = crate::semantic::blob_to_vec(&blob) {
+                        known.insert(id, vec);
+                    }
+                }
+            }
+        }
+        let mut pending: Vec<(String, String)> = Vec::new();
+        for (memory, text) in pool {
+            let hash = crate::semantic::content_sha256(text);
+            // A vector is fresh only if the hash *and* the dimension still match; a model
+            // swap leaves `memory_vectors.model` different, so those rows never load above.
+            let fresh = stored
+                .get(&memory.id)
+                .is_some_and(|(dim, stored_hash)| {
+                    *dim == crate::semantic::MODEL_DIM && stored_hash == &hash
+                })
+                && known.contains_key(&memory.id);
+            if !fresh {
+                pending.push((memory.id.clone(), text.clone()));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(Some(known));
+        }
+        // Deterministic: either the whole scope is embedded, or the channel degrades.
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        while done < pending.len() {
+            if started.elapsed() >= REBUILD_BUDGET {
+                log::warn!(
+                    "semantic vector rebuild exceeded {:?}: {}/{} done, degrading this request",
+                    REBUILD_BUDGET,
+                    done,
+                    pending.len()
+                );
+                return Ok(None);
+            }
+            let end = (done + REFRESH_BATCH).min(pending.len());
+            let texts: Vec<String> = pending[done..end].iter().map(|p| p.1.clone()).collect();
+            let Some(vectors) = self.semantic.embed_records(&texts) else {
+                return Ok(None);
+            };
+            if vectors.len() != end - done {
+                return Ok(None);
+            }
+            for ((id, text), vec) in pending[done..end].iter().zip(vectors.into_iter()) {
+                if vec.len() != crate::semantic::MODEL_DIM {
+                    log::warn!(
+                        "unexpected embedding dimension {} for {id}; skipping",
+                        vec.len()
+                    );
+                    continue;
+                }
+                let hash = crate::semantic::content_sha256(text);
+                let dim = vec.len();
+                if let Err(error) = self.db.execute(
+                    "INSERT OR REPLACE INTO memory_vectors VALUES(?,?,?,?,?,?)",
+                    params![
+                        id,
+                        crate::semantic::MODEL_ID,
+                        dim as i64,
+                        hash,
+                        crate::semantic::vec_to_blob(&vec),
+                        now()
+                    ],
+                ) {
+                    log::warn!("cannot persist memory vector for {id}: {error}");
+                }
+                known.insert(id.clone(), vec);
+            }
+            done = end;
+        }
+        Ok(Some(known))
+    }
+    /// Persist vectors staged while the model was not ready.
+    fn flush_staged_vectors(&self) {
+        let (dirty, staged) = self.semantic.take_staged();
+        if !dirty {
+            return;
+        }
+        for (id, model, dim, content_sha256, vec, updated_at) in staged {
+            if let Err(error) = self.db.execute(
+                "INSERT OR REPLACE INTO memory_vectors VALUES(?,?,?,?,?,?)",
+                params![
+                    id,
+                    model,
+                    dim as i64,
+                    content_sha256,
+                    crate::semantic::vec_to_blob(&vec),
+                    updated_at
+                ],
+            ) {
+                log::warn!("cannot persist staged memory vector: {error}");
+            }
+        }
+    }
+    /// Recompute one record's vector right away when the model is ready; otherwise
+    /// mark the index dirty so the next search rebuilds on demand.
+    fn refresh_vector(&mut self, memory: &Memory) {
+        self.flush_staged_vectors();
+        let text = crate::semantic::record_text(&memory.title, &memory.content, &memory.conditions);
+        // Only embed when the session is already built; otherwise flag the index so the
+        // next search (or startup) rebuilds missing vectors on demand.
+        if self.semantic.embedder_ready() {
+            if let Some(vec) = self.semantic.embed_query(&text) {
+                let hash = crate::semantic::content_sha256(&text);
+                let dim = vec.len();
+                if let Err(error) = self.db.execute(
+                    "INSERT OR REPLACE INTO memory_vectors VALUES(?,?,?,?,?,?)",
+                    params![
+                        memory.id,
+                        crate::semantic::MODEL_ID,
+                        dim as i64,
+                        hash,
+                        crate::semantic::vec_to_blob(&vec),
+                        now()
+                    ],
+                ) {
+                    log::warn!("cannot refresh memory vector: {error}");
+                }
+                return;
+            }
+        }
+        self.semantic.mark_index_dirty();
+    }
+    /// Drop a vector (record deleted) — currently only used by tests/`restore` paths.
+    #[allow(dead_code)]
+    fn drop_vector(&self, id: &str) {
+        let _ = self
+            .db
+            .execute("DELETE FROM memory_vectors WHERE id=?", [id]);
+    }
+    /// P5 §4: index size, used by tests and by `restore` verification.
+    #[allow(dead_code)]
+    pub fn vector_count(&self) -> ApiResult<usize> {
+        let count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))?;
+        Ok(count as usize)
     }
     fn search(&self, body: &Value) -> ApiResult<Value> {
         fn string<'a>(body: &'a Value, key: &str, default: &'a str) -> ApiResult<&'a str> {
@@ -380,7 +761,9 @@ impl MemoryStore {
         let query = string(body, "query", "")?;
         // P1-A: retracted records are excluded unless the caller explicitly opts in.
         let include_retracted = optional_flag(body, "include_retracted", false)?;
-        let (matched, retracted_excluded) = self.search_scored(
+        // P5 §3.1: optional semantic channel. Out-of-range values are a 400.
+        let options = semantic_options(body)?;
+        let (matched, retracted_excluded, semantic_pool) = self.search_scored_opts(
             if project.is_empty() {
                 None
             } else {
@@ -389,8 +772,13 @@ impl MemoryStore {
             query,
             scope == "all",
             include_retracted,
+            &options,
         )?;
         let mut dated = Vec::new();
+        // §2.1 (v1.2): semantic suggestions are only produced when the literal hit set is
+        // empty. "Empty" means no literal hit anywhere in the requested scope — not merely
+        // an empty page after `offset`/`limit` paging.
+        let literal_hits_any = !matched.is_empty();
         for (memory, score) in matched {
             if (scope == "project" && memory.memory_scope != "project")
                 || (scope == "personal" && memory.memory_scope != "personal")
@@ -431,11 +819,71 @@ impl MemoryStore {
             .collect::<ApiResult<Vec<Value>>>()?;
         let end = offset.saturating_add(memories.len());
         let next = if end < total { Some(end) } else { None };
+        // §2.1 (v1.4): only when the literal result set is empty, and only when the caller
+        // did not ask to include retracted records (that mode is an audit view). `None`
+        // means "the index could not be built inside the budget" -> explicit degradation.
+        let mut degraded_note = None;
+        let semantic_hits = if should_offer_semantic(&options, literal_hits_any, include_retracted) {
+            match self.semantic_candidates(query, &semantic_pool, &options)? {
+                Some(hits) => hits,
+                None => {
+                    degraded_note = Some(format!(
+                        "索引未就绪：本次需要重建的向量超过 {} 秒预算，语义通道已跳过",
+                        REBUILD_BUDGET.as_secs()
+                    ));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let semantic = self.semantic_payload(&semantic_hits, &options, degraded_note.as_deref());
         Ok(
             json!({"ranked":true,"memories":memories,"total":total,"offset":offset,"next_offset":next,"truncated":next.is_some(),"retracted_excluded":retracted_excluded,
+            "semantic":semantic,
             "filters":{"scope":scope,"project_id":if project.is_empty(){None}else{Some(project)},"query":query,"kind":kind,"date_field":field,"from":from,"to":to},
             "time_semantics":"record timestamps, not occurrence dates; from inclusive, to exclusive; latest versions only"}),
         )
+    }
+    /// Contract §3.2: `semantic` is always present; `memories` is empty when the model
+    /// is not ready (or the index could not be built inside the budget), and `note`
+    /// explains the degradation.
+    fn semantic_payload(
+        &self,
+        hits: &[crate::semantic::SemanticHit],
+        options: &crate::semantic::MatchOptions,
+        degraded_note: Option<&str>,
+    ) -> Value {
+        // `available` means "the semantic channel can actually answer right now", i.e. the
+        // ONNX session is built *and* this request was not degraded by the rebuild budget.
+        let ready = self.semantic.embedder_ready() && degraded_note.is_none();
+        let mut memories = Vec::new();
+        for hit in hits {
+            if let Ok(memory) = self.get(&hit.id) {
+                let mut value = serde_json::to_value(&memory).unwrap_or(Value::Null);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("score".into(), json!(hit.score));
+                }
+                memories.push(value);
+            }
+        }
+        let mut payload = json!({
+            "available": ready,
+            "mode": if ready && options.semantic { "hybrid" } else { "literal" },
+            "model": crate::semantic::MODEL_ID,
+            "min_similarity": options.semantic_min_similarity,
+            "memories": memories,
+        });
+        if !ready {
+            let note = match degraded_note {
+                Some(text) => text.to_string(),
+                None => self.semantic.not_ready_note(),
+            };
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("note".into(), json!(note));
+            }
+        }
+        payload
     }
     pub fn route(&mut self, method: &str, path: &str, body: Value) -> ApiResult<Value> {
         match (method, path) {
@@ -443,7 +891,7 @@ impl MemoryStore {
                 let mut st=self.db.prepare("SELECT tool,calls,successes,last_at,last_ok FROM agent_activity ORDER BY last_at DESC")?;
                 let rows=st.query_map([],|r|Ok(json!({"tool":r.get::<_,String>(0)?,"calls":r.get::<_,i64>(1)?,"successes":r.get::<_,i64>(2)?,"last_at":r.get::<_,String>(3)?,"last_ok":r.get::<_,bool>(4)?})))?;
                 Ok(
-                    json!({"activity":rows.collect::<Result<Vec<_>,_>>()?,"evidence":"local_mcp_route_calls_not_host_configuration"}),
+                    json!({"activity":rows.collect::<Result<Vec<_>,_>>()?,"evidence":"local_mcp_route_calls_not_host_configuration","semantic":self.semantic.status_json()}),
                 )
             }
             ("POST", "/api/v1/agent/call") => {
@@ -490,6 +938,11 @@ impl MemoryStore {
                 let rows=st.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"directory":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?})))?;
                 Ok(json!({"projects":rows.collect::<Result<Vec<_>,_>>()?}))
             }
+            // P5 §3.3: explicit, idempotent model acquisition. The only endpoint that may
+            // ever touch the network; a search never does.
+            ("POST", "/api/v1/models/prepare") => Ok(json!({
+                "semantic": self.semantic.prepare(),
+            })),
             ("POST", "/api/v1/projects") => {
                 let name = required(&body, "name")?;
                 let directory = body["directory"]
@@ -543,7 +996,10 @@ impl MemoryStore {
                     .collect();
                 let q = query.to_string();
                 let p = project.map(|p| p.to_string());
-                let (project_records, related, blockers, next_steps, recent_decisions, text, project_total, personal_total) = {
+                // P5 §3.1: `/context` accepts the same optional semantic channel.
+                let semantic_options = semantic_options(&body)?;
+                let mut semantic_hits: Vec<crate::semantic::SemanticHit> = Vec::new();
+                let (project_records, related, blockers, next_steps, recent_decisions, text, project_total, personal_total, semantic_payload) = {
                     let (mut project_records, mut related) = (project_records, related);
                     if p.is_some() && q.trim().is_empty() {
                         let terms: Vec<String> = project_records
@@ -573,8 +1029,40 @@ impl MemoryStore {
                             grouped_by_kind(&hits, &["decision", "决策"]),
                         )
                     };
+                    // The semantic pool is the *whole* requested scope, captured before the
+                    // 40/20 display truncation; otherwise a truncated view could never match.
+                    let semantic_pool: Vec<(Memory, String)> = project_records
+                        .iter()
+                        .chain(related.iter())
+                        .map(|memory| {
+                            (
+                                memory.clone(),
+                                crate::semantic::record_text(
+                                    &memory.title,
+                                    &memory.content,
+                                    &memory.conditions,
+                                ),
+                            )
+                        })
+                        .collect();
+                    let literal_empty = project_records.is_empty() && related.is_empty();
                     project_records.truncate(40);
                     related.truncate(20);
+                    // §2.1 v1.4: only when the assembled handover is empty, mirroring search.
+                    let mut degraded_note = None;
+                    if semantic_options.semantic && !q.trim().is_empty() && literal_empty {
+                        match self.semantic_candidates(&q, &semantic_pool, &semantic_options)? {
+                            Some(hits) => semantic_hits = hits,
+                            None => {
+                                degraded_note = Some(format!(
+                                    "索引未就绪：本次需要重建的向量超过 {} 秒预算，语义通道已跳过",
+                                    REBUILD_BUDGET.as_secs()
+                                ));
+                            }
+                        }
+                    }
+                    let semantic_payload =
+                        self.semantic_payload(&semantic_hits, &semantic_options, degraded_note.as_deref());
                     let truncated =
                         project_total > project_records.len() || personal_total > related.len();
                     let mut text =
@@ -616,10 +1104,11 @@ impl MemoryStore {
                         text,
                         project_total,
                         personal_total,
+                        semantic_payload,
                     )
                 };
                 Ok(
-                    json!({"project_records":project_records,"personal_experiences":related,"blockers":blockers,"next_steps":next_steps,"recent_decisions":recent_decisions,"text":text,"generated_at":now(),"query":query,"truncated":project_total > project_records.len() || personal_total > related.len(),"project_total":project_total,"personal_total":personal_total,"retracted_excluded":retracted_excluded}),
+                    json!({"project_records":project_records,"personal_experiences":related,"blockers":blockers,"next_steps":next_steps,"recent_decisions":recent_decisions,"text":text,"generated_at":now(),"query":query,"truncated":project_total > project_records.len() || personal_total > related.len(),"project_total":project_total,"personal_total":personal_total,"retracted_excluded":retracted_excluded,"semantic":semantic_payload}),
                 )
             }
             ("POST", "/api/v1/memories/update") => self.update(body, false),
@@ -720,6 +1209,8 @@ impl MemoryStore {
             params![event, request, response.to_string()],
         )?;
         tx.commit()?;
+        // P5 §4: keep `memory_vectors` in step with the record (no-op when no model).
+        self.refresh_vector(&memory);
         Ok(response)
     }
     fn update(&mut self, body: Value, undo: bool) -> ApiResult<Value> {
@@ -771,6 +1262,7 @@ impl MemoryStore {
             params![id, next.version, raw],
         )?;
         tx.commit()?;
+        self.refresh_vector(&next);
         Ok(json!({"memory":next}))
     }
     /// P1-A: retract (`retracting=true`) or restore (`false`). Both produce version+1 and
@@ -811,6 +1303,11 @@ impl MemoryStore {
             params![id, next.version, raw],
         )?;
         tx.commit()?;
+        // Retracted records keep their vector (contract §4) but never surface while
+        // `include_retracted=false`, because the scope pool is filtered first.
+        if next.retracted_at.is_none() {
+            self.refresh_vector(&next);
+        }
         Ok(json!({"memory":next}))
     }
 }
@@ -1944,5 +2441,209 @@ mod tests {
             .unwrap_err();
         assert_eq!((stale.0, stale.1.as_str()), (400, "memory is not retracted"));
         assert_eq!(store.get(&id).unwrap().version, 4);
+    }
+
+    // ───────────────────────── P5: bounded semantic suggestions ─────────────────────────
+
+    fn p5_options(semantic: bool, min: f64) -> crate::semantic::MatchOptions {
+        crate::semantic::MatchOptions {
+            semantic,
+            semantic_min_similarity: min,
+            semantic_limit: 5,
+        }
+    }
+
+    fn unit(n: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; crate::semantic::MODEL_DIM];
+        v[n % crate::semantic::MODEL_DIM] = 1.0;
+        v
+    }
+
+    fn pool_of(ids: &[&str]) -> Vec<(Memory, String)> {
+        ids.iter()
+            .map(|id| {
+                (
+                    Memory {
+                        id: (*id).to_string(),
+                        version: 1,
+                        memory_scope: "project".into(),
+                        project_id: None,
+                        title: (*id).to_string(),
+                        content: String::new(),
+                        kind: String::new(),
+                        source: String::new(),
+                        conditions: String::new(),
+                        evidence_type: String::new(),
+                        origin_memory_id: None,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                        retracted_at: None,
+                        retract_reason: None,
+                    },
+                    (*id).to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn semantic_is_off_by_default_and_bad_values_are_400() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        // Absent fields -> defaults, and a valid request still answers.
+        let ok = store
+            .route("POST", "/api/v1/search", json!({"query":"任意"}))
+            .unwrap();
+        assert_eq!(ok["semantic"]["available"], false);
+        assert_eq!(ok["semantic"]["mode"], "literal");
+        assert_eq!(ok["semantic"]["model"], crate::semantic::MODEL_ID);
+        assert_eq!(
+            ok["semantic"]["min_similarity"],
+            crate::semantic::DEFAULT_MIN_SIMILARITY
+        );
+        assert_eq!(ok["semantic"]["memories"], json!([]));
+        // Out-of-range / wrong-typed values are rejected before any work.
+        for bad in [
+            json!({"semantic_min_similarity": 1.5}),
+            json!({"semantic_min_similarity": -0.1}),
+            json!({"semantic_min_similarity": "0.4"}),
+            json!({"semantic_limit": 0}),
+            json!({"semantic_limit": 11}),
+            json!({"semantic": "yes"}),
+        ] {
+            let mut body = json!({"query":"任意"});
+            for (k, v) in bad.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let error = store.route("POST", "/api/v1/search", body).unwrap_err();
+            assert_eq!(error.0, 400, "expected 400 for {bad}");
+        }
+    }
+
+    #[test]
+    fn semantic_suggestions_only_when_literal_is_empty() {
+        let options = p5_options(true, 0.10);
+        assert!(should_offer_semantic(&options, false, false));
+        assert!(!should_offer_semantic(&options, true, false));
+        assert!(!should_offer_semantic(&options, false, true));
+        assert!(!should_offer_semantic(&p5_options(false, 0.10), false, false));
+    }
+
+    #[test]
+    fn semantic_ranking_applies_threshold_limit_and_deterministic_order() {
+        let pool = pool_of(&["a", "b", "c", "d", "e", "f", "g"]);
+        let mut known = std::collections::HashMap::new();
+        let query = unit(0);
+        // c/b/a align with the query, e/f/g are orthogonal, d sits exactly on the bound.
+        for (id, score) in [
+            ("a", 0.5f32),
+            ("b", 0.9),
+            ("c", 0.7),
+            ("d", 0.4),
+            ("e", 0.0),
+            ("f", 0.0),
+            ("g", 0.0),
+        ] {
+            // Unit vector whose cosine against `unit(0)` is exactly `score`, so the
+            // assertions below test the threshold branch and not float drift.
+            let mut v = vec![0.0f32; crate::semantic::MODEL_DIM];
+            v[0] = score;
+            v[1] = (1.0 - score * score).sqrt();
+            known.insert(id.to_string(), v);
+        }
+        // threshold 0.4 keeps d (>= bound, inclusive); limit 5 keeps a,b,c,d.
+        let hits = rank_semantic_hits(&query, &known, &pool, &p5_options(true, 0.40));
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a", "d"]);
+        assert!((hits[0].score - 0.9).abs() < 1e-6);
+        // Raising the bound drops the borderline record.
+        let hits = rank_semantic_hits(&query, &known, &pool, &p5_options(true, 0.45));
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+        // The limit is capped by MAX_SEMANTIC_LIMIT regardless of what the caller asked.
+        let mut wide = p5_options(true, 0.0);
+        wide.semantic_limit = 99;
+        assert_eq!(rank_semantic_hits(&query, &known, &pool, &wide).len(), 7);
+        // Pure tie-break: equal scores fall back to id ascending.
+        let tie = pool_of(&["z", "y"]);
+        let mut tied = std::collections::HashMap::new();
+        tied.insert("z".to_string(), unit(1));
+        tied.insert("y".to_string(), unit(1));
+        assert_eq!(
+            rank_semantic_hits(&query, &tied, &tie, &p5_options(true, 0.0))
+                .iter()
+                .map(|h| h.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["y", "z"]
+        );
+    }
+
+    #[test]
+    fn semantic_never_changes_literal_ranking_or_total() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let project = store
+            .route("POST", "/api/v1/projects", json!({"name":"P5"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (i, content) in ["排班改为两班倒", "夜班补贴标准", "巡检路线调整"].iter().enumerate() {
+            store
+                .route(
+                    "POST",
+                    "/api/v1/memories",
+                    json!({"memory_scope":"project","project_id":project,"content":content,
+                           "title":format!("记录{i}"),"event_id":format!("p5-{i}")}),
+                )
+                .unwrap();
+        }
+        let plain = store
+            .route("POST", "/api/v1/search", json!({"query":"排班"}))
+            .unwrap();
+        let semantic = store
+            .route(
+                "POST",
+                "/api/v1/search",
+                json!({"query":"排班","semantic":true}),
+            )
+            .unwrap();
+        // §6.0: suggestions never enter `total` and never reorder literal hits.
+        assert_eq!(plain["total"], semantic["total"]);
+        assert_eq!(plain["memories"], semantic["memories"]);
+        assert_eq!(semantic["semantic"]["memories"], json!([]));
+    }
+
+    #[test]
+    fn context_payload_always_carries_a_semantic_object() {
+        let mut store = MemoryStore::open(Path::new(":memory:")).unwrap();
+        let value = store
+            .route("POST", "/api/v1/context", json!({"query":"任意"}))
+            .unwrap();
+        assert_eq!(value["semantic"]["available"], false);
+        assert_eq!(value["semantic"]["memories"], json!([]));
+        assert!(value["text"].as_str().unwrap().contains("记忆数据"));
+        let error = store
+            .route("POST", "/api/v1/context", json!({"semantic_limit": 42}))
+            .unwrap_err();
+        assert_eq!(error.0, 400);
+    }
+
+    #[test]
+    fn vectors_survive_reopen_and_are_scoped_to_the_store() {
+        let dir = std::env::temp_dir().join(format!("gm-p5-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("work-memory.db");
+        {
+            let store = MemoryStore::open(&path).unwrap();
+            assert_eq!(store.vector_count().unwrap(), 0);
+        }
+        // Two independent stores must not share an in-memory index.
+        let a = MemoryStore::open(&path).unwrap();
+        let b = MemoryStore::open(&path).unwrap();
+        assert_eq!(a.vector_count().unwrap(), 0);
+        assert_eq!(b.vector_count().unwrap(), 0);
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

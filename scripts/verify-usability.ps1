@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 <#
     P0-D 独立端到端验收脚本（黑盒）。
     契约：docs/design/USABILITY_P0.md（唯一来源）。
