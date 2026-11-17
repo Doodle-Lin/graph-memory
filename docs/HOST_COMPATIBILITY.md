@@ -1,5 +1,24 @@
 # Agent 宿主兼容与验收矩阵
 
+## 2026-11-17 工作日志追加验收
+
+新入口 [verify-work-log-adoption.py](../scripts/verify-work-log-adoption.py) 用一个真实 Claude Code 会话发送三轮工作消息，再启动全新 Claude 会话和可选 Codex CLI 只读会话。工作消息没有要求“记日志”；宿主通过统一 Agent 指令主动决定调用。独立 HTTP 回读核对日期、状态、ID、版本、随机细节、记录总数及只读阶段没有写入。
+
+- Claude Code 2.1.295：首日未完成进展自动创建一条日志；同日同任务回归完成更新原ID至v2；次日计划另建planned日志，前日保持不变。新会话按work_date和项目完整查询一周，读回两个随机编号、两条ID，说明记录空缺及用户陈述边界。
+- Codex CLI 0.166.0：全新只读会话从同一隔离服务读到Claude写入的详细日志，按真实项目及work_date范围检索，正确区分完成/计划。只开放projects/search，不代表Codex自动写入已验收。
+- 请求模型别名sonnet，Claude响应自报GLM-5.3；本页证明该宿主/路由样本，不宣称Anthropic Sonnet认证。Hermes的工作日志模型采用仍未验证。
+- 成功证据：`artifacts/work-log-adoption/8a237eb2f1f941f2b6392f0f194550b3/`。第一次`f4b9a6d7e6f641a5b3686611d8cbc9bb`中Claude通过，Codex未通过：CLI嵌套配置合并保留了旧GM_SERVICE_DIR，覆盖GM_API_URL仍会接旧库，发生只读项目发现/空结果检索；没有写入。修复后同时覆盖command、args、GM_SERVICE_DIR、GM_SERVICE_EXE与API地址，复测成功。失败证据保留，不算隔离验收通过。
+- 模型曾保留“回归待跑”旧标题，虽然正文/状态已完成；两位读者均指出差异。使用约定已补充同时更新title，不能声称提示能保证所有模型每次一致。多页大样本、长期自动记录漏记率、Hermes和Codex写入仍需后续独立验证。
+
+复跑示例（先构建候选组件；需要已配置模型路由）：
+
+```powershell
+python -X utf8 scripts/verify-work-log-adoption.py --binary-dir src-tauri/target/debug
+# 跨宿主再指定 --codex-exe <本机codex.exe完整路径>
+```
+
+此入口不修改日常宿主配置。成功样本不表示当前聊天已重载新版MCP；安装/切换另行记录。以下保留2026-11-02历史证据，不将旧版本矩阵当作当前状态。
+
 本页记录 2026-11-02 的实际证据，区分配置、工具发现、调用成功、结果采用。配置文件存在或“测试本地组件”通过，不等于真实宿主已使用记忆。此轮未修改日常宿主配置或真实知识库。
 
 ## 兼容矩阵

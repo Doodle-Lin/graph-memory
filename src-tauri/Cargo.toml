@@ -1,6 +1,6 @@
 [package]
 name = "graph-memory"
-version = "0.3.0"
+version = "0.4.0"
 description = "Graph Memory — 图式记忆系统"
 authors = ["Graph Memory Contributors"]
 license = "MIT"

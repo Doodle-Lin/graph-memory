@@ -30,6 +30,18 @@ try {
     void Pump(Func<bool> done){var deadline=DateTime.UtcNow.AddSeconds(15);while(!done()){Dispatcher.UIThread.RunJobs();if(DateTime.UtcNow>deadline)throw new TimeoutException("UI operation timed out");Thread.Sleep(5);}Dispatcher.UIThread.RunJobs();}
     void Click(string method){Invoke(method,null,null);Pump(()=>!(bool)typeof(MainWindow).GetField("busy",flags)!.GetValue(window)!);}
     void Complete(Task task){Pump(()=>task.IsCompleted);task.GetAwaiter().GetResult();}
+    // Teardown for recovery observers, not a user close action: leave the crash
+    // draft on disk and guarantee this window cannot overwrite a later cycle.
+    // Ordinary Close() is cancelled by the deliberately recovered dirty draft.
+    void CloseRecoveryObserver(MainWindow observer){
+        var didClose=false;
+        observer.Closed+=(_,_)=>didClose=true;
+        typeof(MainWindow).GetField("allowClose",flags)!.SetValue(observer,true);
+        observer.Close();
+        Check(didClose,"recovery observer remained alive after teardown");
+        Dispatcher.UIThread.RunJobs(); // drain deferred TextChanged from draft restoration
+        Check(!((DispatcherTimer)typeof(MainWindow).GetField("draftTimer",flags)!.GetValue(observer)!).IsEnabled,"closed recovery observer still has an active draft timer");
+    }
     JsonNode Post(string path,object body)=>client.PostAsync(path,body).GetAwaiter().GetResult();
     JsonNode Read(string id)=>Post("api/v1/search",new{scope="all"})["memories"]!.AsArray().Single(x=>x!["id"]!.GetValue<string>()==id)!.DeepClone();
     var projectId=Post("api/v1/projects",new{name="Editor regression"})["id"]!.GetValue<string>();
@@ -384,7 +396,7 @@ try {
             Check(reopened.FindControl<ComboBox>("Kind")!.SelectedIndex==2,"new process restored the wrong kind");
             Check(reopened.FindControl<ComboBox>("EvidenceInput")!.SelectedIndex==1,"new process restored the wrong evidence");
             Check(reopened.FindControl<TextBlock>("DraftNotice")!.IsVisible&&reopened.FindControl<TextBlock>("DraftNotice")!.Text!.Contains("上次未保存"),"recovered draft was not labelled as unsaved");
-            reopened.Close();
+            CloseRecoveryObserver(reopened);
             Console.WriteLine("OK crash recovery #1: child wrote with a real data_dir, was killed, and a new window read every field back");
             // 关掉这一扇窗的草稿自动落盘：它的 500ms 防抖若在后面 Pump 时才触发，会把旧内容盖回磁盘，掩盖子进程写的草稿。
             ((DispatcherTimer)typeof(MainWindow).GetField("draftTimer",flags)!.GetValue(draftWindow)!).Stop();
@@ -397,6 +409,7 @@ try {
             var thirdContent="面板未开草稿正文";
             DraftStore.DeleteBucket(hostRealDir);
             DraftStore.DeleteBucket("");
+            Dispatcher.UIThread.RunJobs();
             Check(!System.IO.File.Exists(DraftStore.FileFor(hostRealDir)),"cycle 2 did not start from an empty workspace bucket");
             Trace("cycle2 spawn connect-writer");
             var third=System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("dotnet"){
@@ -416,6 +429,7 @@ try {
             Check(thirdWritten,"connect-write child did not confirm writing the draft: "+third.StandardError.ReadToEnd());
             Check(System.IO.File.Exists(DraftStore.FileFor(hostRealDir)),"the draft did not land in the real workspace bucket while the data panel stayed closed");
             Check(DraftStore.Load(hostRealDir).Drafts.Count==1,"the real workspace bucket does not hold exactly one draft");
+            Check(DraftStore.Load(hostRealDir).Drafts["personal"].Title==thirdTitle,"cycle 2 child did not persist the expected title before reopening");
             Check(!System.IO.File.Exists(DraftStore.FileFor("")),"a draft was written into the shared gm-draft-no-workspace bucket");
             Trace("cycle2 reopen");
             var thirdReopened=new MainWindow();
@@ -428,7 +442,7 @@ try {
             Check(thirdReopened.FindControl<TextBox>("ContentInput")!.Text==thirdContent,"recovered content is wrong: "+thirdReopened.FindControl<TextBox>("ContentInput")!.Text);
             Check(thirdReopened.FindControl<TextBlock>("DraftNotice")!.IsVisible&&thirdReopened.FindControl<TextBlock>("DraftNotice")!.Text!.Contains("上次未保存"),"recovered draft was not labelled as unsaved");
             Check(!System.IO.File.Exists(DraftStore.FileFor("")),"connecting and restoring created a gm-draft-no-workspace bucket");
-            thirdReopened.Close();
+            CloseRecoveryObserver(thirdReopened);
             Console.WriteLine("OK crash recovery #2: a child that never opened the data panel persisted into the real workspace bucket, and Connect restored it");
 
             // 真实双进程 #3：进程被杀后重启，用户不做任何额外操作就直接继续编辑，草稿仍在同一工作库分片里。

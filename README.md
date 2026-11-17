@@ -2,7 +2,7 @@
 
 本仓库以 **Avalonia Windows x64 可运行开发版** 为统一入口，通过 **MCP 自动记忆** 沉淀跨会话经验与项目记录：Agent 经 MCP 检索、写入和纠正记忆，桌面端展示接入状态、最近记忆与人工纠正，不要求用户逐轮复制上下文。
 
-当前交付线为 P4（0.3.0）；P5 语义实验在独立保留分支，尚未验收。[当前状态与验证入口](docs/design/GOVERNANCE_20261116.md)。
+当前交付线为 P4 加工作日志（0.4.0）；P5 语义实验在独立保留分支，尚未验收。[收口基线](docs/design/GOVERNANCE_20261116.md)与[工作日志说明](docs/WORK_LOGS.md)。
 
 ## 快速开始
 
@@ -54,7 +54,7 @@
 
 1. **桌面**【数据备份与恢复】面板：显示当前工作库目录与计数；导出备份、校验备份、恢复到空目录（`apply` 前二次确认，明示当前工作库不会被写入/覆盖/合并/删除）；目标文件已存在时界面直接拒绝，绝不覆盖。
 2. **命令行**：`graph-memory-backup export --data-dir DIR --output FILE.gmbackup`、`verify FILE.gmbackup`、`restore --input FILE.gmbackup --data-dir EMPTY_DIR [--dry-run]`。详见[备份文档](docs/BACKUP.md)。
-3. **发布包**：`scripts/package-release.ps1` 产出 `artifacts/release/graph-memory-<版本>-win-x64/` 与同名 ZIP（含 4 个可执行文件、`VERSION.txt`、`SHA256SUMS.txt`）；`scripts/verify-release.ps1` 校验版本一致性、哈希、ZIP 解压后 smoke 与真实 export→verify→restore 往返。当前版本 **0.3.0**，解压即用、无需安装。
+3. **发布包**：`scripts/package-release.ps1` 产出 `artifacts/release/graph-memory-<版本>-win-x64/` 与同名 ZIP（含 4 个可执行文件、`VERSION.txt`、`SHA256SUMS.txt`）；`scripts/verify-release.ps1` 校验版本一致性、哈希、ZIP 解压后 smoke 与真实 export→verify→restore 往返。当前版本 **0.4.0**，解压即用、无需安装。
 
 恢复只写入**空的** `--data-dir`，不会覆盖现有工作库；需要把备份并回现有库时请人工核对记录 ID 与版本（合并式恢复仍未实现）。
 
