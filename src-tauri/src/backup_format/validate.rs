@@ -24,6 +24,7 @@ fn memory(raw: &str) -> Result<(Memory, Value), String> {
             && chrono::DateTime::parse_from_rfc3339(&parsed.updated_at).is_ok(),
         "invalid memory timestamp",
     )?;
+    if let Some(log) = &parsed.work_log { log.validate()?; }
     Ok((parsed, value))
 }
 

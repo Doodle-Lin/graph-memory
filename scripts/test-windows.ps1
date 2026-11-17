@@ -101,6 +101,10 @@ try {
         '-X', 'utf8', 'tests/eval/check_false_recall.py', '--exe', 'src-tauri/target/debug/graph-memory-service.exe'
     )
 
+    Invoke-Native -Label 'Work log MCP and restore' -FilePath $Python -CommandArgs @(
+        '-X', 'utf8', 'tests/test_work_logs.py'
+    )
+
     Invoke-Native -Label 'Setup console tests' -FilePath $Dotnet -CommandArgs @(
         'run', '--project', $setupTestProject, '-c', 'Release'
     )

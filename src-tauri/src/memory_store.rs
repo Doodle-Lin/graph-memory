@@ -223,6 +223,14 @@ pub struct Memory {
     /// P1-A: retraction reason; cleared again on restore.
     #[serde(default)]
     pub retract_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_log: Option<crate::work_log::WorkLog>,
+}
+fn parse_work_log(body: &Value) -> ApiResult<Option<crate::work_log::WorkLog>> {
+    let Some(value) = body.get("work_log") else { return Ok(None); };
+    let log: crate::work_log::WorkLog = serde_json::from_value(value.clone())?;
+    log.validate().map_err(|e| ApiError(400,e))?;
+    Ok(Some(log))
 }
 pub struct MemoryStore {
     db: Connection,
@@ -352,15 +360,20 @@ impl MemoryStore {
             return Err(ApiError(400, "scope must be current, project (requires project_id), personal or all (without project_id)".into()));
         }
         let field = string(body, "date_field", "updated_at")?;
-        if !matches!(field, "created_at" | "updated_at") {
+        if !matches!(field, "created_at" | "updated_at" | "work_date") {
             return Err(ApiError(
                 400,
-                "date_field must be created_at or updated_at".into(),
+                "date_field must be created_at, updated_at or work_date".into(),
             ));
         }
         let parse_bound = |key: &str| -> ApiResult<Option<chrono::DateTime<chrono::FixedOffset>>> {
             if body.get(key).is_none() {
                 return Ok(None);
+            }
+            if field == "work_date" {
+                let value = string(body, key, "")?;
+                crate::work_log::WorkLog::validate_date(value).map_err(|e| ApiError(400,e))?;
+                return Ok(Some(chrono::DateTime::parse_from_rfc3339(&format!("{value}T00:00:00Z")).unwrap()));
             }
             chrono::DateTime::parse_from_rfc3339(string(body, key, "")?)
                 .map(Some)
@@ -398,7 +411,12 @@ impl MemoryStore {
             {
                 continue;
             }
-            let date = chrono::DateTime::parse_from_rfc3339(if field == "created_at" {
+            let work_day;
+            let date = chrono::DateTime::parse_from_rfc3339(if field == "work_date" {
+                let Some(log) = &memory.work_log else { continue; };
+                work_day = format!("{}T00:00:00Z", log.date);
+                &work_day
+            } else if field == "created_at" {
                 &memory.created_at
             } else {
                 &memory.updated_at
@@ -413,7 +431,7 @@ impl MemoryStore {
             b.1 .1
                 .partial_cmp(&a.1 .1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.1 .0.updated_at.cmp(&a.1 .0.updated_at))
+                .then_with(|| if field == "work_date" { b.0.cmp(&a.0) } else { b.1 .0.updated_at.cmp(&a.1 .0.updated_at) })
                 .then_with(|| a.1 .0.id.cmp(&b.1 .0.id))
         });
         let total = dated.len();
@@ -433,8 +451,8 @@ impl MemoryStore {
         let next = if end < total { Some(end) } else { None };
         Ok(
             json!({"ranked":true,"memories":memories,"total":total,"offset":offset,"next_offset":next,"truncated":next.is_some(),"retracted_excluded":retracted_excluded,
-            "filters":{"scope":scope,"project_id":if project.is_empty(){None}else{Some(project)},"query":query,"kind":kind,"date_field":field,"from":from,"to":to},
-            "time_semantics":"record timestamps, not occurrence dates; from inclusive, to exclusive; latest versions only"}),
+            "filters":{"scope":scope,"project_id":if project.is_empty(){None}else{Some(project)},"query":query,"kind":kind,"date_field":field,"from":body.get("from"),"to":body.get("to")},
+            "time_semantics":if field == "work_date" {"declared local work dates (day precision), unknown dates excluded; from inclusive/to exclusive YYYY-MM-DD; latest corrected versions, not as-of history"} else {"record timestamps, not occurrence dates; from inclusive, to exclusive; latest versions only"}}),
         )
     }
     pub fn route(&mut self, method: &str, path: &str, body: Value) -> ApiResult<Value> {
@@ -703,7 +721,11 @@ impl MemoryStore {
             updated_at: timestamp,
             retracted_at: None,
             retract_reason: None,
+            work_log: parse_work_log(&body)?,
         };
+        if (memory.kind == "work_log") != memory.work_log.is_some() {
+            return Err(ApiError(400, "kind=work_log and work_log metadata must be provided together".into()));
+        }
         let raw = serde_json::to_string(&memory)?;
         let response = json!({"memory":memory});
         let tx = self.db.transaction()?;
@@ -743,6 +765,7 @@ impl MemoryStore {
         } else {
             let mut next = current.clone();
             next.content = required(&body, "content")?;
+            if body.get("work_log").is_some() { next.work_log = parse_work_log(&body)?; }
             for (key, target) in [
                 ("title", &mut next.title),
                 ("conditions", &mut next.conditions),
@@ -758,6 +781,7 @@ impl MemoryStore {
             }
             next
         };
+        if next.work_log.is_some() && next.kind != "work_log" { return Err(ApiError(400, "work_log metadata requires kind=work_log".into())); }
         next.version = current.version + 1;
         next.updated_at = now();
         let raw = serde_json::to_string(&next)?;
@@ -872,6 +896,7 @@ mod tests {
                 updated_at: updated.into(),
                 retracted_at: None,
                 retract_reason: None,
+            work_log: None,
             };
             store
                 .db

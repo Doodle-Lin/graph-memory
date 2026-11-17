@@ -12,3 +12,5 @@ pub mod backup_io;
 mod desktop;
 #[cfg(feature = "desktop")]
 pub use desktop::run;
+
+pub mod work_log;
