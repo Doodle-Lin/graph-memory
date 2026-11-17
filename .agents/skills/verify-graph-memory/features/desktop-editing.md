@@ -1,6 +1,6 @@
 # Native desktop editing and safe close
 
-Status: source-grounded workflow, not executed during skill creation. Sources: `desktop/GraphMemory.Desktop/Program.cs`, `MainWindow.axaml`, `MainWindow.axaml.cs`, `MainWindow.Closing.cs`, `ServiceHost.cs`. Use host computer-use tools and their skill instructions; inspect the live window before actions. XAML x:Name values below identify source controls, not a promise that UIA exposes them as AutomationId. Use observed accessible labels or screenshot-derived locations; no reflection, internal setters or direct database mutation.
+Status: source-grounded workflow, not rerun in this skill update. Earlier UIA/real-keyboard plus HTTP persistence checks passed, while capture timed out; visual acceptance remains blocked (see feature index for evidence and retained scratch). Sources: `desktop/GraphMemory.Desktop/Program.cs`, `MainWindow.axaml`, `MainWindow.axaml.cs`, `MainWindow.Closing.cs`, `ServiceHost.cs`. Use host computer-use tools and their skill instructions; inspect the live window before actions. XAML x:Name values below identify source controls, not a promise that UIA exposes them as AutomationId. Use observed accessible labels or screenshot-derived locations; no reflection, internal setters or direct database mutation. Public UIA Value actions are allowed when the observed control supports them; do not call a UIA text tree a screenshot.
 
 ## Launch and doctor
 

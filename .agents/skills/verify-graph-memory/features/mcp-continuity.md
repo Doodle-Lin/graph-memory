@@ -8,4 +8,4 @@ The real driver launches a fresh MCP executable per call, sending JSON-RPC initi
 
 Evidence: actions.json records raw inputs/stdout/exit codes; source-doctor.json binds PID/data directory; build.json identifies executable bytes. Require no JSON-RPC error/isError, correct ID/version/count and corrected text, not merely exit0.
 
-Excluded: autonomous model use, host configuration migration, project/date filters, retraction and contention. Those remain in existing tests/test_headless_service.py and the full contract; a personal-flow pass does not prove those branches. Cleanup and failed-attempt retention follow SKILL.md.
+Excluded from this personal continuity feature: autonomous model use, host configuration migration, project/date filters, retraction and contention. See the separate [work-log feature](work-logs.md) for project/date coverage and [model adoption](model-adoption.md) for real host behavior. Existing tests/test_headless_service.py and the full contract cover additional protocol branches; a personal-flow pass does not prove them. Cleanup and failed-attempt retention follow SKILL.md.

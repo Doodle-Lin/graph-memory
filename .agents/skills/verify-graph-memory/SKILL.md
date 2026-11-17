@@ -1,11 +1,11 @@
 ---
 name: verify-graph-memory
-description: Verify Graph Memory through real isolated MCP sessions, backup CLI and native Avalonia user flows. Use for repeatable end-to-end acceptance, regression diagnosis and evidence collection; distinguish native UI, headless controls and model adoption.
+description: Verify Graph Memory end to end through isolated MCP work logs, date/project recall, backup restore, native Avalonia flows and opt-in Claude/Codex adoption. Use for repeatable acceptance with evidence and owned cleanup; distinguish protocol, actual model use and native visual coverage.
 ---
 
 # Graph Memory verification
 
-Run from the repository root (currently `E:/workspace/graph-memory`). Read `docs/design/GOVERNANCE_20261116.md` and the [feature map](features/README.md) first. P4 is the delivery baseline; P5 on `codex/p5-semantic-hold-20261116` is unaccepted. Recheck these facts on future runs; do not assume a clean working tree or current binaries.
+Run from the repository root (currently `E:/workspace/graph-memory`). Read `docs/WORK_LOGS.md`, `docs/design/EXECUTION_LEDGER.md` and the [feature map](features/README.md) first. Current source baseline is P4 plus work logs, 0.4.0; P5 on `codex/p5-semantic-hold-20261116` is unaccepted. Recheck these facts on future runs; do not assume a clean working tree or current binaries. Reuse this skill rather than creating a second verifier for the same product.
 
 ## Launch and dependencies
 
@@ -20,13 +20,13 @@ python -X utf8 .agents/skills/verify-graph-memory/scripts/verify.py run
 if ($LASTEXITCODE -ne 0) { throw 'verification failed; inspect printed evidence path' }
 ```
 
-The driver accepts `--bin-dir ABSOLUTE_DIRECTORY` for freshly built or extracted binaries. It never builds implicitly. Record HEAD/dirty state and build output alongside its `build.json` hashes; hashes identify actual tested binaries, not proof they match arbitrary source edits. Do not run the default desktop build script against a user's running `artifacts/desktop` installation. Use the CI candidate or an isolated publish directory.
+The driver accepts `--bin-dir ABSOLUTE_DIRECTORY` for freshly built or extracted binaries. It never builds implicitly. Record HEAD/dirty state and build output alongside its `build.json` hashes; hashes identify actual tested binaries, not proof they match arbitrary source edits. The helper records the actual MCP initialize version in result.json. Do not run the default desktop build script against a user's running installation or overwrite installed binaries. Use the CI candidate or an isolated publish directory.
 
-No external account, token or model is required. The driver strips inherited `GM_*` settings, creates unique temporary source/restore/draft directories, starts its own service with random local port, and uses `GM_MEMORY_V1=1` / `GM_API_URL` only in fresh MCP child processes. MemoryStore initializes schema only in the owned empty source directory. No real knowledge or host configuration is read or changed.
+The default run needs no external account, token or model. It strips inherited `GM_*` settings, creates unique temporary source/restore/draft directories, starts its own service with random local port, and uses `GM_MEMORY_V1=1` / `GM_API_URL` only in fresh MCP child processes. MemoryStore initializes schema only in the owned empty source directory. Two synthetic projects are created via public HTTP (MCP cannot create projects). No real knowledge or host configuration is read or changed. Opt-in model adoption instead needs an authorized configured model route; follow its feature file, never print credentials or broaden the child's tool permissions.
 
 ## Doctor (read-only)
 
-`run` executes doctor after launching each service and again before cleanup. For a manually launched, owned instance:
+`run` executes doctor after launching each service, before each fresh MCP process and on both source/restore instances before cleanup. For a manually launched, owned instance:
 
 ```powershell
 python -X utf8 .agents/skills/verify-graph-memory/scripts/verify.py doctor --url $info.api_url --pid $ownedService.Id --data-dir $runData
@@ -38,15 +38,16 @@ Concurrent instances work with separate data directories and ports. Two writers 
 
 ## Drive and evidence
 
-Use the feature files, which cite source entry points. The helper invokes actual stdio MCP and the shipped backup CLI, not internal methods. Its default run exercises both MCP and backup mapped features. Native UI is a separate manual/computer-use feature and is not covered by a service pass.
+Use the feature files, which cite source entry points. The helper invokes actual stdio MCP, public HTTP project creation and the shipped backup CLI, not internal methods. Its default run exercises MCP continuity, dated/project-scoped work logs and backup restore. Native UI and real model adoption are separate features, not covered by a service pass. Run only the selected surfaces and report every other surface as historical/not-run/blocked, never silently count them as passed.
 
 Each run creates `artifacts/verification/run-UUID/` outside disposable state:
 
 - `build.json`: executable paths and SHA-256.
-- `source-doctor.json`, `restored-doctor.json`: instance identity/readiness.
+- `source-doctor.json`, `restored-doctor.json`, both `*-final-doctor.json`: instance identity/readiness.
 - `actions.json`: commands, synthetic requests, responses and exit codes.
-- service logs and `workspace.gmbackup`: synthetic backup retained as evidence.
-- `result.json`: pass/failure, scratch path, process cleanup and removal outcome.
+- `work-logs.json`: original/corrected day records, paginated responses and rejected-mutation readback.
+- service logs, `workspace.gmbackup`, `restored.gmbackup`: synthetic backups compared as full payloads.
+- `result.json`: overall and per-feature verdicts, MCP version, scratch path, process cleanup and removal outcome.
 
 Evidence may contain synthetic record bodies; do not change this harness to use real private records. Preserve failed attempts. Never call a screenshot substitute for state verification: use UI screenshots plus public API readback, and distinguish content persistence from visual usability.
 
@@ -58,6 +59,6 @@ For native UI, save/discard only synthetic drafts, close the owned window, then 
 
 ## Broader checks and limits
 
-`scripts/test-windows.ps1 -Dotnet <dotnet-path> -Python python` runs full source regression and P4 quality gates. Editor.Tests uses headless controls/reflection for some paths; its 215 assertions are not native input/screenshot proof. `--smoke-test` skips window creation. `scripts/verify-release.ps1` separately checks an actual package; debug success does not validate a ZIP. `scripts/verify-claude-mcp.py` uses a real external model route and is excluded from the default offline verifier; do not infer model adoption from stdio success.
+`scripts/test-windows.ps1 -Dotnet <dotnet-path> -Python python` runs full source regression and P4 quality gates. Editor.Tests uses headless controls/reflection for some paths; its current 220 assertions are not native input/screenshot proof. `--smoke-test` skips window creation. `scripts/verify-release.ps1` separately checks an actual package; debug success does not validate a ZIP. [Model adoption](features/model-adoption.md) uses `scripts/verify-work-log-adoption.py`, a real external model route excluded from the default offline verifier. The older `scripts/verify-claude-mcp.py` explicitly asks for writes; it does not test spontaneous work-log adoption.
 
 Current self-validation and gaps are in `features/README.md`. Use `$maintain-verification-skill` when source, controls, CLI or package behavior changes. This skill grants no deployment or host-configuration permission and creates no schedule.
