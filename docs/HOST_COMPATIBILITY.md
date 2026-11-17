@@ -9,6 +9,7 @@
 - 请求模型别名sonnet，Claude响应自报GLM-5.3；本页证明该宿主/路由样本，不宣称Anthropic Sonnet认证。Hermes的工作日志模型采用仍未验证。
 - 成功证据：`artifacts/work-log-adoption/8a237eb2f1f941f2b6392f0f194550b3/`。第一次`f4b9a6d7e6f641a5b3686611d8cbc9bb`中Claude通过，Codex未通过：CLI嵌套配置合并保留了旧GM_SERVICE_DIR，覆盖GM_API_URL仍会接旧库，发生只读项目发现/空结果检索；没有写入。修复后同时覆盖command、args、GM_SERVICE_DIR、GM_SERVICE_EXE与API地址，复测成功。失败证据保留，不算隔离验收通过。
 - 模型曾保留“回归待跑”旧标题，虽然正文/状态已完成；两位读者均指出差异。使用约定已补充同时更新title，不能声称提示能保证所有模型每次一致。多页大样本、长期自动记录漏记率、Hermes和Codex写入仍需后续独立验证。
+- 用本机实际安装的0.4.0发布二进制再跑同一完整链路，结果通过，证据`artifacts/work-log-adoption/b88f33d9140b429793046c3cac91c5e5/`。这次完成状态与标题同步更新，模型未把用户陈述升级为工具结果，Claude与Codex新会话正确读回；仍是隔离合成任务。二进制哈希和采用指令哈希保存在report.json，测试进程已清理，日常服务保持运行。
 
 复跑示例（先构建候选组件；需要已配置模型路由）：
 

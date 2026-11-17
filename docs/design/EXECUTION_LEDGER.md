@@ -309,3 +309,6 @@ P3 提交：`5c8a49f`(评测集与基线) / `9e9ea94`(协议加固 + LF-only 修
 - 输入4c74914；远端44008419972失败于编辑器草稿恢复第二轮，工作日志用例通过。Claude禁工具独立复核发现恢复观察窗Close被未保存保护取消；Codex补上测试窗口明确退出断言。单独修测试后本地仍能复现：Closed之后排队的TextChanged可重新启动timer，故产品Closed时同时将draftsLoaded=false，阻止延迟事件再次持久化。保留原字段恢复断言，增加实际关闭、timer停止和第二轮磁盘标题检查；修复后220项通过。不是通过延长等待或删除断言解决。
 - 新增opt-in真实模型验收脚本：同一Claude会话三轮自动记/改/跨日追加；全新Claude与Codex按项目/工作日期复盘并引用随机细节。成功证据及第一次隔离配置失败见HOST_COMPATIBILITY.md。使用合成事实，用户陈述未升级为工具验证。当前路由自报GLM-5.3；Codex CLI0.166.0只读采用通过。
 - 对齐Cargo、MCP及桌面版本至0.4.0（发现桌面原先已为0.4.0，其他仍0.3.0）；重新构建发布ZIP，227项文件哈希、解压smoke、MCP版本握手、真实备份恢复校验通过。日志artifacts/worklog-package.log、worklog-release-verify.log。未把源码测试当成发布物证据。
+- 完整本地回归通过：63 Rust、102配置、220编辑/草稿、7 headless、备份与工作日志集成、P4质量门槛、30探针、桌面smoke。代码提交d36dea8已推送，远端Windows CI [44036932849](https://github.com/Doodle-Lin/graph-memory/actions/runs/44036932849)成功；不再沿用4c74914的失败结论。
+- 本机安装到`%LOCALAPPDATA%/GraphMemory/versions/0.4.0`；升级备份位于`%LOCALAPPDATA%/GraphMemory/upgrade-backups/worklogs-20261117-151436/`。先导出/校验原库、恢复副本并用新服务重导出核对payload，再切换唯一实际工作库服务并逐项比较升级前后payload相等。原服务进程身份核对后停止；Codex/Claude只变更Graph Memory命令与服务路径，原workspace-v1不变，共享/Claude技能追加工作日志约定，原配置与技能字节保留。回滚不能用旧服务覆盖已经带work_log的记录；当前旧聊天工具缓存仍需重载。
+- 已将本次真实工作写入Graph Memory项目、日期2026-11-17；当前对话MCP可读回。合成模型验收记录仍仅在隔离库；没有把合成任务混入日常知识库。安装切换不等于Hermes或Codex写入采用已经通过。
